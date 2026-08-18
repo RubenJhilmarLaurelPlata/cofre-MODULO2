@@ -1,0 +1,189 @@
+// src/lib/package-transitions.ts
+// Reglas de transicion de estado de un paquete, en un solo lugar para que
+// Entrega y Deposito (proximo modulo) usen exactamente la misma logica en
+// vez de reimplementarla cada uno por su lado.
+
+import { prisma, TRANSACTION_OPTS } from '@/lib/prisma';
+import { registrarAuditoria } from '@/lib/auditoria';
+import { normalizarCodigo } from '@/lib/codigo';
+import { getCompanyConfig, getHolidaySet } from '@/lib/config';
+import { calcularCosto } from '@/lib/pricing';
+import { fechaReferencia } from '@/lib/package-detail';
+import type { Package } from '@prisma/client';
+import type { PackageStatus, PaymentStatus } from '@/types';
+
+export class TransicionInvalidaError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'TransicionInvalidaError';
+  }
+}
+
+export class PaqueteNoEncontradoError extends Error {
+  constructor(code: string) {
+    super(`No se encontró ningún paquete con el código "${code}".`);
+    this.name = 'PaqueteNoEncontradoError';
+  }
+}
+
+async function buscarOFallar(code: string): Promise<Package> {
+  const pkg = await prisma.package.findUnique({ where: { codigoNormalizado: normalizarCodigo(code) } });
+  if (!pkg) throw new PaqueteNoEncontradoError(code);
+  return pkg;
+}
+
+async function transicionar(
+  pkg: Package,
+  nuevoEstado: PackageStatus,
+  userId: string,
+  camposExtra: Record<string, unknown>
+): Promise<Package> {
+  const now = new Date();
+  const estadoAnterior = pkg.status;
+  const actualizado = await prisma.$transaction(async (tx) => {
+    // "where: status: estadoAnterior" es la protección contra doble
+    // entrega/doble transición: si dos requests casi simultáneas leyeron
+    // el mismo paquete "En Paquetería" y ambas intentan entregarlo, solo
+    // la primera encuentra una fila que coincide (count 1); la segunda
+    // encuentra 0 filas porque el status ya cambió, y falla explícitamente
+    // en vez de aplicar la transición dos veces.
+    const resultado = await tx.package.updateMany({
+      where: { id: pkg.id, status: estadoAnterior },
+      data: { status: nuevoEstado, ...camposExtra },
+    });
+    if (resultado.count === 0) {
+      throw new TransicionInvalidaError(
+        'Este paquete ya fue actualizado por otra operación en curso. Vuelve a buscarlo para ver su estado actual.'
+      );
+    }
+    await tx.packageHistory.create({
+      data: { packageId: pkg.id, estado: nuevoEstado, fecha: now, userId },
+    });
+    return tx.package.findUniqueOrThrow({ where: { id: pkg.id } });
+  }, TRANSACTION_OPTS);
+
+  // Auditoria (Modulo 7): un solo lugar para las 5 transiciones de estado
+  // (Entrega, Deposito), en vez de repetir la llamada en cada endpoint.
+  await registrarAuditoria({
+    userId,
+    accion: `PAQUETE_${nuevoEstado}`,
+    modulo: 'paquetes',
+    valorAnterior: { code: pkg.code, status: estadoAnterior },
+    valorNuevo: { code: pkg.code, status: nuevoEstado },
+  });
+
+  return actualizado;
+}
+
+export type TipoPago = 'ANTICIPO' | 'COBRO_ENTREGA' | 'AJUSTE';
+
+/**
+ * Registra un movimiento de dinero sobre un paquete (anticipo en
+ * Recepcion, cobro en Entrega, o ajuste posterior desde Finanzas) sin
+ * modificar nunca silenciosamente el acumulado anterior: cada llamada
+ * agrega una fila nueva a Pago con el monto anterior y el nuevo, y
+ * recalcula "estadoPago" comparando lo pagado contra el costo acumulado
+ * en este momento (que sigue creciendo con los dias, pagos anticipados
+ * no lo congelan — ver especificacion, seccion Pagos anticipados).
+ */
+export async function registrarPago(pkg: Package, tipo: TipoPago, montoDelta: number, userId: string | null, motivo?: string): Promise<Package> {
+  const [company, feriados] = await Promise.all([getCompanyConfig(), getHolidaySet()]);
+  const costoActual = calcularCosto(
+    pkg.ingresoAt,
+    fechaReferencia(pkg),
+    { tarifaBase: company.tarifaBase, diasIncluidos: company.diasIncluidos, costoAdicionalDia: company.costoAdicionalDia },
+    feriados,
+    pkg.tarifaBaseOverride,
+    pkg.diasIncluidosOverride
+  ).total;
+
+  const montoAnterior = pkg.montoPagado;
+  const montoNuevo = Math.round((montoAnterior + montoDelta) * 100) / 100;
+  const estadoPago: PaymentStatus = montoNuevo <= 0 ? 'PENDIENTE' : montoNuevo >= costoActual ? 'PAGADO' : 'PARCIAL';
+
+  // Nota: la forma "array" de $transaction (a diferencia de la forma con
+  // callback de arriba) no acepta maxWait/timeout en esta version de
+  // Prisma — no hace falta: al ser un solo round-trip batched, no sufre
+  // la misma contencion bajo rafagas que una transaccion interactiva mas
+  // larga.
+  const [actualizado] = await prisma.$transaction([
+    prisma.package.update({ where: { id: pkg.id }, data: { montoPagado: montoNuevo, estadoPago } }),
+    prisma.pago.create({
+      data: { packageId: pkg.id, tipo, monto: montoDelta, montoAnterior, montoNuevo, motivo: motivo || null, userId },
+    }),
+  ]);
+
+  await registrarAuditoria({
+    userId: userId ?? undefined,
+    accion: `PAGO_${tipo}`,
+    modulo: 'finanzas',
+    valorAnterior: { code: pkg.code, montoPagado: montoAnterior },
+    valorNuevo: { code: pkg.code, montoPagado: montoNuevo, motivo: motivo || undefined },
+  });
+
+  return actualizado;
+}
+
+export async function entregarPaquete(
+  code: string,
+  userId: string,
+  opts?: {
+    observaciones?: string;
+    montoCobrado?: number;
+    motivoCobro?: string;
+    destinatario?: string;
+    destinatarioTelefono?: string;
+    destinatarioObservaciones?: string;
+  }
+): Promise<Package> {
+  const pkg = await buscarOFallar(code);
+  if (pkg.status !== 'EN_PAQUETERIA') {
+    throw new TransicionInvalidaError('Solo se pueden entregar paquetes en estado "En Paquetería".');
+  }
+  const now = new Date();
+  const entregado = await transicionar(pkg, 'ENTREGADO', userId, {
+    entregaAt: now,
+    ...(opts?.observaciones !== undefined ? { observaciones: opts.observaciones } : {}),
+    ...(opts?.destinatario !== undefined ? { destinatario: opts.destinatario || null } : {}),
+    ...(opts?.destinatarioTelefono !== undefined ? { destinatarioTelefono: opts.destinatarioTelefono || null } : {}),
+    ...(opts?.destinatarioObservaciones !== undefined ? { destinatarioObservaciones: opts.destinatarioObservaciones || null } : {}),
+  });
+
+  if (opts?.montoCobrado !== undefined && opts.montoCobrado !== 0) {
+    return registrarPago(entregado, 'COBRO_ENTREGA', opts.montoCobrado, userId, opts.motivoCobro);
+  }
+  return entregado;
+}
+
+export async function denegarPaquete(code: string, userId: string): Promise<Package> {
+  const pkg = await buscarOFallar(code);
+  if (pkg.status === 'ENTREGADO' || pkg.status === 'DENEGADO') {
+    throw new TransicionInvalidaError('El paquete ya fue entregado o denegado.');
+  }
+  return transicionar(pkg, 'DENEGADO', userId, { denegadoAt: new Date() });
+}
+
+export async function enviarADeposito(code: string, userId: string): Promise<Package> {
+  const pkg = await buscarOFallar(code);
+  if (pkg.status !== 'EN_PAQUETERIA') {
+    throw new TransicionInvalidaError('Solo paquetes en estado "En Paquetería" pueden enviarse a depósito.');
+  }
+  return transicionar(pkg, 'EN_DEPOSITO', userId, { depositoAt: new Date() });
+}
+
+export async function solicitarBajarDeposito(code: string, userId: string): Promise<Package> {
+  const pkg = await buscarOFallar(code);
+  if (pkg.status !== 'EN_DEPOSITO') {
+    throw new TransicionInvalidaError('Solo paquetes en estado "En Depósito" pueden solicitarse para bajar.');
+  }
+  return transicionar(pkg, 'PENDIENTE_BAJAR', userId, { pendienteAt: new Date() });
+}
+
+/** Usado por el modulo de Deposito: confirma que un paquete pendiente ya fue bajado fisicamente. */
+export async function bajarDeDeposito(code: string, userId: string): Promise<Package> {
+  const pkg = await buscarOFallar(code);
+  if (pkg.status !== 'PENDIENTE_BAJAR') {
+    throw new TransicionInvalidaError('Solo paquetes en estado "Pendiente de bajar" pueden volver a "En Paquetería".');
+  }
+  return transicionar(pkg, 'EN_PAQUETERIA', userId, { pendienteAt: null });
+}

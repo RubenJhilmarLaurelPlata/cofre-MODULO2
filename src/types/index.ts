@@ -1,0 +1,64 @@
+// src/types/index.ts
+//
+// Role y PackageStatus se definen AQUI a mano, no se importan de
+// "@prisma/client", porque SQLite no soporta enums nativos de base de
+// datos: en el schema de Prisma esos campos son String (ver el
+// comentario en prisma/schema.prisma). Este es el UNICO lugar del
+// proyecto donde se definen estos dos conjuntos de valores; todo lo
+// demas los importa de aqui.
+
+export const ROLES = ['ADMIN', 'SUPERVISOR', 'RECEPCION', 'ENTREGA', 'CONSULTA', 'ADMIN_CAJA'] as const;
+export type Role = (typeof ROLES)[number];
+
+export const PACKAGE_STATUSES = ['EN_PAQUETERIA', 'EN_DEPOSITO', 'PENDIENTE_BAJAR', 'ENTREGADO', 'DENEGADO'] as const;
+export type PackageStatus = (typeof PACKAGE_STATUSES)[number];
+
+export const PAYMENT_STATUSES = ['PENDIENTE', 'PARCIAL', 'PAGADO'] as const;
+export type PaymentStatus = (typeof PAYMENT_STATUSES)[number];
+
+/** Lo que guardamos dentro del JWT y devolvemos como "sesion" en el servidor. */
+export interface SessionUser {
+  id: string;
+  username: string;
+  nombre: string;
+  role: Role;
+  branchId: string | null;
+}
+
+/**
+ * Cada seccion del sistema y que roles pueden entrar a ella.
+ *
+ * ADMIN_CAJA (Administrador de Caja) hace recepcion + entrega del dia a
+ * dia: entra a recepcion/entrega/deposito/buscador, pero NUNCA a
+ * dashboard, finanzas (gastos/cierre de caja), reportes o configuracion
+ * — esos siguen siendo exclusivos de ADMIN (y, donde ya aplicaba,
+ * SUPERVISOR). No agregarlo a esos modulos es intencional.
+ */
+export const PERMISOS_POR_MODULO = {
+  dashboard: ['ADMIN', 'SUPERVISOR', 'RECEPCION', 'ENTREGA', 'CONSULTA'],
+  recepcion: ['ADMIN', 'RECEPCION', 'ADMIN_CAJA'],
+  entrega: ['ADMIN', 'ENTREGA', 'ADMIN_CAJA'],
+  deposito: ['ADMIN', 'ENTREGA', 'RECEPCION', 'ADMIN_CAJA'],
+  buscador: ['ADMIN', 'SUPERVISOR', 'ENTREGA', 'CONSULTA', 'ADMIN_CAJA'],
+  etiquetas: ['ADMIN', 'RECEPCION'],
+  reportes: ['ADMIN', 'SUPERVISOR'],
+  finanzas: ['ADMIN', 'SUPERVISOR'],
+  importacion: ['ADMIN'],
+  configuracion: ['ADMIN'],
+} as const satisfies Record<string, readonly Role[]>;
+
+export type Modulo = keyof typeof PERMISOS_POR_MODULO;
+
+export function puedeAcceder(role: Role, modulo: Modulo): boolean {
+  return (PERMISOS_POR_MODULO[modulo] as readonly Role[]).includes(role);
+}
+
+/** Etiquetas legibles de cada rol, para mostrar en la interfaz. */
+export const ROLE_LABELS: Record<Role, string> = {
+  ADMIN: 'Administrador',
+  SUPERVISOR: 'Supervisor',
+  RECEPCION: 'Recepción',
+  ENTREGA: 'Entrega',
+  CONSULTA: 'Consulta',
+  ADMIN_CAJA: 'Administrador de Caja',
+};

@@ -1,0 +1,595 @@
+// prisma/schema.prisma
+// Esquema de base de datos para Cofre Express.
+// Diseñado para escalar a cientos de miles de paquetes sin rediseño:
+// - Historial en tabla separada (no JSON embebido) para poder indexarlo y
+//   consultarlo eficientemente.
+// - Índices sobre las columnas que se usan en búsquedas y reportes
+//   (status, fechas, sucursal, remitente/destinatario).
+// - Sucursales como entidad propia desde el día uno (multi-sucursal real).
+// - SQLite por defecto para desarrollo/operación de una sola sede; basta
+//   cambiar el "provider" a "postgresql" y la DATABASE_URL para escalar a
+//   un servidor de base de datos compartido entre sucursales.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------
+// Usuarios y roles
+// ---------------------------------------------------------------------
+
+// NOTA IMPORTANTE: SQLite no soporta enums nativos de base de datos
+// (a diferencia de PostgreSQL/MySQL). Por eso "role" y "status" se
+// guardan como String, y el conjunto de valores permitidos se define y
+// valida en TypeScript (ver src/types/index.ts). Si en el futuro migran
+// a PostgreSQL, esto puede convertirse a `enum` real de Prisma sin
+// cambiar el resto del código, porque todo el codigo de la aplicacion ya
+// trata estos campos como un tipo union cerrado, no como string libre.
+//
+// Valores permitidos de "role": ADMIN | SUPERVISOR | RECEPCION | ENTREGA | CONSULTA | ADMIN_CAJA
+
+model User {
+  id               String    @id @default(cuid())
+  username         String    @unique
+  passwordHash     String
+  nombre           String
+  role             String
+  activo           Boolean   @default(true)
+  branchId         String?
+  branch           Branch?   @relation(fields: [branchId], references: [id])
+  // Ultima actividad real (cualquier request autenticado): mueve la
+  // ventana de "tiempo maximo de inactividad" (Modulo 7).
+  ultimoAccesoAt   DateTime?
+  // Ultimo INICIO DE SESION exitoso especificamente (no cualquier
+  // actividad) — lo que muestran el Reporte de Operadores (Modulo 6) y
+  // la pantalla de Usuarios (Modulo 7).
+  ultimoLoginAt    DateTime?
+  // Seguridad (Modulo 7): intentos fallidos consecutivos y bloqueo
+  // temporal automatico, o bloqueo manual del administrador (que usa la
+  // misma fecha, puesta muy en el futuro).
+  intentosFallidos Int       @default(0)
+  bloqueadoHasta   DateTime?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  paquetesRegistrados Package[]        @relation("PackageRegistradoPor")
+  historialAcciones   PackageHistory[]
+  lotesGenerados      LabelBatch[]
+  reportesGenerados   ReportLog[]
+  auditorias          AuditLog[]
+  respaldos           Backup[]
+  pagosRegistrados    Pago[]
+  gastosRegistrados   Gasto[]
+  cierresCaja         CierreCaja[]
+  importaciones       ImportLog[]
+
+  @@index([role])
+  @@index([branchId])
+}
+
+// ---------------------------------------------------------------------
+// Sucursales
+// ---------------------------------------------------------------------
+
+model Branch {
+  id        String   @id @default(cuid())
+  nombre    String   @unique
+  direccion String?
+  activo    Boolean  @default(true)
+  createdAt DateTime @default(now())
+
+  usuarios User[]
+  paquetes Package[]
+}
+
+// ---------------------------------------------------------------------
+// Configuracion general (fila unica, id fijo = 1)
+// ---------------------------------------------------------------------
+
+model Company {
+  id                                   Int     @id @default(1)
+  nombre                               String  @default("Cofre Express")
+  logoUrl                              String?
+  // Empresa (Modulo 7): datos de contacto, mostrados en reportes/PDF/etiquetas.
+  direccion                            String?
+  telefono                             String?
+  email                                String?
+  sitioWeb                             String?
+  ciudad                               String?
+  pais                                 String?
+  horarioAtencion                      String?
+  moneda                               String  @default("Bs")
+  tarifaBase                           Float   @default(2)
+  diasIncluidos                        Int     @default(4)
+  costoAdicionalDia                    Float   @default(1)
+  formatoLetra                         String  @default("L")
+  formatoSeparador                     String  @default("-")
+  formatoDigitos                       Int     @default(3)
+  impedirDuplicados                    Boolean @default(true)
+  impedirReutilizarEntregadosDenegados Boolean @default(true)
+  mostrarCostoAcumuladoEnEntrega       Boolean @default(true)
+  sucursalActualId                     String?
+
+  // Preferencias (Modulo 7)
+  idioma         String  @default("es")
+  zonaHoraria    String  @default("America/La_Paz")
+  formatoFecha   String  @default("DD/MM/YYYY")
+  formatoHora    String  @default("24h")
+  sonidosActivos Boolean @default(true)
+
+  // Seguridad (Modulo 7)
+  tiempoMaximoSesionMin       Int     @default(720)
+  tiempoMaximoInactividadMin  Int     @default(0)
+  cerrarSesionAutomaticamente Boolean @default(false)
+  maxIntentosLogin            Int     @default(5)
+  tiempoBloqueoMin            Int     @default(15)
+
+  // Operacion (Paso A): montos rapidos de pago en Recepcion, en el mismo
+  // orden en que deben aparecer los botones ("2,3,5,7" -> Bs2, Bs3, Bs5,
+  // Bs7). Segundos de cuenta regresiva antes de confirmar una entrega.
+  montosPagoRapido         String @default("2,3,5,7")
+  entregaCountdownSegundos Int    @default(5)
+
+  // Clima del Dashboard (Paso A): coordenadas opcionales para consultar
+  // Open-Meteo (no requiere API key). Si no estan configuradas, el
+  // Dashboard muestra "Clima no configurado" en vez de inventar datos.
+  climaLat Float?
+  climaLon Float?
+
+  // Lector S700 / Socket Mobile CaptureSDK (Paso V3): credenciales del
+  // AppKey registrado en socketmobile.com para este dominio. HID sigue
+  // siendo el modo por defecto sin ninguna de estas 3 columnas
+  // configuradas — CaptureSDK es un modo ADICIONAL, nunca obligatorio.
+  // En iOS requiere abrir la app en Rumba (no Safari); en
+  // Android/Windows requiere Socket Mobile Companion corriendo; en Mac
+  // no existe una alternativa real para el S700, HID sigue siendo el
+  // unico camino. Ver src/lib/scanner/capture-js-provider.ts.
+  s700Habilitado  Boolean @default(false)
+  s700AppId       String?
+  s700DeveloperId String?
+  s700AppKey      String?
+}
+
+model Holiday {
+  id     String  @id @default(cuid())
+  fecha  String // formato YYYY-MM-DD
+  nombre String
+  activo Boolean @default(true)
+
+  @@index([fecha])
+}
+
+// Series / iniciales / tipos de paquete (S, M, L, X, etc.)
+model PackageSeries {
+  inicial            String  @id
+  descripcion        String
+  // Ultimo consecutivo usado por Etiquetas (Modulo 5) para esta inicial,
+  // sin importar la fecha/mes de cada lote. "Continuar lote" propone
+  // correlativo + 1 como siguiente numero, para no tener que calcularlo.
+  correlativo        Int     @default(0)
+  tarifaBaseOverride Float?
+  activo             Boolean @default(true)
+
+  codigos  GeneratedCode[]
+  paquetes Package[]
+  lotes    LabelBatch[]
+}
+
+model GeneratedCode {
+  code           String        @id
+  inicial        String
+  serie          PackageSeries @relation(fields: [inicial], references: [inicial])
+  fechaGenerado  String
+  usado          Boolean       @default(false)
+  // Cuantas veces se reimprimio este codigo (pestaña Reimprimir/Historial
+  // del Modulo 5), para el Reporte de Etiquetas del Modulo 6.
+  vecesReimpreso Int           @default(0)
+  createdAt      DateTime      @default(now())
+  // Tarifa base propia de ESTE codigo (Paso B: Codigos personalizados),
+  // distinta de "serie.tarifaBaseOverride". Permite que una misma
+  // inicial/serie conviva con generaciones a montos distintos (ej. dos
+  // lotes "Q16" generados en momentos distintos con tarifas diferentes).
+  // Si es null, Recepcion usa la tarifa de la serie o la tarifa base
+  // general de la empresa, igual que hasta ahora.
+  tarifaOverride Float?
+  // Dias incluidos propios de ESTE codigo (Fase 4B: "Nuevo lote" desde
+  // Recepcion), mismo criterio que tarifaOverride — si es null, se usa
+  // company.diasIncluidos como siempre.
+  diasIncluidosOverride Int?
+
+  batchId String?
+  batch   LabelBatch? @relation(fields: [batchId], references: [id])
+
+  @@index([inicial])
+  @@index([usado])
+  @@index([batchId])
+  @@index([createdAt])
+}
+
+// Letra asignada a cada mes del año (1 = enero .. 12 = diciembre), usada
+// para armar el codigo de las etiquetas (ej. "M24J-1": J = letra de junio).
+// Totalmente editable por el administrador, nunca codificada en el
+// sistema (Modulo 5).
+model MonthLetter {
+  mes   Int    @id
+  letra String
+}
+
+// Un lote de etiquetas generado desde el Modulo 5. Cada lote es un rango
+// continuo de consecutivos para una misma inicial; puede cubrir un solo
+// dia o varios (semana completa / rango de fechas), en cuyo caso cada dia
+// recibe "cantidadPorDia" etiquetas y las fechas de "codigos" varian
+// dentro del mismo lote.
+model LabelBatch {
+  id      String        @id @default(cuid())
+  inicial String
+  serie   PackageSeries @relation(fields: [inicial], references: [inicial])
+
+  fechaInicio    String // YYYY-MM-DD
+  fechaFin       String // YYYY-MM-DD (igual a fechaInicio si es un solo dia)
+  cantidadPorDia Int
+  cantidad       Int // total de etiquetas del lote (cantidadPorDia * cantidad de dias)
+
+  separador         String
+  primerConsecutivo Int
+  ultimoConsecutivo Int
+
+  observaciones String @default("")
+  // Nombre amigable opcional (Fase 4B: "Nuevo lote" desde Recepcion, ej.
+  // "Fajas"), distinto de "observaciones" (texto autogenerado). Null para
+  // lotes creados desde Etiquetas (su flujo no cambia, no lo usa).
+  nombre        String?
+
+  generadoPorId String?
+  generadoPor   User?    @relation(fields: [generadoPorId], references: [id])
+  createdAt     DateTime @default(now())
+
+  codigos GeneratedCode[]
+
+  @@index([inicial])
+  @@index([createdAt])
+}
+
+// ---------------------------------------------------------------------
+// Paquetes
+// ---------------------------------------------------------------------
+
+// Valores permitidos de "status" / "estado": EN_PAQUETERIA | EN_DEPOSITO |
+// PENDIENTE_BAJAR | ENTREGADO | DENEGADO (ver nota sobre enums arriba).
+// Valores permitidos de "estadoPago": PENDIENTE | PARCIAL | PAGADO.
+
+model Package {
+  id                String        @id @default(cuid())
+  code              String        @unique
+  // Igual a "code" pero en mayusculas y sin guiones/espacios, para que el
+  // Buscador y Entrega encuentren el paquete sin importar como fue tipeado
+  // o escaneado (M24J-125 / M24J125 / m24j 125 son el mismo paquete). Se
+  // calcula una sola vez al crear el paquete (ver src/lib/codigo.ts); el
+  // codigo "oficial" que se imprime y se muestra siempre sigue siendo "code".
+  codigoNormalizado String        @unique
+  inicial           String
+  serie             PackageSeries @relation(fields: [inicial], references: [inicial])
+
+  branchId String
+  branch   Branch @relation(fields: [branchId], references: [id])
+
+  status String @default("EN_PAQUETERIA")
+
+  ingresoAt   DateTime  @default(now())
+  depositoAt  DateTime?
+  pendienteAt DateTime?
+  entregaAt   DateTime?
+  denegadoAt  DateTime?
+
+  tarifaBaseOverride Float?
+  // Dias incluidos propios de este paquete (Fase 4B), copiado desde
+  // GeneratedCode.diasIncluidosOverride al momento del escaneo cuando el
+  // codigo viene de un lote con duracion propia (ej. "Q16, 10 dias"). Si
+  // es null, se usa company.diasIncluidos como siempre.
+  diasIncluidosOverride Int?
+
+  remitente                 String?
+  remitenteTelefono         String?
+  destinatario              String?
+  destinatarioTelefono      String?
+  // Observaciones especificas de quien RECOGE el paquete (Paso B),
+  // distintas de "observaciones" (notas operativas generales tipo
+  // "cliente llamó") y de las observaciones del remitente en Cliente.
+  destinatarioObservaciones String?
+  observaciones             String  @default("")
+  // Nombre/descripcion breve del contenido (ej. "Ropa, 2 cajas"), distinto
+  // de "observaciones" (notas operativas tipo "cliente llamó").
+  descripcion               String?
+
+  // Foto opcional del paquete, tomada en Recepcion (camara o galeria).
+  // Se guarda en disco (fuera de "public/", mismo criterio que los
+  // respaldos) y esta columna solo referencia el nombre de archivo.
+  fotoArchivo String?
+
+  // Cliente/remitente asociado (Modulo Recepcion): opcional, permite que
+  // varios paquetes registrados en la misma recepcion compartan los
+  // mismos datos de contacto sin repetirlos.
+  clienteId String?
+  cliente   Cliente? @relation(fields: [clienteId], references: [id])
+
+  // Estado de pago: independiente del estado logistico del paquete (un
+  // paquete puede estar EN_PAQUETERIA y PAGADO, o ENTREGADO con saldo
+  // pendiente si asi se decidio al momento de entregar).
+  estadoPago  String @default("PENDIENTE")
+  // Suma de todo lo efectivamente pagado hasta ahora (anticipos en
+  // Recepcion + cobro en Entrega + ajustes posteriores). El detalle de
+  // cada movimiento vive en Pago; este campo es el acumulado para no
+  // tener que sumarlo en cada lectura.
+  montoPagado Float  @default(0)
+
+  registradoPorId String?
+  registradoPor   User?   @relation("PackageRegistradoPor", fields: [registradoPorId], references: [id])
+
+  // Origen de la entrega (Fase 2 — Importacion): null = entrega normal
+  // (lector/manual, como siempre funciono el sistema). "IMPORTACION"
+  // cuando el paquete se marco ENTREGADO mediante una importacion
+  // administrativa, para que quede diferenciado como un hecho
+  // estructurado (no solo una nota de texto) en Buscador/Entrega/
+  // reportes — nunca debe parecer una entrega hecha con el lector.
+  origenEntrega String?
+
+  historial PackageHistory[]
+  pagos     Pago[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+  @@index([ingresoAt])
+  @@index([entregaAt])
+  @@index([depositoAt])
+  @@index([branchId])
+  @@index([destinatario])
+  @@index([destinatarioTelefono])
+  @@index([remitenteTelefono])
+  @@index([registradoPorId])
+  @@index([clienteId])
+  @@index([estadoPago])
+}
+
+// ---------------------------------------------------------------------
+// Cliente / remitente (mejora estructural: Paso 1)
+// ---------------------------------------------------------------------
+
+// Persona o emprendimiento que deja uno o mas paquetes. Todos los campos
+// son opcionales porque registrar estos datos nunca debe ser obligatorio
+// para completar una recepcion. Una fila de Cliente puede quedar
+// asociada a muchos Package (misma persona, varios paquetes en la misma
+// visita), evitando reescribir los datos en cada escaneo.
+model Cliente {
+  id             String   @id @default(cuid())
+  nombre         String?
+  emprendimiento String?
+  telefono       String?
+  observaciones  String?
+  createdAt      DateTime @default(now())
+
+  paquetes Package[]
+
+  @@index([telefono])
+  @@index([nombre])
+}
+
+// ---------------------------------------------------------------------
+// Importacion masiva de codigos (Paso A)
+// ---------------------------------------------------------------------
+
+// Registro de cada corrida de importacion (CSV/XLSX/TXT), normalmente
+// para marcar como ENTREGADO codigos ya procesados fuera del sistema.
+// Separado de AuditLog porque necesita campos estructurados propios
+// (validos/duplicados/invalidos/etc.) que alimentan el resumen que ve el
+// usuario antes y despues de confirmar — mismo criterio que ReportLog.
+model ImportLog {
+  id                String   @id @default(cuid())
+  nombreArchivo     String
+  // Nombre opcional que el administrador le da a este lote de importacion
+  // (ej. "Códigos antiguos junio"), para distinguir lotes de entrega
+  // administrativa entre si en el historial.
+  nombreLote        String?
+  formato           String // CSV | XLSX
+  // Que hizo el administrador con las filas validas de este lote
+  // (Fase 2): SOLO_REGISTRAR | MARCAR_ENTREGADOS | CREAR_Y_ENTREGAR.
+  tipoImportacion   String   @default("MARCAR_ENTREGADOS")
+  detectados        Int
+  validos           Int
+  duplicados        Int
+  invalidos         Int
+  marcadosEntregado Int      @default(0)
+  noEncontrados     Int      @default(0)
+  creadosFaltantes  Int      @default(0)
+  detalleErrores    String? // JSON: [{ fila, motivo }]
+  userId            String?
+  user              User?    @relation(fields: [userId], references: [id])
+  createdAt         DateTime @default(now())
+
+  rows ImportRow[]
+
+  @@index([createdAt])
+}
+
+// Detalle fila-por-fila de una importacion (Fase 2), separado de
+// ImportLog (que solo guarda agregados) para que la pantalla de detalle
+// de lote pueda filtrar/buscar por estado o por persona en archivos de
+// miles de filas sin tener que releer y reparsear el archivo original
+// cada vez.
+model ImportRow {
+  id            String    @id @default(cuid())
+  importLogId   String
+  importLog     ImportLog @relation(fields: [importLogId], references: [id], onDelete: Cascade)
+  numeroFila    Int
+  codigo        String
+  codigoOficial String?
+  packageId     String?
+  monto         Float?
+  persona       String?
+  // VALIDO | DUPLICADO | INVALIDO | NO_ENCONTRADO | YA_ENTREGADO | CREADO | ENTREGADO | SOLO_DATOS | ERROR
+  estado        String
+  motivo        String?
+
+  @@index([importLogId])
+  @@index([estado])
+  @@index([codigo])
+}
+
+// ---------------------------------------------------------------------
+// Pagos (mejora estructural: Paso 1)
+// ---------------------------------------------------------------------
+
+// Cada movimiento de dinero relacionado a un paquete: anticipo en
+// Recepcion, cobro al momento de Entrega, o un ajuste posterior hecho
+// por un Administrador desde Finanzas. Nunca se sobrescribe/borra un
+// monto anterior: cada cambio queda como una fila nueva, lo que arma el
+// historial de auditoria financiera exigido por la especificacion.
+// Valores permitidos de "tipo": ANTICIPO | COBRO_ENTREGA | AJUSTE.
+model Pago {
+  id        String  @id @default(cuid())
+  packageId String
+  package   Package @relation(fields: [packageId], references: [id], onDelete: Cascade)
+
+  tipo          String
+  // Monto de este movimiento especifico (lo que efectivamente cambio el
+  // acumulado: positivo salvo un ajuste que reduce lo cobrado).
+  monto         Float
+  // Solo se llenan para tipo=AJUSTE: el acumulado antes/despues del ajuste,
+  // para poder mostrar "de Bs X a Bs Y" sin tener que reconstruirlo.
+  montoAnterior Float?
+  montoNuevo    Float?
+  motivo        String?
+
+  userId String?
+  user   User?   @relation(fields: [userId], references: [id])
+
+  createdAt DateTime @default(now())
+
+  @@index([packageId])
+  @@index([tipo])
+  @@index([createdAt])
+}
+
+// ---------------------------------------------------------------------
+// Finanzas: gastos y cierre de caja (mejora estructural: Paso 1)
+// ---------------------------------------------------------------------
+
+model Gasto {
+  id            String   @id @default(cuid())
+  concepto      String
+  monto         Float
+  fecha         DateTime @default(now())
+  observaciones String?
+
+  userId String?
+  user   User?   @relation(fields: [userId], references: [id])
+
+  createdAt DateTime @default(now())
+
+  @@index([fecha])
+}
+
+// Cierre de caja: una foto congelada de ingresos/gastos/resultado neto de
+// un periodo (normalmente un dia), para que quede un historial que nadie
+// pueda alterar silenciosamente despues.
+model CierreCaja {
+  id               String   @id @default(cuid())
+  fechaInicio      DateTime
+  fechaFin         DateTime
+  ingresos         Float
+  gastos           Float
+  ajustes          Float    @default(0)
+  resultadoNeto    Float
+  paquetesCobrados Int
+
+  userId String?
+  user   User?   @relation(fields: [userId], references: [id])
+
+  createdAt DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([fechaInicio])
+}
+
+model PackageHistory {
+  id        String   @id @default(cuid())
+  packageId String
+  package   Package  @relation(fields: [packageId], references: [id], onDelete: Cascade)
+  estado    String
+  fecha     DateTime @default(now())
+  userId    String?
+  user      User?    @relation(fields: [userId], references: [id])
+  nota      String?
+
+  @@index([packageId])
+  @@index([fecha])
+  @@index([userId])
+}
+
+// ---------------------------------------------------------------------
+// Reportes (Modulo 6)
+// ---------------------------------------------------------------------
+
+// Valores permitidos de "tipo": PAQUETES | FINANCIERO | OPERADORES |
+// DEPOSITO | ETIQUETAS. Valores permitidos de "formato": PDF | EXCEL | CSV.
+model ReportLog {
+  id        String   @id @default(cuid())
+  tipo      String
+  formato   String
+  filtros   String // JSON de los filtros aplicados, para auditoria
+  userId    String?
+  user      User?    @relation(fields: [userId], references: [id])
+  createdAt DateTime @default(now())
+
+  @@index([tipo])
+  @@index([createdAt])
+}
+
+// ---------------------------------------------------------------------
+// Configuracion, auditoria y respaldos (Modulo 7)
+// ---------------------------------------------------------------------
+
+// Registro de auditoria general: quien hizo que, en que modulo, y con
+// que valores antes/despues. Distinto de ReportLog (que es especifico de
+// exportaciones de Reportes): AuditLog cubre todas las acciones
+// importantes del sistema (login, usuarios, tarifas, feriados, series,
+// etiquetas, cambios de estado de paquetes, etc.).
+model AuditLog {
+  id            String   @id @default(cuid())
+  userId        String?
+  user          User?    @relation(fields: [userId], references: [id])
+  ip            String?
+  userAgent     String?
+  accion        String
+  modulo        String
+  valorAnterior String?
+  valorNuevo    String?
+  createdAt     DateTime @default(now())
+
+  @@index([modulo])
+  @@index([accion])
+  @@index([createdAt])
+  @@index([userId])
+}
+
+// Historial de respaldos completos de la base de datos. El archivo en si
+// se guarda fuera de "public/" (no accesible por URL directa); esta fila
+// solo registra los metadatos y sirve de base para una futura
+// restauracion automatica (todavia no implementada).
+model Backup {
+  id            String   @id @default(cuid())
+  nombreArchivo String
+  tamanioBytes  Int
+  estado        String   @default("COMPLETADO")
+  userId        String?
+  user          User?    @relation(fields: [userId], references: [id])
+  createdAt     DateTime @default(now())
+
+  @@index([createdAt])
+}

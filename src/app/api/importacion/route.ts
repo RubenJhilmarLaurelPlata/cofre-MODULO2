@@ -1,0 +1,149 @@
+// src/app/api/importacion/route.ts
+// Importacion masiva de codigos. Un solo endpoint con 3 acciones
+// (detectar-columnas / previsualizar / confirmar): siempre vuelve a
+// parsear y validar el archivo contra la base de datos real en el
+// servidor — nunca confia en un resumen que haya vuelto del cliente,
+// para que nadie pueda alterar la validacion antes de confirmar.
+import { NextResponse } from 'next/server';
+import { prisma } from '@/lib/prisma';
+import { getSession } from '@/lib/auth';
+import { getCompanyConfig } from '@/lib/config';
+import { extraerContextoRequest } from '@/lib/auditoria';
+import {
+  parseCSV,
+  parseTXT,
+  parseXLSX,
+  detectarEncabezados,
+  validarFilas,
+  ejecutarImportacion,
+  registrarImportLog,
+  type FormatoImportacion,
+  type FilaImportacion,
+  type CampoSistema,
+  type TipoImportacion,
+} from '@/lib/importacion';
+
+const MAX_BYTES = 8_000_000;
+const MAX_FILAS = 10_000;
+
+function detectarFormato(nombreArchivo: string): FormatoImportacion | null {
+  const ext = nombreArchivo.split('.').pop()?.toLowerCase();
+  if (ext === 'csv') return 'CSV';
+  if (ext === 'xlsx') return 'XLSX';
+  if (ext === 'txt') return 'TXT';
+  return null;
+}
+
+const TIPOS_VALIDOS: TipoImportacion[] = ['SOLO_REGISTRAR', 'MARCAR_ENTREGADOS', 'CREAR_Y_ENTREGAR'];
+
+export async function POST(req: Request) {
+  const session = await getSession();
+  if (!session || session.role !== 'ADMIN') {
+    return NextResponse.json({ error: 'No tienes permiso para esta acción' }, { status: 403 });
+  }
+
+  const formData = await req.formData().catch(() => null);
+  if (!formData) {
+    return NextResponse.json({ error: 'No se pudo leer el archivo enviado.' }, { status: 400 });
+  }
+
+  const accion = String(formData.get('accion') ?? 'previsualizar');
+  if (!['detectar-columnas', 'previsualizar', 'confirmar'].includes(accion)) {
+    return NextResponse.json({ error: 'Acción inválida.' }, { status: 400 });
+  }
+
+  const file = formData.get('file');
+  if (!(file instanceof File)) {
+    return NextResponse.json({ error: 'Adjunta un archivo CSV o XLSX.' }, { status: 400 });
+  }
+  const nombreLote = String(formData.get('nombreLote') ?? '').trim().slice(0, 120) || undefined;
+  if (file.size > MAX_BYTES) {
+    return NextResponse.json({ error: 'El archivo es demasiado grande (máximo 8MB).' }, { status: 400 });
+  }
+
+  const formato = detectarFormato(file.name);
+  if (!formato) {
+    const ext = file.name.split('.').pop()?.toLowerCase();
+    if (ext === 'xls') {
+      return NextResponse.json(
+        { error: 'El formato .xls (Excel 97-2003) no está soportado. Ábrelo en Excel/Sheets y guárdalo como .xlsx o .csv — toma dos clics.' },
+        { status: 400 }
+      );
+    }
+    return NextResponse.json({ error: 'Formato no reconocido. Usa un archivo .csv o .xlsx.' }, { status: 400 });
+  }
+
+  try {
+    const buffer = Buffer.from(await file.arrayBuffer());
+
+    // Paso 1: solo detectar encabezados para el mapeador visual. No
+    // valida filas ni escribe nada.
+    if (accion === 'detectar-columnas') {
+      const deteccion = await detectarEncabezados(formato, buffer);
+      return NextResponse.json(deteccion);
+    }
+
+    // Mapeo explicito confirmado por el administrador en el mapeador
+    // (array paralelo a los encabezados detectados, en el mismo orden).
+    // Si no viene, se usa la deteccion automatica de siempre (TXT nunca
+    // lo necesita: es una lista de codigos sin columnas).
+    const mapeoRaw = formData.get('mapeo');
+    let mapeo: Array<CampoSistema | null> | undefined;
+    if (typeof mapeoRaw === 'string' && mapeoRaw.trim()) {
+      try {
+        const parsed = JSON.parse(mapeoRaw);
+        if (Array.isArray(parsed)) mapeo = parsed;
+      } catch {
+        return NextResponse.json({ error: 'El mapeo de columnas enviado no es válido.' }, { status: 400 });
+      }
+    }
+
+    let filas: FilaImportacion[];
+    if (formato === 'TXT') filas = parseTXT(buffer.toString('utf-8'));
+    else if (formato === 'CSV') filas = parseCSV(buffer.toString('utf-8'), mapeo);
+    else filas = await parseXLSX(buffer, mapeo);
+
+    if (filas.length === 0) {
+      return NextResponse.json({ error: 'El archivo no tiene filas para importar.' }, { status: 400 });
+    }
+    if (filas.length > MAX_FILAS) {
+      return NextResponse.json({ error: `El archivo tiene demasiadas filas (máximo ${MAX_FILAS.toLocaleString('es-BO')} por importación).` }, { status: 400 });
+    }
+
+    const resumen = await validarFilas(filas);
+
+    if (accion === 'previsualizar') {
+      return NextResponse.json({ resumen });
+    }
+
+    // accion === 'confirmar'
+    const tipoRaw = String(formData.get('tipo') ?? '');
+    if (!TIPOS_VALIDOS.includes(tipoRaw as TipoImportacion)) {
+      return NextResponse.json({ error: 'Selecciona un tipo de importación válido.' }, { status: 400 });
+    }
+    const tipo = tipoRaw as TipoImportacion;
+
+    const company = await getCompanyConfig();
+    const branchId = session.branchId ?? company.sucursalActualId ?? (await prisma.branch.findFirst({ where: { activo: true } }))?.id;
+    if (!branchId) {
+      return NextResponse.json({ error: 'No hay ninguna sucursal activa configurada.' }, { status: 400 });
+    }
+
+    const resultado = await ejecutarImportacion(resumen, tipo, session.id, branchId);
+    const importLogId = await registrarImportLog({
+      nombreArchivo: file.name,
+      nombreLote,
+      formato,
+      resumen,
+      resultado,
+      userId: session.id,
+    });
+
+    const { ip, userAgent } = extraerContextoRequest(req);
+    return NextResponse.json({ resumen, resultado, importLogId, ip, userAgent });
+  } catch (err) {
+    console.error('Error en importación masiva:', err);
+    const mensaje = err instanceof Error ? err.message : 'Ocurrió un error al procesar el archivo.';
+    return NextResponse.json({ error: mensaje }, { status: 400 });
+  }
+}
