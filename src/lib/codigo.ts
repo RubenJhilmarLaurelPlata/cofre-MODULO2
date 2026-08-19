@@ -14,17 +14,25 @@
 //   ' (U+2018 comilla simple izq.)   ` (U+0060 acento grave)
 //   ´ (U+00B4 acento agudo)          ʼ (U+02BC letra modificadora apostrofe)
 //   ＇ (U+FF07 apostrofe ancho completo, IME/teclados en japones-chino-coreano)
-// Las 7 se tratan como separadores a eliminar, igual que el guion y los
-// espacios — nunca se sustituye ni se toca ningun caracter alfanumerico
-// real, asi que no hay riesgo de que dos codigos legitimos distintos
-// colisionen entre si.
-const SEPARADORES_APOSTROFE = /['‘’`´ʼ＇]/g;
+//
+// El lector KNUP KP-1018A (HID), segun su configuracion, puede en cambio
+// enviar cualquiera de estos otros caracteres en el mismo lugar:
+//   / (U+002F barra)                 \ (U+005C barra invertida)
+//   _ (U+005F guion bajo)            – (U+2013 guion medio/en dash)
+//   — (U+2014 raya/em dash)          − (U+2212 signo menos matematico)
+// Ningun lector real esta garantizado a mandar siempre el mismo
+// caracter (depende de firmware/idioma de teclado configurado), asi que
+// las 13 variantes de arriba se tratan TODAS igual, junto con el guion
+// real y los espacios: son "separadores equivalentes" — nunca se toca
+// ningun caracter alfanumerico real, asi que no hay riesgo de que dos
+// codigos legitimos distintos colisionen entre si.
+const SEPARADORES_EQUIVALENTES = /['‘’`´ʼ＇/\\_–—−]/g;
 
 export function normalizarCodigo(code: string): string {
   return code
     .trim()
     .toUpperCase()
-    .replace(SEPARADORES_APOSTROFE, '')
+    .replace(SEPARADORES_EQUIVALENTES, '')
     .replace(/[\s\-]+/g, '');
 }
 
@@ -32,17 +40,25 @@ export function normalizarCodigo(code: string): string {
 // comparar/buscar), esta funcion se usa donde el codigo se va a
 // IMPRIMIR/ALMACENAR como "code" (el valor oficial y visible del
 // paquete, ver Package.code en prisma/schema.prisma): convierte
-// unicamente las variantes de apostrofe/acento que el S700 puede enviar
-// en vez del guion (ver lista arriba), sin tocar espacios ni ningun otro
+// cualquier separador equivalente (ver lista arriba) al guion "-", que
+// es el UNICO separador canonico del sistema, sin tocar ningun otro
 // caracter, para que un paquete creado a partir de ese escaneo quede
 // guardado con el mismo formato "M15A-1" que tiene impreso en su
-// etiqueta — nunca con "M15A'1" ni "M15A´1". Se usa en Recepcion (donde
-// se crea el "code" de un paquete nuevo) y tambien para lo que se
-// MUESTRA en pantalla en Entrega/Buscador (nunca debe verse un
-// apostrofe/acento en la interfaz aunque el lector lo haya enviado, solo
-// se usa para buscar via normalizarCodigo() ahi, nunca para crear).
+// etiqueta — nunca con "M15A'1", "M15A´1" ni "M15A/1". Tambien colapsa
+// espacios pegados al separador ("M19A / 29" -> "M19A-29", no
+// "M19A - 29") y guiones consecutivos ("M19A--29" -> "M19A-29"), para
+// que el resultado sea siempre una unica forma canonica. Se usa en
+// Recepcion (donde se crea el "code" de un paquete nuevo), en
+// Importacion (donde se crea el "code" de un paquete faltante) y para lo
+// que se MUESTRA en pantalla en Entrega/Buscador (nunca debe verse un
+// separador distinto de "-" en la interfaz aunque el lector lo haya
+// enviado, solo se usa para buscar via normalizarCodigo() ahi, nunca
+// para crear).
 export function canonicalizarSeparadores(code: string): string {
-  return code.replace(SEPARADORES_APOSTROFE, '-');
+  return code
+    .replace(SEPARADORES_EQUIVALENTES, '-')
+    .replace(/\s*-\s*/g, '-')
+    .replace(/-{2,}/g, '-');
 }
 
 /**

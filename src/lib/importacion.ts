@@ -6,7 +6,7 @@
 // el administrador confirma un resumen ya validado contra la BD real.
 import ExcelJS from 'exceljs';
 import { prisma, TRANSACTION_OPTS } from '@/lib/prisma';
-import { normalizarCodigo } from '@/lib/codigo';
+import { normalizarCodigo, canonicalizarSeparadores } from '@/lib/codigo';
 import { registrarPago } from '@/lib/package-transitions';
 import { registrarAuditoria } from '@/lib/auditoria';
 
@@ -417,7 +417,12 @@ export async function crearPaquetesFaltantes(filas: FilaValidada[], userId: stri
   for (const bloque of enBloques(faltantes, TAMANO_BLOQUE)) {
     const resultados = await Promise.allSettled(
       bloque.map(async (fila) => {
-        const code = fila.codigo.trim().toUpperCase();
+        // canonicalizarSeparadores() antes de guardar: si la celda del
+        // Excel trae "M19A/29" (u otro separador equivalente, ver
+        // src/lib/codigo.ts), el paquete debe quedar creado como
+        // "M19A-29" — el formato canonico — nunca con el separador tal
+        // cual vino del archivo.
+        const code = canonicalizarSeparadores(fila.codigo.trim()).toUpperCase();
         const codigoNormalizado = normalizarCodigo(code);
         const inicial = code.match(/^[A-Z]+/)?.[0];
         if (!inicial) throw new Error('Código sin inicial reconocible.');

@@ -7,6 +7,7 @@
 import { prisma } from '@/lib/prisma';
 import type { Prisma } from '@prisma/client';
 import { MESES_LABELS } from '@/lib/meses';
+import { canonicalizarSeparadores } from '@/lib/codigo';
 
 export { MESES_LABELS };
 
@@ -379,12 +380,19 @@ export async function resolverCodigosReimpresion(selector: SelectorReimpresion):
   if (selector.tipo === 'lote') {
     rows = await prisma.generatedCode.findMany({ where: { batchId: selector.batchId } });
   } else if (selector.tipo === 'codigos') {
-    const codigosNormalizados = selector.codigos.map((c) => c.trim().toUpperCase()).filter(Boolean);
+    // canonicalizarSeparadores() antes de comparar: GeneratedCode.code
+    // siempre se guarda con "-" (ver construirCodigo), asi que un codigo
+    // tipeado/pegado a mano con otro separador equivalente (ej.
+    // "M19A/29", ver src/lib/codigo.ts) nunca encontraria coincidencia
+    // sin esto.
+    const codigosNormalizados = selector.codigos
+      .map((c) => canonicalizarSeparadores(c.trim()).toUpperCase())
+      .filter(Boolean);
     rows = await prisma.generatedCode.findMany({ where: { code: { in: codigosNormalizados } } });
   } else {
     // tipo === 'rango'
-    const desde = parseConsecutivo(selector.desde.trim().toUpperCase());
-    const hasta = parseConsecutivo(selector.hasta.trim().toUpperCase());
+    const desde = parseConsecutivo(canonicalizarSeparadores(selector.desde.trim()).toUpperCase());
+    const hasta = parseConsecutivo(canonicalizarSeparadores(selector.hasta.trim()).toUpperCase());
     if (!desde || !hasta) {
       throw new EtiquetasError('No se pudo interpretar el rango de códigos indicado.');
     }

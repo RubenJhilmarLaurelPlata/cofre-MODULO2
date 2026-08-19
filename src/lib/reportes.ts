@@ -11,6 +11,7 @@ import { diasTranscurridos, dateKey } from '@/lib/pricing';
 import { fechaReferencia, construirFiltroTextoPaquete } from '@/lib/package-detail';
 import { sumarCosto } from '@/lib/dashboard-data';
 import { buscarLotes } from '@/lib/etiquetas';
+import { canonicalizarSeparadores } from '@/lib/codigo';
 import type { Prisma } from '@prisma/client';
 import type { PackageStatus } from '@/types';
 
@@ -494,7 +495,11 @@ export async function getReporteEtiquetas(filtros: FiltrosReporte): Promise<Repo
 
   const where: Prisma.GeneratedCodeWhereInput = { createdAt: { gte, lt } };
   if (filtros.inicial) where.inicial = filtros.inicial;
-  if (filtros.q) where.code = { contains: filtros.q };
+  // GeneratedCode no tiene "codigoNormalizado" (a diferencia de Package,
+  // ver construirFiltroTextoPaquete): su "code" siempre se guarda con
+  // "-", asi que hay que canonicalizar el separador del texto buscado
+  // aqui mismo para que "M19A/29" siga encontrando "M19A-29".
+  if (filtros.q) where.code = { contains: canonicalizarSeparadores(filtros.q.trim()).toUpperCase() };
 
   const codigos = await prisma.generatedCode.findMany({ where, take: 5000 });
   const utilizados = codigos.filter((c) => c.usado).length;
