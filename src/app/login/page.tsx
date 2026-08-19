@@ -2,12 +2,13 @@
 import { redirect } from 'next/navigation';
 import { getSession } from '@/lib/auth';
 import { getCompanyConfig } from '@/lib/config';
+import { moduloInicialPara } from '@/types';
 import { Logo } from '@/components/layout/logo';
 import { LoginForm } from './login-form';
 
 export default async function LoginPage() {
   const session = await getSession();
-  if (session) redirect('/dashboard');
+  if (session) redirect(`/${moduloInicialPara(session.role) ?? 'login'}`);
   const company = await getCompanyConfig();
 
   return (

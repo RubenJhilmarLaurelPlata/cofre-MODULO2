@@ -28,6 +28,8 @@ import {
   Loader2,
   Camera as CameraIcon,
   ScanLine,
+  AlertTriangle,
+  RotateCcw,
 } from 'lucide-react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -167,6 +169,32 @@ export function EntregaClient({
   const [editMotivo, setEditMotivo] = React.useState('');
   const [guardandoCorreccion, setGuardandoCorreccion] = React.useState(false);
 
+  // "Editar" un paquete ya ENTREGADO en la tarjeta principal (no la fila de
+  // la lista de abajo, que ya tiene su propia edicion de monto): desbloquea
+  // destinatario/telefono/observaciones para corregirlos sin crear un
+  // registro nuevo — reutiliza el mismo guardarDatos()/PATCH que ya usan
+  // los paquetes activos, el backend nunca bloqueo esto por estado, solo
+  // la interfaz lo tenia deshabilitado.
+  const [editandoEntregado, setEditandoEntregado] = React.useState(false);
+
+  // Alerta roja "PAQUETE YA ENTREGADO" (seccion 4 de la especificacion):
+  // se dispara al ENCONTRAR un paquete que ya esta ENTREGADO (por
+  // escaneo, tecleo o camara — el mismo procesarEntrega() de siempre), es
+  // muy visible, y se cierra sola a los 2 segundos sin bloquear nada —
+  // escanear el siguiente codigo sigue funcionando de inmediato, y el
+  // detalle completo del paquete (bajo la alerta) sigue visible despues
+  // de que la alerta desaparece.
+  const [alertaEntregado, setAlertaEntregado] = React.useState<{ code: string; entregaAt: string | Date | null } | null>(null);
+  const alertaEntregadoTimeoutRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+  const mostrarAlertaEntregado = React.useCallback((code: string, entregaAt: string | Date | null) => {
+    if (alertaEntregadoTimeoutRef.current) clearTimeout(alertaEntregadoTimeoutRef.current);
+    setAlertaEntregado({ code, entregaAt });
+    alertaEntregadoTimeoutRef.current = setTimeout(() => setAlertaEntregado(null), 2000);
+  }, []);
+  React.useEffect(() => () => {
+    if (alertaEntregadoTimeoutRef.current) clearTimeout(alertaEntregadoTimeoutRef.current);
+  }, []);
+
   const inputRef = React.useRef<HTMLInputElement | null>(null);
   const codigoInicialProcesadoRef = React.useRef<string | undefined>(undefined);
   // Resuelve la promesa que useScanQueue esta esperando dentro de
@@ -191,11 +219,13 @@ export function EntregaClient({
       setPaquete(paqueteInicial);
       setMensajeError(null);
       setFase(paqueteInicial.status === 'EN_PAQUETERIA' ? 'COUNTDOWN' : 'FOUND');
+      if (paqueteInicial.status === 'ENTREGADO') mostrarAlertaEntregado(paqueteInicial.code, paqueteInicial.entregaAt);
     } else {
       setPaquete(null);
       setFase('ERROR');
       setMensajeError(`No se encontró ningún paquete con el código "${codigoInicial}".`);
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [codigoInicial, paqueteInicial]);
 
   React.useEffect(() => {
@@ -209,6 +239,12 @@ export function EntregaClient({
     setMontoCobrar(paquete ? Math.max(0, Math.round(paquete.saldoPendiente * 100) / 100) : 0);
     setMotivoCobro('');
     setPersonalizarCobro(false);
+    // Cierra el modo edicion de un entregado tanto al escanear un paquete
+    // distinto como al guardar exitosamente (guardarDatos() hace
+    // setPaquete(data) con la respuesta ya guardada) — mismo patron
+    // "guardar y cerrar" en un solo lugar, sin duplicar el cierre en cada
+    // callsite.
+    setEditandoEntregado(false);
   }, [paquete]);
 
   /**
@@ -243,7 +279,17 @@ export function EntregaClient({
       }
       setPaquete(data);
       reportarEscaneoExitoso();
-      playSound('ok');
+      if (data.status === 'ENTREGADO') {
+        // Escanear un paquete que YA esta entregado nunca debe volver a
+        // "entregarlo" ni pasar desapercibido como un hallazgo mas — una
+        // alerta roja bien visible, con sonido distinto al de un hallazgo
+        // normal, que se cierra sola a los 2s sin bloquear el siguiente
+        // escaneo (ver mostrarAlertaEntregado arriba).
+        mostrarAlertaEntregado(data.code, data.entregaAt);
+        playSound('duplicado');
+      } else {
+        playSound('ok');
+      }
       if (data.status !== 'EN_PAQUETERIA') {
         // Encontrado pero no entregable ahora mismo (en deposito,
         // pendiente de bajar, ya entregado, denegado): se muestra su
@@ -313,7 +359,7 @@ export function EntregaClient({
     focusScanner(inputRef);
   }
 
-  async function ejecutarAccion(accion: 'denegar' | 'enviar-deposito' | 'solicitar-bajar', mensajeExito: string, tipoSonido: SoundType = 'ok') {
+  async function ejecutarAccion(accion: 'denegar' | 'enviar-deposito' | 'solicitar-bajar' | 'reingresar', mensajeExito: string, tipoSonido: SoundType = 'ok') {
     if (!paquete || accionEnCurso) return;
     setAccionEnCurso(true);
     try {
@@ -325,6 +371,21 @@ export function EntregaClient({
         return;
       }
       setPaquete(data);
+      if (accion === 'reingresar') {
+        // Igual que reingresarDesdeLista(): si el paquete que se acaba de
+        // volver a ingresar seguia visible en "Entregados recientemente"
+        // (ej. se entrego hoy mismo y se corrigio al toque), debe salir de
+        // ahi y del contador de inmediato — sin esto quedaba mostrado como
+        // entregado en la lista hasta recargar la pagina. A diferencia de
+        // reingresarDesdeLista() (que solo se puede llamar sobre una fila
+        // que YA esta en esa lista), este boton tambien aparece al
+        // encontrar por escaneo/busqueda un paquete entregado en un dia
+        // anterior — por eso el contador de "hoy" solo baja si el paquete
+        // realmente estaba contado ahi.
+        const estabaEnListaDeHoy = entregadosRecientes.some((p) => p.code === data.code);
+        setEntregadosRecientes((prev) => prev.filter((p) => p.code !== data.code));
+        if (estabaEnListaDeHoy) setEntregadosHoy((n) => Math.max(0, n - 1));
+      }
       setFeedback({ ok: true, mensaje: mensajeExito });
       playSound(tipoSonido);
     } catch {
@@ -437,6 +498,39 @@ export function EntregaClient({
     setEditMotivo('');
   }
 
+  const [reingresandoCode, setReingresandoCode] = React.useState<string | null>(null);
+
+  /** "Volver a ingresar" desde la fila de la lista, sin tener que re-escanear el paquete — mismo endpoint que el boton de la tarjeta principal. */
+  async function reingresarDesdeLista(code: string) {
+    if (reingresandoCode) return;
+    setReingresandoCode(code);
+    try {
+      const res = await fetch(`/api/entrega/${encodeURIComponent(code)}/reingresar`, { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) {
+        setFeedback({ ok: false, mensaje: data.error ?? 'No se pudo volver a ingresar el paquete.' });
+        playSound('error');
+        return;
+      }
+      // Ya no esta ENTREGADO: sale de "Entregados recientemente" y el
+      // contador de hoy baja (best-effort — la fuente real para
+      // reportes/dashboard siempre recalcula desde Package.status +
+      // entregaAt en la base de datos, esto solo mantiene coherente lo
+      // que ya se ve en pantalla en esta sesion).
+      setEntregadosRecientes((prev) => prev.filter((p) => p.code !== code));
+      setEntregadosHoy((n) => Math.max(0, n - 1));
+      if (paquete?.code === code) setPaquete(data);
+      if (editando === code) setEditando(null);
+      setFeedback({ ok: true, mensaje: `${code} vuelve a estar en paquetería.` });
+      playSound('ok');
+    } catch {
+      setFeedback({ ok: false, mensaje: 'Error de conexión. No se volvió a ingresar el paquete.' });
+      playSound('error');
+    } finally {
+      setReingresandoCode(null);
+    }
+  }
+
   async function guardarCorreccion(code: string) {
     if (guardandoCorreccion) return;
     setGuardandoCorreccion(true);
@@ -470,6 +564,12 @@ export function EntregaClient({
   const puedeSolicitarBajar = paquete?.status === 'EN_DEPOSITO';
   const puedeDenegar = paquete && !['ENTREGADO', 'DENEGADO'].includes(paquete.status);
   const esFinal = paquete && ['ENTREGADO', 'DENEGADO'].includes(paquete.status);
+  const puedeReingresar = paquete?.status === 'ENTREGADO';
+  // "Editar"/"Guardar datos" quedan disponibles tanto en el flujo normal
+  // (paquete activo) como en un ENTREGADO una vez que el operador tocó
+  // "Editar" — nunca en DENEGADO (esFinal cubre ambos, pero solo
+  // ENTREGADO tiene una via explicita de vuelta atras).
+  const puedeEditarCampos = !esFinal || editandoEntregado;
 
   return (
     <div className="grid grid-cols-1 gap-5 md:grid-cols-3">
@@ -539,6 +639,21 @@ export function EntregaClient({
             {fase === 'ERROR' && mensajeError && <p className="mt-2 text-sm text-red-600 dark:text-red-400">{mensajeError}</p>}
           </CardContent>
         </Card>
+
+        {alertaEntregado && (
+          <div
+            role="alert"
+            className="flex items-center gap-3 rounded-xl border-2 border-red-700 bg-red-600 px-4 py-3.5 text-white shadow-lg"
+          >
+            <AlertTriangle className="h-7 w-7 shrink-0" strokeWidth={2.25} />
+            <div className="min-w-0">
+              <p className="text-base font-extrabold uppercase leading-tight tracking-wide">Paquete ya entregado</p>
+              <p className="truncate text-sm font-medium text-red-50">
+                {alertaEntregado.code} — Entregado el {fmtFecha(alertaEntregado.entregaAt)} a las {fmtHora(alertaEntregado.entregaAt)}
+              </p>
+            </div>
+          </div>
+        )}
 
         {feedback && (
           <div
@@ -757,11 +872,11 @@ export function EntregaClient({
                         id="destinatario"
                         value={destinatario}
                         onChange={(e) => setDestinatario(e.target.value)}
-                        disabled={!!esFinal}
+                        disabled={!puedeEditarCampos}
                         placeholder="Nombre de quien recoge"
                         className="pr-11"
                       />
-                      {!esFinal && <VoiceInputButton onResult={setDestinatario} className="absolute right-1 top-1/2 -translate-y-1/2" />}
+                      {puedeEditarCampos && <VoiceInputButton onResult={setDestinatario} className="absolute right-1 top-1/2 -translate-y-1/2" />}
                     </div>
                   </div>
                   <div className="space-y-1">
@@ -770,7 +885,7 @@ export function EntregaClient({
                       id="telefono"
                       value={destinatarioTelefono}
                       onChange={(e) => setDestinatarioTelefono(e.target.value)}
-                      disabled={!!esFinal}
+                      disabled={!puedeEditarCampos}
                       placeholder="Celular de contacto"
                     />
                   </div>
@@ -781,11 +896,11 @@ export function EntregaClient({
                         id="destinatario-obs"
                         value={destinatarioObs}
                         onChange={(e) => setDestinatarioObs(e.target.value)}
-                        disabled={!!esFinal}
+                        disabled={!puedeEditarCampos}
                         placeholder="Ej: solo entregar con cédula"
                         className="pr-11"
                       />
-                      {!esFinal && <VoiceInputButton onResult={setDestinatarioObs} className="absolute right-1 top-1/2 -translate-y-1/2" />}
+                      {puedeEditarCampos && <VoiceInputButton onResult={setDestinatarioObs} className="absolute right-1 top-1/2 -translate-y-1/2" />}
                     </div>
                   </div>
                 </div>
@@ -798,18 +913,59 @@ export function EntregaClient({
                     value={obs}
                     onChange={(e) => setObs(e.target.value)}
                     rows={2}
-                    disabled={!!esFinal}
+                    disabled={!puedeEditarCampos}
                     className="w-full rounded-lg border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900 px-3 py-2 pr-11 text-sm text-ink dark:text-gray-100 outline-none focus:border-brand-500 focus:ring-2 focus:ring-brand-100 disabled:opacity-50"
                     placeholder="Ej: cliente llamó, cobrar monto especial, paquete frágil…"
                   />
-                  {!esFinal && <VoiceInputButton onResult={setObs} className="absolute right-1 top-1.5" />}
+                  {puedeEditarCampos && <VoiceInputButton onResult={setObs} className="absolute right-1 top-1.5" />}
                 </div>
               </PanelColapsable>
 
-              {!esFinal && (
-                <Button variant="secondary" size="sm" onClick={guardarDatos} loading={accionEnCurso} className="min-h-[44px]">
-                  <Save className="h-4 w-4" /> Guardar datos
-                </Button>
+              {puedeReingresar && !editandoEntregado && (
+                <div className="flex flex-wrap gap-2">
+                  <Button variant="secondary" size="sm" onClick={() => setEditandoEntregado(true)} className="min-h-[44px]">
+                    <Pencil className="h-4 w-4" /> Editar
+                  </Button>
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    disabled={accionEnCurso}
+                    onClick={() => {
+                      if (window.confirm(`¿Confirmas volver a ingresar el paquete ${paquete.code}? Volverá a "En Paquetería" — no se crea un paquete nuevo ni cambia su fecha original de ingreso.`)) {
+                        ejecutarAccion('reingresar', 'Paquete vuelto a ingresar. Ahora está en paquetería.', 'ok');
+                      }
+                    }}
+                    className="min-h-[44px]"
+                  >
+                    <RotateCcw className="h-4 w-4" /> Volver a ingresar
+                  </Button>
+                </div>
+              )}
+
+              {puedeEditarCampos && (
+                <div className="flex flex-wrap gap-2">
+                  <Button variant="secondary" size="sm" onClick={guardarDatos} loading={accionEnCurso} className="min-h-[44px]">
+                    <Save className="h-4 w-4" /> {editandoEntregado ? 'Guardar cambios' : 'Guardar datos'}
+                  </Button>
+                  {editandoEntregado && (
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => {
+                        // Descarta cualquier cambio sin guardar, volviendo a
+                        // los valores reales del paquete antes de cerrar.
+                        setObs(paquete.observaciones ?? '');
+                        setDestinatario(paquete.destinatario ?? '');
+                        setDestinatarioTelefono(paquete.destinatarioTelefono ?? '');
+                        setDestinatarioObs(paquete.destinatarioObservaciones ?? '');
+                        setEditandoEntregado(false);
+                      }}
+                      className="min-h-[44px]"
+                    >
+                      <X className="h-4 w-4" /> Cancelar
+                    </Button>
+                  )}
+                </div>
               )}
 
               {MOTIVO_NO_ENTREGABLE[paquete.status] && (
@@ -920,14 +1076,28 @@ export function EntregaClient({
                         <Badge variant={ESTADO_PAGO_VARIANT[p.estadoPago] ?? 'neutral'}>{ESTADO_PAGO_LABEL[p.estadoPago] ?? p.estadoPago}</Badge>
                       </div>
                       {esAdmin && (
-                        <button
-                          type="button"
-                          onClick={() => (editando === p.code ? setEditando(null) : abrirEdicion(p))}
-                          className="flex shrink-0 items-center gap-1 text-xs text-brand-600 dark:text-brand-400 hover:underline"
-                        >
-                          {editando === p.code ? <X className="h-3.5 w-3.5" /> : <Pencil className="h-3.5 w-3.5" />}
-                          {editando === p.code ? 'Cerrar' : 'Editar'}
-                        </button>
+                        <div className="flex shrink-0 items-center gap-3">
+                          <button
+                            type="button"
+                            onClick={() => (editando === p.code ? setEditando(null) : abrirEdicion(p))}
+                            className="flex items-center gap-1 text-xs text-brand-600 dark:text-brand-400 hover:underline"
+                          >
+                            {editando === p.code ? <X className="h-3.5 w-3.5" /> : <Pencil className="h-3.5 w-3.5" />}
+                            {editando === p.code ? 'Cerrar' : 'Editar'}
+                          </button>
+                          <button
+                            type="button"
+                            disabled={reingresandoCode === p.code}
+                            onClick={() => {
+                              if (window.confirm(`¿Confirmas volver a ingresar el paquete ${p.code}? Volverá a "En Paquetería" — no se crea un paquete nuevo ni cambia su fecha original de ingreso.`)) {
+                                reingresarDesdeLista(p.code);
+                              }
+                            }}
+                            className="flex items-center gap-1 text-xs text-amber-600 hover:underline disabled:opacity-50 dark:text-amber-400"
+                          >
+                            <RotateCcw className="h-3.5 w-3.5" /> Volver a ingresar
+                          </button>
+                        </div>
                       )}
                     </div>
                     <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-xs text-ink-soft dark:text-gray-400">

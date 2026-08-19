@@ -98,8 +98,11 @@ export function GastosTab({ moneda }: { moneda: string }) {
             ) : gastos.length === 0 ? (
               <p className="py-8 text-center text-sm text-gray-400 dark:text-gray-500">No hay gastos registrados en este período.</p>
             ) : (
-              <div className="overflow-x-auto">
-                <table className="w-full text-sm">
+              <div className="scrollbar-thin overflow-x-auto">
+                {/* min-w evita que "w-full" achique las columnas hasta
+                    volverlas ilegibles en un telefono (mismo criterio que
+                    auditoria-tab.tsx/report-table.tsx). */}
+                <table className="w-full min-w-[480px] text-sm">
                   <thead>
                     <tr className="border-b border-gray-100 dark:border-gray-800/60 text-left text-xs text-gray-400 dark:text-gray-500">
                       <th className="pb-2 font-medium">Fecha</th>

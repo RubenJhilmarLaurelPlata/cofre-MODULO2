@@ -34,6 +34,13 @@ const serieSchema = z.object({
     .max(4)
     .regex(/^[A-Z]+$/, 'La inicial solo puede tener letras'),
   cantidad: z.number().int().min(1).max(MAX_CANTIDAD_TOTAL),
+  // Numero inicial explicito (ej. "1" para regenerar 1..100, o "101" para
+  // continuar un rango puntual) — si no se envia, se sigue calculando
+  // automaticamente como "ultimo correlativo de la serie + 1", exactamente
+  // el mismo comportamiento que esta pantalla tenia antes de que existiera
+  // este campo. Sin esto, esta pantalla nunca podia generar desde 1 una
+  // vez que la serie ya tenia algun lote generado (ver GenerarPdfTab).
+  consecutivoInicial: z.number().int().min(1).optional(),
 });
 
 const bodySchema = z.object({
@@ -91,7 +98,7 @@ export async function POST(req: Request) {
     // pero adelantar el chequeo aqui evita crear la mitad de las series si
     // otra mas adelante en la lista iba a fallar por duplicados.
     const planes = series.map((s) => {
-      const consecutivoInicial = (correlativoPorInicial.get(s.inicial) ?? 0) + 1;
+      const consecutivoInicial = s.consecutivoInicial ?? (correlativoPorInicial.get(s.inicial) ?? 0) + 1;
       const codigos: string[] = [];
       for (let n = 0; n < s.cantidad; n++) {
         codigos.push(construirCodigo(s.inicial, fecha, letraMes, separador, consecutivoInicial + n));
@@ -116,7 +123,7 @@ export async function POST(req: Request) {
         descripcionNuevaSerie: !correlativoPorInicial.has(s.inicial) ? `Serie ${s.inicial}` : undefined,
         fechas: [fecha],
         cantidadPorDia: s.cantidad,
-        consecutivoInicial: (correlativoPorInicial.get(s.inicial) ?? 0) + 1,
+        consecutivoInicial: s.consecutivoInicial ?? (correlativoPorInicial.get(s.inicial) ?? 0) + 1,
         separador,
         userId: session.id,
       });

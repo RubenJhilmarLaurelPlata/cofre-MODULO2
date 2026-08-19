@@ -31,6 +31,12 @@ interface FilaSerie {
   id: string;
   inicial: string;
   cantidad: number;
+  // Numero inicial explicito, opcional: vacio ("") = automatico (sigue
+  // continuando desde el ultimo correlativo de la serie, como siempre).
+  // Un valor propio permite generar desde 1 (o cualquier rango puntual)
+  // aunque la serie ya tenga lotes generados — antes esta pantalla no
+  // tenia forma de pedir esto, quedaba encerrada en "seguir donde quedo".
+  consecutivoInicial: string;
 }
 
 // Una hoja completa (30), para que la vista previa muestre el mismo
@@ -52,7 +58,7 @@ function fmtFechaCorta(fecha: string): string {
 let filaIdSeq = 0;
 function nuevaFila(inicial = '', cantidad = 100): FilaSerie {
   filaIdSeq += 1;
-  return { id: `fila-${filaIdSeq}`, inicial, cantidad };
+  return { id: `fila-${filaIdSeq}`, inicial, cantidad, consecutivoInicial: '' };
 }
 
 export function GenerarPdfTab({ series, monthLetters, separadorDefault, onCorrelativoActualizado }: GenerarPdfTabProps) {
@@ -82,7 +88,8 @@ export function GenerarPdfTab({ series, monthLetters, separadorDefault, onCorrel
     for (const f of filasValidas) {
       if (out.length >= PREVIEW_LIMIT) break;
       const inicial = f.inicial.trim().toUpperCase();
-      const consecutivoInicial = (correlativoPorInicial.get(inicial) ?? 0) + 1;
+      const consecutivoManual = Number(f.consecutivoInicial);
+      const consecutivoInicial = f.consecutivoInicial.trim() && consecutivoManual > 0 ? consecutivoManual : (correlativoPorInicial.get(inicial) ?? 0) + 1;
       const restante = PREVIEW_LIMIT - out.length;
       const cantidadPreview = Math.min(f.cantidad, restante);
       for (let i = 0; i < cantidadPreview; i++) {
@@ -112,7 +119,14 @@ export function GenerarPdfTab({ series, monthLetters, separadorDefault, onCorrel
     try {
       const body = {
         fecha,
-        series: filasValidas.map((f) => ({ inicial: f.inicial.trim().toUpperCase(), cantidad: f.cantidad })),
+        series: filasValidas.map((f) => {
+          const consecutivoManual = Number(f.consecutivoInicial);
+          return {
+            inicial: f.inicial.trim().toUpperCase(),
+            cantidad: f.cantidad,
+            ...(f.consecutivoInicial.trim() && consecutivoManual > 0 ? { consecutivoInicial: consecutivoManual } : {}),
+          };
+        }),
       };
       const res = await fetch('/api/etiquetas/generar-pdf-lote', {
         method: 'POST',
@@ -190,6 +204,10 @@ export function GenerarPdfTab({ series, monthLetters, separadorDefault, onCorrel
             <CardTitle>Series</CardTitle>
           </CardHeader>
           <CardContent className="space-y-3">
+            <p className="text-xs text-ink-soft dark:text-gray-400">
+              &quot;Número inicial&quot; es opcional: dejalo vacío para continuar automáticamente desde el último código de esa serie, o escribí un número (ej. 1) para generar un rango puntual — el sistema
+              sigue validando que ningún código quede duplicado.
+            </p>
             {filas.map((f) => {
               const inicial = f.inicial.trim().toUpperCase();
               const serieExistente = series.find((s) => s.inicial === inicial);
@@ -216,6 +234,18 @@ export function GenerarPdfTab({ series, monthLetters, separadorDefault, onCorrel
                       value={f.cantidad}
                       onChange={(e) => actualizarFila(f.id, { cantidad: Math.max(1, Number(e.target.value) || 1) })}
                       className="mt-1 font-mono"
+                    />
+                  </div>
+                  <div className="w-32 min-w-0 flex-1 sm:flex-none">
+                    <Label htmlFor={`numero-inicial-${f.id}`}>Número inicial</Label>
+                    <Input
+                      id={`numero-inicial-${f.id}`}
+                      type="number"
+                      min={1}
+                      value={f.consecutivoInicial}
+                      onChange={(e) => actualizarFila(f.id, { consecutivoInicial: e.target.value })}
+                      className="mt-1 font-mono"
+                      placeholder={serieExistente ? `${serieExistente.correlativo + 1} (auto)` : '1 (auto)'}
                     />
                   </div>
                   <p className="min-w-0 flex-1 truncate text-xs text-ink-soft dark:text-gray-400">

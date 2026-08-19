@@ -362,7 +362,29 @@ export function ImportacionClient() {
               <ResumenNumero label="No encontrados" valor={resumen.noEncontrados} color="text-amber-600 dark:text-amber-400" />
             </div>
 
-            <div className="max-h-72 overflow-y-auto rounded-lg border border-gray-100 dark:border-gray-800/60">
+            {/* Móvil: tarjetas — 6 columnas en una tabla de 375px de ancho
+                obligaban a achicar el texto hasta hacerlo ilegible o a
+                desbordar la pagina horizontalmente. Mismo criterio que el
+                historial de lotes mas abajo en este mismo archivo (ver
+                "Móvil: tarjetas, no la tabla de escritorio comprimida"). */}
+            <div className="max-h-96 space-y-2 overflow-y-auto md:hidden">
+              {resumen.filas.map((f) => (
+                <div key={f.numeroFila} className="rounded-lg border border-gray-100 dark:border-gray-800/60 p-2.5">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="font-mono text-sm font-semibold text-ink dark:text-gray-100">{f.codigoOficial ?? f.codigo}</span>
+                    <Badge variant={ESTADO_INFO[f.estado].variant}>{ESTADO_INFO[f.estado].label}</Badge>
+                  </div>
+                  <div className="mt-1 flex flex-wrap gap-x-3 gap-y-0.5 text-xs text-ink-soft dark:text-gray-400">
+                    <span>Fila {f.numeroFila}</span>
+                    {f.monto !== undefined && <span>Bs {f.monto}</span>}
+                    {f.personaRecoge && <span>{f.personaRecoge}</span>}
+                  </div>
+                  {f.motivo && <p className="mt-1 text-xs text-gray-400 dark:text-gray-500">{f.motivo}</p>}
+                </div>
+              ))}
+            </div>
+
+            <div className="hidden max-h-72 overflow-y-auto rounded-lg border border-gray-100 dark:border-gray-800/60 md:block">
               <table className="w-full text-sm">
                 <thead className="sticky top-0 bg-gray-50 dark:bg-gray-800/60">
                   <tr className="text-left text-xs text-gray-400 dark:text-gray-500">

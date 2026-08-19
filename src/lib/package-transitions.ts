@@ -36,7 +36,8 @@ async function transicionar(
   pkg: Package,
   nuevoEstado: PackageStatus,
   userId: string,
-  camposExtra: Record<string, unknown>
+  camposExtra: Record<string, unknown>,
+  nota?: string
 ): Promise<Package> {
   const now = new Date();
   const estadoAnterior = pkg.status;
@@ -57,7 +58,7 @@ async function transicionar(
       );
     }
     await tx.packageHistory.create({
-      data: { packageId: pkg.id, estado: nuevoEstado, fecha: now, userId },
+      data: { packageId: pkg.id, estado: nuevoEstado, fecha: now, userId, nota: nota ?? null },
     });
     return tx.package.findUniqueOrThrow({ where: { id: pkg.id } });
   }, TRANSACTION_OPTS);
@@ -186,4 +187,35 @@ export async function bajarDeDeposito(code: string, userId: string): Promise<Pac
     throw new TransicionInvalidaError('Solo paquetes en estado "Pendiente de bajar" pueden volver a "En Paquetería".');
   }
   return transicionar(pkg, 'EN_PAQUETERIA', userId, { pendienteAt: null });
+}
+
+/**
+ * Corrige un paquete marcado ENTREGADO por error, devolviéndolo al flujo
+ * normal (EN_PAQUETERIA) — caso real: el operador escaneó/confirmó una
+ * entrega equivocada. NUNCA crea un registro nuevo ni cambia "code" o
+ * "ingresoAt" (la fecha original de ingreso es inmutable por esta vía,
+ * igual que el resto del sistema): solo cambia "status" y limpia
+ * "entregaAt" (mismo criterio que bajarDeDeposito() limpia "pendienteAt"
+ * al volver a EN_PAQUETERIA — el timestamp de un estado que se abandona
+ * no debe seguir colgando en el paquete activo). La entrega anterior NO
+ * se pierde: queda para siempre en PackageHistory (la fila ENTREGADO ya
+ * escrita en su momento nunca se borra ni se modifica), y esta misma
+ * transición agrega su propia fila EN_PAQUETERIA con una nota explicando
+ * el motivo, para que la trazabilidad completa (ingreso → entrega →
+ * reingreso → nueva entrega, si vuelve a pasar) quede reconstruible.
+ * Pagos/montoPagado tampoco se tocan (ver corregir/route.ts para ajustar
+ * un cobro mal hecho) — reingresar es una corrección de ESTADO, no de dinero.
+ */
+export async function reingresarPaquete(code: string, userId: string, motivo?: string): Promise<Package> {
+  const pkg = await buscarOFallar(code);
+  if (pkg.status !== 'ENTREGADO') {
+    throw new TransicionInvalidaError('Solo se pueden volver a ingresar paquetes que estén en estado "Entregado".');
+  }
+  return transicionar(
+    pkg,
+    'EN_PAQUETERIA',
+    userId,
+    { entregaAt: null },
+    motivo?.trim() ? `Reingreso: ${motivo.trim()}` : 'Reingreso: marcado como entregado por error'
+  );
 }

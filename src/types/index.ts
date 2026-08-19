@@ -53,6 +53,31 @@ export function puedeAcceder(role: Role, modulo: Modulo): boolean {
   return (PERMISOS_POR_MODULO[modulo] as readonly Role[]).includes(role);
 }
 
+/**
+ * Orden de preferencia para elegir a donde mandar a un usuario recien
+ * logueado (o rebotado por falta de permiso). No todos los roles tienen
+ * acceso a "dashboard" (ej. ADMIN_CAJA) — redirigir ahi sin verificar
+ * causaba un loop infinito de redirects (dashboard -> sin permiso ->
+ * dashboard -> sin permiso -> ...). Esta funcion siempre devuelve el
+ * primer modulo al que el rol SI tiene acceso, nunca uno prohibido.
+ */
+const ORDEN_MODULOS_PREFERIDO: readonly Modulo[] = [
+  'dashboard',
+  'recepcion',
+  'entrega',
+  'deposito',
+  'buscador',
+  'etiquetas',
+  'reportes',
+  'finanzas',
+  'importacion',
+  'configuracion',
+];
+
+export function moduloInicialPara(role: Role): Modulo | null {
+  return ORDEN_MODULOS_PREFERIDO.find((modulo) => puedeAcceder(role, modulo)) ?? null;
+}
+
 /** Etiquetas legibles de cada rol, para mostrar en la interfaz. */
 export const ROLE_LABELS: Record<Role, string> = {
   ADMIN: 'Administrador',

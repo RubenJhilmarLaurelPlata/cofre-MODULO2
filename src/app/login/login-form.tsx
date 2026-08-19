@@ -6,6 +6,7 @@ import { useRouter } from 'next/navigation';
 import { Lock, User } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input, Label } from '@/components/ui/input';
+import { moduloInicialPara, type Role } from '@/types';
 
 export function LoginForm() {
   const router = useRouter();
@@ -30,7 +31,8 @@ export function LoginForm() {
       }
       const params = new URLSearchParams(window.location.search);
       const next = params.get('next');
-      router.push(next && next.startsWith('/') ? next : '/dashboard');
+      const destinoRol = moduloInicialPara(data.user.role as Role);
+      router.push(next && next.startsWith('/') ? next : `/${destinoRol ?? 'login'}`);
       router.refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'No se pudo iniciar sesión');

@@ -2,6 +2,30 @@
 @tailwind components;
 @tailwind utilities;
 
+/*
+ * Causa raiz del zoom automatico al enfocar un input en movil: TODOS los
+ * inputs/select/textarea del sistema usan "text-sm" (14px) como tamaño
+ * base (ver src/components/ui/input.tsx y varios <select>/<textarea>
+ * sueltos en Buscador/Entrega/Configuracion/etc) — iOS Safari y Chrome
+ * Android hacen zoom automatico al enfocar cualquier campo con
+ * font-size menor a 16px, sin excepcion, sin importar el viewport meta.
+ * Esta regla queda FUERA de cualquier @layer a proposito: las reglas sin
+ * layer siempre ganan sobre las reglas en capas (base/components/
+ * utilities de Tailwind, que es donde vive "text-sm"), asi que sube el
+ * tamaño real de fuente sin tener que tocar cada campo del sistema uno
+ * por uno ni arriesgarse a que alguno quede afuera. Solo aplica debajo
+ * de "md" (768px): en escritorio, donde el zoom automatico no existe
+ * como comportamiento del navegador, el diseño compacto ya validado
+ * queda exactamente igual.
+ */
+@media (max-width: 767px) {
+  input,
+  select,
+  textarea {
+    font-size: 16px !important;
+  }
+}
+
 @layer base {
   html {
     -webkit-text-size-adjust: 100%;

@@ -4,7 +4,7 @@
 
 import { NextResponse, type NextRequest } from 'next/server';
 import { jwtVerify } from 'jose';
-import { PERMISOS_POR_MODULO, type Modulo, type Role } from '@/types';
+import { PERMISOS_POR_MODULO, moduloInicialPara, type Modulo, type Role } from '@/types';
 import { SESSION_COOKIE } from '@/lib/session-cookie';
 
 const RUTAS_PUBLICAS = ['/login'];
@@ -55,7 +55,22 @@ export async function middleware(req: NextRequest) {
     if (segmentos[0] === 'api') {
       return NextResponse.json({ error: 'No tienes permiso para esta acción' }, { status: 403 });
     }
-    return NextResponse.redirect(new URL('/dashboard?error=sin-permiso', req.url));
+    // Nunca redirigir a un modulo fijo (ej. "/dashboard"): si el rol tampoco
+    // tiene acceso a ese destino, el middleware lo volveria a rechazar y se
+    // forma un loop infinito (asi se producia ERR_TOO_MANY_REDIRECTS para
+    // roles como ADMIN_CAJA, que no tiene acceso a dashboard). Se redirige
+    // siempre al primer modulo que el rol SI puede usar.
+    const destino = moduloInicialPara(session.role);
+    if (!destino || destino === candidato) {
+      // No hay ningun modulo accesible para este rol (no deberia ocurrir
+      // con los roles actuales, pero evita cualquier loop si pasara): se
+      // cierra la sesion y se manda a login en vez de rebotar sin salida.
+      const loginUrl = new URL('/login', req.url);
+      const res = NextResponse.redirect(loginUrl);
+      res.cookies.delete(SESSION_COOKIE);
+      return res;
+    }
+    return NextResponse.redirect(new URL(`/${destino}?error=sin-permiso`, req.url));
   }
 
   return NextResponse.next();
