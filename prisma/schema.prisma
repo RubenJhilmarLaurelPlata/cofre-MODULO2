@@ -67,6 +67,8 @@ model User {
   gastosRegistrados   Gasto[]
   cierresCaja         CierreCaja[]
   importaciones       ImportLog[]
+  cajasAbiertas       CajaSesion[] @relation("CajaAbiertaPor")
+  cajasCerradas       CajaSesion[] @relation("CajaCerradaPor")
 
   @@index([role])
   @@index([branchId])
@@ -153,6 +155,13 @@ model Company {
   s700AppId       String?
   s700DeveloperId String?
   s700AppKey      String?
+
+  // Cierre automatico de caja: si esta habilitado, el sistema cierra la
+  // sesion de caja abierta apenas la hora local del servidor supera
+  // "horaCierreAutomatico" (formato "HH:MM"). Ver instrumentation.ts y
+  // verificarCierreAutomatico() en src/lib/finanzas.ts.
+  cierreAutomaticoHabilitado Boolean @default(false)
+  horaCierreAutomatico       String  @default("20:00")
 }
 
 model Holiday {
@@ -508,13 +517,48 @@ model CierreCaja {
   resultadoNeto    Float
   paquetesCobrados Int
 
+  // true si lo genero verificarCierreAutomatico() (instrumentation.ts) sin
+  // intervencion humana; false si lo disparo un ADMIN/SUPERVISOR desde
+  // Finanzas > Cierre de caja. Nunca debe quedar ambiguo cual fue cual.
+  automatico        Boolean @default(false)
+  // Efectivo contado fisicamente por quien cierra (opcional: un cierre
+  // automatico nunca lo tiene, porque no hay nadie contando caja en ese
+  // momento). "diferencia" solo se calcula cuando se declaro efectivo.
+  efectivoDeclarado Float?
+  diferencia        Float?
+  estado            String  @default("CONFIRMADO")
+
   userId String?
   user   User?   @relation(fields: [userId], references: [id])
 
   createdAt DateTime @default(now())
 
+  cajaSesion CajaSesion?
+
   @@index([createdAt])
   @@index([fechaInicio])
+}
+
+// Sesion de caja: mientras "cerradaAt" es null, la caja esta ABIERTA. Se
+// cierra hacia un CierreCaja (relacion 1:1) que congela ingresos/gastos
+// del periodo [abiertaAt, cerradaAt) — ver cerrarCajaSesion() en
+// src/lib/finanzas.ts. Gastos/pagos nunca dependen de que exista una
+// sesion abierta (nunca bloquean una operacion de dinero real); si hace
+// falta, getEstadoCajaActual() abre una de forma transparente.
+model CajaSesion {
+  id           String    @id @default(cuid())
+  abiertaAt    DateTime  @default(now())
+  abiertaPorId String?
+  abiertaPor   User?     @relation("CajaAbiertaPor", fields: [abiertaPorId], references: [id])
+  cerradaAt    DateTime?
+  cerradaPorId String?
+  cerradaPor   User?     @relation("CajaCerradaPor", fields: [cerradaPorId], references: [id])
+
+  cierreCajaId String?     @unique
+  cierreCaja   CierreCaja? @relation(fields: [cierreCajaId], references: [id])
+
+  @@index([cerradaAt])
+  @@index([abiertaAt])
 }
 
 model PackageHistory {

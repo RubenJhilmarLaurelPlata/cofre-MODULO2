@@ -22,6 +22,8 @@ export async function GET() {
     costoAdicionalDia: company.costoAdicionalDia,
     montosPagoRapido: company.montosPagoRapido,
     entregaCountdownSegundos: company.entregaCountdownSegundos,
+    cierreAutomaticoHabilitado: company.cierreAutomaticoHabilitado,
+    horaCierreAutomatico: company.horaCierreAutomatico,
   });
 }
 
@@ -37,6 +39,10 @@ const bodySchema = z.object({
     .max(60)
     .refine((v) => v.split(',').every((n) => n.trim() !== '' && Number(n.trim()) > 0), 'Usa números positivos separados por comas, ej: 2,3,5,7'),
   entregaCountdownSegundos: z.number().int().min(1).max(30),
+  cierreAutomaticoHabilitado: z.boolean(),
+  horaCierreAutomatico: z
+    .string()
+    .regex(/^([01]\d|2[0-3]):[0-5]\d$/, 'Usa el formato HH:MM, ej: 20:00'),
 });
 
 export async function PATCH(req: Request) {
@@ -71,5 +77,7 @@ export async function PATCH(req: Request) {
     costoAdicionalDia: actualizado.costoAdicionalDia,
     montosPagoRapido: actualizado.montosPagoRapido,
     entregaCountdownSegundos: actualizado.entregaCountdownSegundos,
+    cierreAutomaticoHabilitado: actualizado.cierreAutomaticoHabilitado,
+    horaCierreAutomatico: actualizado.horaCierreAutomatico,
   });
 }

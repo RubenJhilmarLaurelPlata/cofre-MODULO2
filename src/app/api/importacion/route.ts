@@ -21,6 +21,7 @@ import {
   type FilaImportacion,
   type CampoSistema,
   type TipoImportacion,
+  type OpcionesFechaRecepcion,
 } from '@/lib/importacion';
 
 const MAX_BYTES = 8_000_000;
@@ -110,7 +111,26 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: `El archivo tiene demasiadas filas (máximo ${MAX_FILAS.toLocaleString('es-BO')} por importación).` }, { status: 400 });
     }
 
-    const resumen = await validarFilas(filas);
+    // Fecha de recepcion de esta lista (opcional): "unica" aplica la misma
+    // fecha a todas las filas, "por_fila" interpreta la columna
+    // fechaRecepcion de cada una — ver validarFilas() en
+    // src/lib/importacion.ts. Si no se envia nada, el comportamiento es
+    // exactamente el de siempre (ingresoAt = entregaAt para paquetes
+    // nuevos).
+    const modoFechaRaw = String(formData.get('modoFechaRecepcion') ?? '');
+    const fechaRecepcionUnicaRaw = formData.get('fechaRecepcionUnica');
+    let opcionesFecha: OpcionesFechaRecepcion | undefined;
+    if (modoFechaRaw === 'por_fila') {
+      opcionesFecha = { modo: 'por_fila' };
+    } else if (modoFechaRaw === 'unica') {
+      const fechaUnica = typeof fechaRecepcionUnicaRaw === 'string' ? fechaRecepcionUnicaRaw.trim() : '';
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(fechaUnica)) {
+        return NextResponse.json({ error: 'Selecciona una fecha de recepción válida para toda la lista.' }, { status: 400 });
+      }
+      opcionesFecha = { modo: 'unica', fechaUnica };
+    }
+
+    const resumen = await validarFilas(filas, opcionesFecha);
 
     if (accion === 'previsualizar') {
       return NextResponse.json({ resumen });

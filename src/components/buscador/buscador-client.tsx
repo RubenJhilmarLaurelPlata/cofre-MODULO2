@@ -7,6 +7,7 @@ import {
   Search,
   Wallet,
   Camera as CameraIcon,
+  Keyboard,
   X,
   Truck,
   Archive,
@@ -22,6 +23,7 @@ import { Badge } from '@/components/ui/badge';
 import { StatusBadge } from '@/components/ui/status-badge';
 import { ESTADO_LABELS } from '@/components/ui/status-badge';
 import { CameraScanner } from '@/components/scanner/camera-scanner';
+import { TecladoVirtual } from '@/components/scanner/teclado-virtual';
 import { PackageDetailModal } from '@/components/buscador/package-detail-modal';
 import { VoiceInputButton } from '@/components/ui/voice-input-button';
 import { cn } from '@/lib/utils';
@@ -58,6 +60,7 @@ export function BuscadorClient({ resultadosIniciales, limite, puedeIrAEntrega, p
   const [desde, setDesde] = React.useState('');
   const [hasta, setHasta] = React.useState('');
   const [mostrarCamara, setMostrarCamara] = React.useState(false);
+  const [mostrarTeclado, setMostrarTeclado] = React.useState(false);
 
   const [resultados, setResultados] = React.useState<PackageDetailDTO[]>(resultadosIniciales);
   const [truncado, setTruncado] = React.useState(false);
@@ -287,6 +290,9 @@ export function BuscadorClient({ resultadosIniciales, limite, puedeIrAEntrega, p
             <Button variant="secondary" onClick={() => setMostrarCamara((v) => !v)} className="sm:w-auto">
               <CameraIcon className="h-4 w-4" /> {mostrarCamara ? 'Ocultar cámara' : 'Cámara'}
             </Button>
+            <Button variant="secondary" onClick={() => setMostrarTeclado((v) => !v)} className="sm:w-auto">
+              <Keyboard className="h-4 w-4" /> {mostrarTeclado ? 'Ocultar teclado' : 'Teclado'}
+            </Button>
             {hayFiltrosActivos && (
               <Button variant="ghost" onClick={limpiarFiltros} className="sm:w-auto">
                 <X className="h-4 w-4" /> Limpiar
@@ -297,6 +303,12 @@ export function BuscadorClient({ resultadosIniciales, limite, puedeIrAEntrega, p
           {mostrarCamara && (
             <div className="mx-auto max-w-sm">
               <CameraScanner onDetect={onCameraDetect} />
+            </div>
+          )}
+
+          {mostrarTeclado && (
+            <div className="mx-auto max-w-sm">
+              <TecladoVirtual onDetect={onCameraDetect} />
             </div>
           )}
 

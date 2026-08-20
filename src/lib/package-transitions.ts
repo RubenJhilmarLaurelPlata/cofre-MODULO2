@@ -219,3 +219,96 @@ export async function reingresarPaquete(code: string, userId: string, motivo?: s
     motivo?.trim() ? `Reingreso: ${motivo.trim()}` : 'Reingreso: marcado como entregado por error'
   );
 }
+
+export class SerieNoConfiguradaError extends Error {
+  constructor(inicial: string) {
+    super(`La serie "${inicial}" no está configurada o está inactiva. Pide a un administrador que la registre en Configuración.`);
+    this.name = 'SerieNoConfiguradaError';
+  }
+}
+
+export interface EntregaExcepcionalOpts {
+  destinatario?: string;
+  destinatarioTelefono?: string;
+  destinatarioObservaciones?: string;
+  observaciones?: string;
+  montoCobrado?: number;
+  motivoCobro?: string;
+}
+
+/**
+ * "Entrega excepcional": crea el paquete + registra la recepcion omitida
+ * + lo entrega, todo en un solo movimiento auditado, para un codigo que
+ * NUNCA paso por Recepcion. Solo debe llamarse cuando ya se confirmo que
+ * el codigo no existe (si existe, corresponde el flujo normal de
+ * entregarPaquete() — esta funcion rechaza explicitamente ese caso, nunca
+ * pisa un paquete real).
+ *
+ * ingresoAt y entregaAt quedan iguales a "ahora" (no hay una fecha de
+ * recepcion real que registrar — el paquete nunca paso por Recepcion).
+ * Reutiliza el campo YA EXISTENTE "origenEntrega" (hasta ahora solo valia
+ * 'IMPORTACION' o null) con el valor nuevo 'EXCEPCIONAL', asi que esto no
+ * requiere ningun cambio de schema. Dos filas de PackageHistory dejan la
+ * trazabilidad explicita: "Recepción omitida" y luego "Entrega
+ * excepcional" — nunca se ve igual que una recepcion+entrega normal en el
+ * historial.
+ */
+export async function entregaExcepcional(code: string, userId: string, branchId: string, opts?: EntregaExcepcionalOpts): Promise<Package> {
+  const codigoNormalizado = normalizarCodigo(code);
+  const existente = await prisma.package.findUnique({ where: { codigoNormalizado } });
+  if (existente) {
+    throw new TransicionInvalidaError('Este código ya existe en el sistema; usa la entrega normal en vez de la excepcional.');
+  }
+
+  const inicial = code.match(/^[A-Z]+/)?.[0];
+  if (!inicial) {
+    throw new TransicionInvalidaError('El código no tiene un formato reconocible (debe iniciar con letras, ej: M26L-001).');
+  }
+
+  const serie = await prisma.packageSeries.findUnique({ where: { inicial } });
+  if (!serie || !serie.activo) {
+    throw new SerieNoConfiguradaError(inicial);
+  }
+
+  const now = new Date();
+
+  const pkg = await prisma.$transaction(async (tx) => {
+    const nuevo = await tx.package.create({
+      data: {
+        code,
+        codigoNormalizado,
+        inicial,
+        branchId,
+        status: 'ENTREGADO',
+        ingresoAt: now,
+        entregaAt: now,
+        tarifaBaseOverride: serie.tarifaBaseOverride,
+        registradoPorId: userId,
+        destinatario: opts?.destinatario || null,
+        destinatarioTelefono: opts?.destinatarioTelefono || null,
+        destinatarioObservaciones: opts?.destinatarioObservaciones || null,
+        observaciones: opts?.observaciones || '',
+        origenEntrega: 'EXCEPCIONAL',
+      },
+    });
+    await tx.packageHistory.create({
+      data: { packageId: nuevo.id, estado: 'EN_PAQUETERIA', fecha: now, userId, nota: 'Recepción omitida (entrega excepcional)' },
+    });
+    await tx.packageHistory.create({
+      data: { packageId: nuevo.id, estado: 'ENTREGADO', fecha: now, userId, nota: 'Entrega excepcional: paquete no figuraba como recibido' },
+    });
+    return nuevo;
+  }, TRANSACTION_OPTS);
+
+  await registrarAuditoria({
+    userId,
+    accion: 'ENTREGA_EXCEPCIONAL',
+    modulo: 'entrega',
+    valorNuevo: { code: pkg.code, status: pkg.status },
+  });
+
+  if (opts?.montoCobrado !== undefined && opts.montoCobrado !== 0) {
+    return registrarPago(pkg, 'COBRO_ENTREGA', opts.montoCobrado, userId, opts.motivoCobro);
+  }
+  return pkg;
+}

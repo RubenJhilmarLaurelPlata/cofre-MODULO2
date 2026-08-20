@@ -14,7 +14,7 @@ import { Badge } from '@/components/ui/badge';
 import { Input, Label } from '@/components/ui/input';
 import { cn } from '@/lib/utils';
 
-type CampoSistema = 'codigo' | 'monto' | 'personaRecoge' | 'cliente' | 'emprendimiento' | 'fecha' | 'hora' | 'observaciones' | 'descripcion';
+type CampoSistema = 'codigo' | 'monto' | 'personaRecoge' | 'cliente' | 'emprendimiento' | 'fecha' | 'hora' | 'fechaRecepcion' | 'observaciones' | 'descripcion';
 type TipoImportacion = 'SOLO_REGISTRAR' | 'MARCAR_ENTREGADOS' | 'CREAR_Y_ENTREGAR';
 
 const CAMPOS_SISTEMA: Array<{ value: CampoSistema; label: string }> = [
@@ -23,8 +23,9 @@ const CAMPOS_SISTEMA: Array<{ value: CampoSistema; label: string }> = [
   { value: 'personaRecoge', label: 'Persona que recogió' },
   { value: 'cliente', label: 'Cliente / remitente (quien deja)' },
   { value: 'emprendimiento', label: 'Emprendimiento' },
-  { value: 'fecha', label: 'Fecha (AAAA-MM-DD)' },
-  { value: 'hora', label: 'Hora (HH:MM)' },
+  { value: 'fecha', label: 'Fecha de entrega (AAAA-MM-DD)' },
+  { value: 'hora', label: 'Hora de entrega (HH:MM)' },
+  { value: 'fechaRecepcion', label: 'Fecha de recepción (DD/MM/AAAA)' },
   { value: 'observaciones', label: 'Observaciones' },
   { value: 'descripcion', label: 'Descripción del paquete' },
 ];
@@ -40,6 +41,7 @@ interface FilaValidada {
   codigoOficial?: string;
   monto?: number;
   personaRecoge?: string;
+  fechaRecepcionResuelta?: string;
   estado: 'valido' | 'duplicado' | 'invalido' | 'no_encontrado' | 'ya_entregado';
   motivo?: string;
 }
@@ -107,6 +109,15 @@ export function ImportacionClient() {
   const [totalFilas, setTotalFilas] = React.useState<number | null>(null);
   const [mapeo, setMapeo] = React.useState<Array<CampoSistema | null>>([]);
   const [nombreLote, setNombreLote] = React.useState('');
+  // Fecha de recepcion de esta lista: por defecto "unica" con la fecha de
+  // hoy (mismo criterio de siempre, ver crearPaquetesFaltantes en
+  // src/lib/importacion.ts — nunca obliga a nadie a pensar en esto si no
+  // importa una lista historica).
+  const [modoFechaRecepcion, setModoFechaRecepcion] = React.useState<'unica' | 'por_fila'>('unica');
+  const [fechaRecepcionUnica, setFechaRecepcionUnica] = React.useState(() => {
+    const d = new Date();
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  });
   const [tipo, setTipo] = React.useState<TipoImportacion>('MARCAR_ENTREGADOS');
   const [procesando, setProcesando] = React.useState<'detectar' | 'previsualizar' | 'confirmar' | null>(null);
   const [resumen, setResumen] = React.useState<Resumen | null>(null);
@@ -180,6 +191,8 @@ export function ImportacionClient() {
       formData.append('file', archivo);
       formData.append('accion', 'previsualizar');
       if (necesitaMapeo) formData.append('mapeo', JSON.stringify(mapeo));
+      formData.append('modoFechaRecepcion', modoFechaRecepcion);
+      if (modoFechaRecepcion === 'unica') formData.append('fechaRecepcionUnica', fechaRecepcionUnica);
       const res = await fetch('/api/importacion', { method: 'POST', body: formData });
       const data = await res.json();
       if (!res.ok) {
@@ -218,6 +231,8 @@ export function ImportacionClient() {
       formData.append('tipo', tipo);
       formData.append('nombreLote', nombreLote.trim());
       if (necesitaMapeo) formData.append('mapeo', JSON.stringify(mapeo));
+      formData.append('modoFechaRecepcion', modoFechaRecepcion);
+      if (modoFechaRecepcion === 'unica') formData.append('fechaRecepcionUnica', fechaRecepcionUnica);
       const res = await fetch('/api/importacion', { method: 'POST', body: formData });
       const data = await res.json();
       if (!res.ok) {
@@ -288,10 +303,64 @@ export function ImportacionClient() {
         </CardContent>
       </Card>
 
+      {archivo && encabezados !== null && (
+        <Card>
+          <CardHeader>
+            <CardTitle>2. Fecha de recepción de esta lista</CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            <p className="text-xs text-ink-soft dark:text-gray-400">
+              Esta fecha se aplicará a los paquetes de esta importación (afecta días en paquetería, tarifas y estadísticas). No se usa
+              automáticamente la fecha de hoy solo porque estés importando hoy.
+            </p>
+            <div className="space-y-2">
+              <label className="flex cursor-pointer items-center gap-2 text-sm text-ink dark:text-gray-100">
+                <input
+                  type="radio"
+                  name="modoFechaRecepcion"
+                  checked={modoFechaRecepcion === 'unica'}
+                  onChange={() => setModoFechaRecepcion('unica')}
+                  className="h-4 w-4 border-gray-300 text-brand-500 focus:ring-brand-500"
+                />
+                Una fecha para toda la lista
+              </label>
+              {modoFechaRecepcion === 'unica' && (
+                <div className="ml-6 space-y-1">
+                  <Label htmlFor="fechaRecepcionUnica">Fecha</Label>
+                  <Input
+                    id="fechaRecepcionUnica"
+                    type="date"
+                    value={fechaRecepcionUnica}
+                    onChange={(e) => setFechaRecepcionUnica(e.target.value)}
+                    className="w-44"
+                  />
+                </div>
+              )}
+              <label className="flex cursor-pointer items-center gap-2 text-sm text-ink dark:text-gray-100">
+                <input
+                  type="radio"
+                  name="modoFechaRecepcion"
+                  checked={modoFechaRecepcion === 'por_fila'}
+                  onChange={() => setModoFechaRecepcion('por_fila')}
+                  className="h-4 w-4 border-gray-300 text-brand-500 focus:ring-brand-500"
+                />
+                Usar fecha de cada fila
+              </label>
+              {modoFechaRecepcion === 'por_fila' && (
+                <p className="ml-6 text-xs text-gray-400 dark:text-gray-500">
+                  Mapea una columna de tu archivo al campo &quot;Fecha de recepción&quot; en el paso siguiente (formato DD/MM/AAAA). Una fecha
+                  inválida en una fila la rechaza en la previsualización.
+                </p>
+              )}
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
       {necesitaMapeo && encabezados && (
         <Card>
           <CardHeader>
-            <CardTitle>2. Confirmar columnas</CardTitle>
+            <CardTitle>3. Confirmar columnas</CardTitle>
           </CardHeader>
           <CardContent className="space-y-3">
             <p className="text-xs text-ink-soft dark:text-gray-400">
@@ -351,7 +420,7 @@ export function ImportacionClient() {
       {resumen && (
         <Card>
           <CardHeader>
-            <CardTitle>3. Previsualización</CardTitle>
+            <CardTitle>4. Previsualización</CardTitle>
           </CardHeader>
           <CardContent className="space-y-4">
             <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">
@@ -378,6 +447,7 @@ export function ImportacionClient() {
                     <span>Fila {f.numeroFila}</span>
                     {f.monto !== undefined && <span>Bs {f.monto}</span>}
                     {f.personaRecoge && <span>{f.personaRecoge}</span>}
+                    {f.fechaRecepcionResuelta && <span>Recepción: {f.fechaRecepcionResuelta}</span>}
                   </div>
                   {f.motivo && <p className="mt-1 text-xs text-gray-400 dark:text-gray-500">{f.motivo}</p>}
                 </div>
@@ -392,6 +462,7 @@ export function ImportacionClient() {
                     <th className="px-3 py-2 font-medium">Código</th>
                     <th className="px-3 py-2 font-medium">Monto</th>
                     <th className="px-3 py-2 font-medium">Persona</th>
+                    <th className="px-3 py-2 font-medium">Recepción</th>
                     <th className="px-3 py-2 font-medium">Estado</th>
                     <th className="px-3 py-2 font-medium">Detalle</th>
                   </tr>
@@ -403,6 +474,7 @@ export function ImportacionClient() {
                       <td className="px-3 py-1.5 font-mono text-ink dark:text-gray-100">{f.codigoOficial ?? f.codigo}</td>
                       <td className="px-3 py-1.5 text-ink-soft dark:text-gray-400">{f.monto !== undefined ? `Bs ${f.monto}` : '—'}</td>
                       <td className="px-3 py-1.5 text-ink-soft dark:text-gray-400">{f.personaRecoge ?? '—'}</td>
+                      <td className="px-3 py-1.5 text-ink-soft dark:text-gray-400">{f.fechaRecepcionResuelta ?? '—'}</td>
                       <td className="px-3 py-1.5">
                         <Badge variant={ESTADO_INFO[f.estado].variant}>{ESTADO_INFO[f.estado].label}</Badge>
                       </td>
@@ -419,7 +491,7 @@ export function ImportacionClient() {
       {resumen && (
         <Card>
           <CardHeader>
-            <CardTitle>4. Tipo de importación</CardTitle>
+            <CardTitle>5. Tipo de importación</CardTitle>
           </CardHeader>
           <CardContent className="space-y-4">
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">

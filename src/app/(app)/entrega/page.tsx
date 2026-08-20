@@ -56,6 +56,7 @@ export default async function EntregaPage({ searchParams }: EntregaPageProps) {
       paqueteInicial={paqueteInicial}
       countdownSegundos={company.entregaCountdownSegundos}
       esAdmin={session?.role === 'ADMIN'}
+      puedeEntregaExcepcional={session?.role === 'ADMIN' || session?.role === 'ADMIN_CAJA'}
       moneda={company.moneda}
     />
   );

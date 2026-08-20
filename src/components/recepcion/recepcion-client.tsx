@@ -2,13 +2,14 @@
 
 // src/components/recepcion/recepcion-client.tsx
 import * as React from 'react';
-import { ScanLine, Camera as CameraIcon, CheckCircle2, XCircle, PackagePlus, PackageCheck, Layers, X } from 'lucide-react';
+import { ScanLine, Camera as CameraIcon, Keyboard, CheckCircle2, XCircle, PackagePlus, PackageCheck, Layers, X } from 'lucide-react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
 import { playSound } from '@/lib/sound';
 import { CameraScanner } from '@/components/scanner/camera-scanner';
+import { TecladoVirtual } from '@/components/scanner/teclado-virtual';
 import { ClientePagoPanel, type ClienteForm } from '@/components/recepcion/cliente-pago-panel';
 import { QuienRecogePanel, type RecogeForm } from '@/components/recepcion/quien-recoge-panel';
 import { PagoSelector, type PagoForm } from '@/components/recepcion/pago-selector';
@@ -58,7 +59,7 @@ export function RecepcionClient({ moneda, tarifaBase, montosRapidos, series, ing
   const primerMonto = montosRapidos[0] ?? tarifaBase;
   const PAGO_VACIO: PagoForm = { pagado: false, monto: primerMonto };
 
-  const [tab, setTab] = React.useState<'usb' | 'camara'>('usb');
+  const [tab, setTab] = React.useState<'usb' | 'camara' | 'teclado'>('usb');
   const [valor, setValor] = React.useState('');
   const [ultimo, setUltimo] = React.useState<ResultadoScan | null>(null);
   const [historialSesion, setHistorialSesion] = React.useState<ResultadoScan[]>([]);
@@ -273,14 +274,12 @@ export function RecepcionClient({ moneda, tarifaBase, montosRapidos, series, ing
     // duplicar ningun componente con estado (el input del lector solo
     // existe una vez en el DOM).
     <div className="space-y-4 md:grid md:grid-cols-3 md:items-start md:gap-5 md:space-y-0">
-      {/* 1+4. Columna izquierda combinada: Escaner + Ultimos paquetes en UN
-          SOLO item de grid (mismo criterio que la columna derecha, ver
-          mas abajo) — asi cada columna fluye a su propia altura en vez de
-          sincronizarse fila por fila con la otra (CSS Grid sincroniza la
-          altura de cualquier fila compartida entre columnas; con 2
-          columnas de una sola celda alta cada una, ya no hay fila
-          intermedia que sincronizar — la diferencia de altura, si la hay,
-          queda al FINAL de la columna mas corta, no en medio). */}
+      {/* 1. Escanear (izquierda) — su propio item de grid en la fila 1,
+          junto a "Condicion de pago" (derecha, ver mas abajo): en movil,
+          sin grid activo, esto pone Condicion de pago inmediatamente
+          despues de Escanear en el DOM (el flujo pedido:
+          ESCANEAR -> CONDICION DE PAGO -> REGISTRAR -> SIGUIENTE), antes
+          que "Ultimos paquetes" (que ahora va en la fila 2, ver abajo). */}
       <div className="space-y-4 md:col-start-1 md:col-span-2 md:row-start-1">
       <Card>
         <CardHeader>
@@ -308,6 +307,15 @@ export function RecepcionClient({ moneda, tarifaBase, montosRapidos, series, ing
                   )}
                 >
                   <CameraIcon className="h-3.5 w-3.5" /> Cámara
+                </button>
+                <button
+                  onClick={() => setTab('teclado')}
+                  className={cn(
+                    'flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors',
+                    tab === 'teclado' ? 'bg-white dark:bg-gray-900 text-ink dark:text-gray-100 shadow-sm' : 'text-ink-soft dark:text-gray-400 hover:text-ink dark:hover:text-gray-100'
+                  )}
+                >
+                  <Keyboard className="h-3.5 w-3.5" /> Teclado
                 </button>
               </div>
             </div>
@@ -345,8 +353,10 @@ export function RecepcionClient({ moneda, tarifaBase, montosRapidos, series, ing
                 </Button>
               </div>
             </div>
-          ) : (
+          ) : tab === 'camara' ? (
             <CameraScanner onDetect={registrar} />
+          ) : (
+            <TecladoVirtual onDetect={registrar} />
           )}
 
           {/* Ultimo resultado: forma parte del escaner, no una tarjeta aparte. */}
@@ -432,7 +442,25 @@ export function RecepcionClient({ moneda, tarifaBase, montosRapidos, series, ing
           </div>
         </CardContent>
       </Card>
+      </div>
 
+      {/* 2. Condicion de pago (derecha, fila 1) — a proposito su propio
+          item de grid junto a Escanear, no agrupado con Lote/Ingresados/
+          Series (que ahora van en la fila 2): esto es lo que adelanta
+          Condicion de pago en el orden movil sin tocar PagoSelector. */}
+      <div className="space-y-4 md:col-start-3 md:row-start-1">
+        <Card>
+          <CardHeader>
+            <CardTitle>Condición de pago</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <PagoSelector moneda={moneda} montosRapidos={montosRapidos} pago={pago} onPagoChange={setPago} />
+          </CardContent>
+        </Card>
+      </div>
+
+      {/* 3. Ultimos paquetes (izquierda, fila 2). */}
+      <div className="space-y-4 md:col-start-1 md:col-span-2 md:row-start-2">
       <Card>
         <CardHeader>
           <CardTitle>Últimos paquetes</CardTitle>
@@ -461,23 +489,12 @@ export function RecepcionClient({ moneda, tarifaBase, montosRapidos, series, ing
       </Card>
       </div>
 
-      {/* Columna derecha combinada: Pago + Lote activo + Info de referencia
-          en UN SOLO item de grid, igual que la columna izquierda de
-          arriba (Escaner + Ultimos paquetes) — ambas columnas son ahora
-          una sola celda de grid cada una, en la misma fila (row-start-1),
-          asi que cada una fluye a su propia altura de forma independiente
-          en vez de sincronizarse con la otra fila por fila (lo que antes
-          dejaba un hueco vacio enorme a mitad de columna). */}
-      <div className="space-y-4 md:col-start-3 md:row-start-1">
-        <Card>
-          <CardHeader>
-            <CardTitle>Condición de pago</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <PagoSelector moneda={moneda} montosRapidos={montosRapidos} pago={pago} onPagoChange={setPago} />
-          </CardContent>
-        </Card>
-
+      {/* 4. Lote activo + Ingresados hoy + Series configuradas (derecha,
+          fila 2) — agrupados en un solo item de grid, mismo criterio de
+          "una celda alta por columna" que ya usaba todo este bloque antes
+          (evita sincronizar alturas fila por fila con la columna
+          izquierda). */}
+      <div className="space-y-4 md:col-start-3 md:row-start-2">
         <LoteActivoPanel moneda={moneda} separador={separador} esAdmin={esAdmin} actualizarToken={loteActivoToken} />
 
         <div className="flex items-center gap-3 rounded-lg border border-gray-200 bg-white px-3.5 py-2.5 dark:border-gray-800 dark:bg-gray-900">
@@ -513,7 +530,7 @@ export function RecepcionClient({ moneda, tarifaBase, montosRapidos, series, ing
       </div>
 
       {/* 5. Datos opcionales — colapsados por defecto, menor prioridad. */}
-      <div className="space-y-3 md:col-start-1 md:col-span-3 md:row-start-2">
+      <div className="space-y-3 md:col-start-1 md:col-span-3 md:row-start-3">
         <ClientePagoPanel
           clienteAsociadoId={clienteId}
           cliente={cliente}

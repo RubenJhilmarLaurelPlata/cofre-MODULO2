@@ -12,7 +12,17 @@ import { registrarAuditoria } from '@/lib/auditoria';
 
 export type FormatoImportacion = 'CSV' | 'XLSX' | 'TXT';
 
-export type CampoSistema = 'codigo' | 'monto' | 'personaRecoge' | 'cliente' | 'emprendimiento' | 'fecha' | 'hora' | 'observaciones' | 'descripcion';
+export type CampoSistema =
+  | 'codigo'
+  | 'monto'
+  | 'personaRecoge'
+  | 'cliente'
+  | 'emprendimiento'
+  | 'fecha'
+  | 'hora'
+  | 'fechaRecepcion'
+  | 'observaciones'
+  | 'descripcion';
 
 export const CAMPOS_SISTEMA: Array<{ value: CampoSistema; label: string }> = [
   { value: 'codigo', label: 'Código' },
@@ -20,8 +30,9 @@ export const CAMPOS_SISTEMA: Array<{ value: CampoSistema; label: string }> = [
   { value: 'personaRecoge', label: 'Persona que recogió' },
   { value: 'cliente', label: 'Cliente / remitente (quien deja)' },
   { value: 'emprendimiento', label: 'Emprendimiento' },
-  { value: 'fecha', label: 'Fecha (YYYY-MM-DD)' },
-  { value: 'hora', label: 'Hora (HH:MM)' },
+  { value: 'fecha', label: 'Fecha de entrega (YYYY-MM-DD)' },
+  { value: 'hora', label: 'Hora de entrega (HH:MM)' },
+  { value: 'fechaRecepcion', label: 'Fecha de recepción (YYYY-MM-DD)' },
   { value: 'observaciones', label: 'Observaciones' },
   { value: 'descripcion', label: 'Descripción del paquete' },
 ];
@@ -29,8 +40,15 @@ export const CAMPOS_SISTEMA: Array<{ value: CampoSistema; label: string }> = [
 export interface FilaImportacion {
   numeroFila: number;
   codigo: string;
-  fecha?: string; // YYYY-MM-DD
-  hora?: string; // HH:MM
+  fecha?: string; // YYYY-MM-DD — fecha de ENTREGA (ver confirmarImportacion/crearPaquetesFaltantes)
+  hora?: string; // HH:MM — hora de ENTREGA
+  // Fecha real de RECEPCION del paquete (distinta de "fecha"/"hora" de
+  // arriba, que siempre fueron de entrega) — solo se usa para paquetes
+  // genuinamente nuevos (crearPaquetesFaltantes), donde alimenta
+  // Package.ingresoAt. Concepto nuevo, separado a proposito: no reutiliza
+  // "fecha" para no cambiar el significado de una columna que
+  // MARCAR_ENTREGADOS ya usa hace tiempo.
+  fechaRecepcion?: string; // YYYY-MM-DD
   monto?: number;
   // Persona que RECOGE el paquete (Fase 2) — distinta de "cliente"
   // (quien lo DEJA). Se guarda como Package.destinatario.
@@ -48,6 +66,13 @@ export interface FilaValidada extends FilaImportacion {
   motivo?: string;
   packageId?: string;
   codigoOficial?: string;
+  // Fecha de recepcion ya resuelta para esta fila (YYYY-MM-DD), sin
+  // importar si vino de la columna fechaRecepcion o de la fecha unica
+  // elegida para todo el archivo — ver validarFilas(). Solo tiene sentido
+  // para filas que terminan creando un paquete nuevo (no_encontrado), pero
+  // se calcula para cualquier fila valida asi el preview siempre puede
+  // mostrar "la fecha interpretada" tal como pide la especificacion.
+  fechaRecepcionResuelta?: string;
 }
 
 export interface ResumenValidacion {
@@ -94,6 +119,17 @@ const COLUMNAS_INEQUIVOCAS: Record<string, CampoSistema> = {
   emprendimiento: 'emprendimiento',
   fecha: 'fecha',
   hora: 'hora',
+  // A proposito NO se incluye el simple "fecha" aqui: esa palabra sola
+  // sigue significando fecha de ENTREGA (arriba), sin ambiguedad. El
+  // administrador debe elegir explicitamente en el mapeador si su columna
+  // es "fecha de recepción" — o usar el selector de fecha global de la
+  // pantalla en vez de una columna.
+  'fecha de recepción': 'fechaRecepcion',
+  'fecha de recepcion': 'fechaRecepcion',
+  'fecha recepción': 'fechaRecepcion',
+  'fecha recepcion': 'fechaRecepcion',
+  'fecha ingreso': 'fechaRecepcion',
+  'fecha de ingreso': 'fechaRecepcion',
   observaciones: 'observaciones',
   'descripción': 'descripcion',
   descripcion: 'descripcion',
@@ -255,6 +291,48 @@ export async function parseXLSX(buffer: Buffer, mapeo?: Array<CampoSistema | nul
 const CODIGO_VALIDO_RE = /^[A-Z]+[A-Z0-9-]*$/;
 
 /**
+ * Interpreta una fecha de recepcion escrita a mano en un archivo real:
+ * acepta tanto el formato interno YYYY-MM-DD como DD/MM/AAAA o DD-MM-AAAA
+ * (el formato mas comun en archivos de usuarios bolivianos, ver ejemplo
+ * de la especificacion: "18/08/2026"). Devuelve YYYY-MM-DD o null si no
+ * se pudo interpretar — nunca "adivina" ni normaliza silenciosamente una
+ * fecha invalida (ej. "31/02/2026" se rechaza, no se convierte a marzo).
+ */
+function parseFechaRecepcionFlexible(raw?: string): string | null {
+  if (!raw) return null;
+  const s = raw.trim();
+
+  let anio: number, mes: number, dia: number;
+  const isoMatch = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+  const ddmmMatch = s.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{4})$/);
+  if (isoMatch) {
+    anio = Number(isoMatch[1]);
+    mes = Number(isoMatch[2]);
+    dia = Number(isoMatch[3]);
+  } else if (ddmmMatch) {
+    dia = Number(ddmmMatch[1]);
+    mes = Number(ddmmMatch[2]);
+    anio = Number(ddmmMatch[3]);
+  } else {
+    return null;
+  }
+
+  const fecha = new Date(anio, mes - 1, dia);
+  // new Date() normaliza dias fuera de rango (ej. 31/02 -> 3 de marzo) en
+  // vez de rechazarlos — comparar los componentes de vuelta es lo que
+  // realmente detecta una fecha invalida.
+  if (fecha.getFullYear() !== anio || fecha.getMonth() !== mes - 1 || fecha.getDate() !== dia) return null;
+
+  return `${String(anio).padStart(4, '0')}-${String(mes).padStart(2, '0')}-${String(dia).padStart(2, '0')}`;
+}
+
+export interface OpcionesFechaRecepcion {
+  modo: 'unica' | 'por_fila';
+  // Requerida cuando modo === 'unica'; ignorada en modo 'por_fila'.
+  fechaUnica?: string; // YYYY-MM-DD
+}
+
+/**
  * Valida el formato de cada fila, marca duplicados dentro del mismo
  * archivo, y verifica contra la base de datos real cuales codigos
  * existen. Nunca escribe nada — es de solo lectura. Usa
@@ -262,7 +340,7 @@ const CODIGO_VALIDO_RE = /^[A-Z]+[A-Z0-9-]*$/;
  * modificarla) para que un codigo con apostrofe en vez de guion se
  * reconozca igual que en Recepcion/Buscador/Entrega.
  */
-export async function validarFilas(filas: FilaImportacion[]): Promise<ResumenValidacion> {
+export async function validarFilas(filas: FilaImportacion[], opcionesFecha?: OpcionesFechaRecepcion): Promise<ResumenValidacion> {
   const vistos = new Map<string, number>(); // codigoNormalizado -> primera fila donde aparecio
   const normalizados = filas.map((f) => normalizarCodigo(f.codigo));
 
@@ -288,9 +366,27 @@ export async function validarFilas(filas: FilaImportacion[]): Promise<ResumenVal
     }
     vistos.set(codigoNorm, fila.numeroFila);
 
+    // Fecha de recepcion (concepto nuevo, distinto de fecha/hora de
+    // entrega): en modo "unica" se aplica la misma a todas las filas sin
+    // mirar ninguna columna; en modo "por_fila" se interpreta la columna
+    // de esta fila puntual, y si esta presente pero no se pudo interpretar,
+    // la fila se rechaza explicitamente (a diferencia de fecha/hora de
+    // entrega, que ignoran en silencio una fecha invalida — aqui el
+    // usuario pidio explicitamente que se valide).
+    let fechaRecepcionResuelta: string | undefined;
+    if (opcionesFecha?.modo === 'unica' && opcionesFecha.fechaUnica) {
+      fechaRecepcionResuelta = opcionesFecha.fechaUnica;
+    } else if (opcionesFecha?.modo === 'por_fila' && fila.fechaRecepcion) {
+      const interpretada = parseFechaRecepcionFlexible(fila.fechaRecepcion);
+      if (!interpretada) {
+        return { ...fila, estado: 'invalido', motivo: `Fecha de recepción inválida: "${fila.fechaRecepcion}" (se esperaba DD/MM/AAAA).` };
+      }
+      fechaRecepcionResuelta = interpretada;
+    }
+
     const existente = porCodigoNormalizado.get(codigoNorm);
     if (!existente) {
-      return { ...fila, estado: 'no_encontrado', motivo: 'No existe ningún paquete con este código en el sistema.' };
+      return { ...fila, estado: 'no_encontrado', motivo: 'No existe ningún paquete con este código en el sistema.', fechaRecepcionResuelta };
     }
     if (existente.status === 'DENEGADO') {
       return { ...fila, estado: 'invalido', motivo: 'Este paquete está DENEGADO; no puede modificarse por importación.', packageId: existente.id, codigoOficial: existente.code };
@@ -439,6 +535,13 @@ export async function crearPaquetesFaltantes(filas: FilaValidada[], userId: stri
         });
 
         const entregaAt = parseFechaHora(fila.fecha, fila.hora) ?? new Date();
+        // Fecha de recepcion (concepto nuevo, ver validarFilas): si la
+        // fila trae una resuelta (fecha unica del archivo, o interpretada
+        // de su propia columna), esa es la fecha REAL de ingreso — nunca
+        // mas forzada a ser igual a la fecha de entrega. Si no se
+        // configuro ninguna, se mantiene el comportamiento de siempre
+        // (ingresoAt = entregaAt).
+        const ingresoAt = fila.fechaRecepcionResuelta ? new Date(`${fila.fechaRecepcionResuelta}T00:00:00`) : entregaAt;
 
         let cliente = null;
         if (fila.cliente || fila.emprendimiento) {
@@ -453,7 +556,7 @@ export async function crearPaquetesFaltantes(filas: FilaValidada[], userId: stri
               inicial,
               branchId,
               status: 'ENTREGADO',
-              ingresoAt: entregaAt,
+              ingresoAt,
               entregaAt,
               origenEntrega: 'IMPORTACION',
               tarifaBaseOverride: serie.tarifaBaseOverride,
@@ -464,7 +567,7 @@ export async function crearPaquetesFaltantes(filas: FilaValidada[], userId: stri
               descripcion: fila.descripcion || null,
             },
           });
-          await tx.packageHistory.create({ data: { packageId: pkg.id, estado: 'EN_PAQUETERIA', fecha: entregaAt, userId, nota: 'Importación administrativa (registro faltante)' } });
+          await tx.packageHistory.create({ data: { packageId: pkg.id, estado: 'EN_PAQUETERIA', fecha: ingresoAt, userId, nota: 'Importación administrativa (registro faltante)' } });
           await tx.packageHistory.create({ data: { packageId: pkg.id, estado: 'ENTREGADO', fecha: entregaAt, userId, nota: 'Importación administrativa (registro faltante)' } });
           return pkg;
         }, TRANSACTION_OPTS);

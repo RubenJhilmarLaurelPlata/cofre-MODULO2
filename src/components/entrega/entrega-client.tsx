@@ -28,6 +28,7 @@ import {
   Loader2,
   Camera as CameraIcon,
   ScanLine,
+  Keyboard,
   AlertTriangle,
   RotateCcw,
 } from 'lucide-react';
@@ -39,6 +40,7 @@ import { StatusBadge } from '@/components/ui/status-badge';
 import { DeliveryCountdown } from '@/components/entrega/delivery-countdown';
 import { ScannerStatus } from '@/components/scanner/scanner-status';
 import { CameraScanner } from '@/components/scanner/camera-scanner';
+import { TecladoVirtual } from '@/components/scanner/teclado-virtual';
 import { VoiceInputButton } from '@/components/ui/voice-input-button';
 import { reportarEscaneoExitoso } from '@/lib/scanner/hid-provider';
 import { onEscaneoCaptureJs } from '@/lib/scanner/capture-js-provider';
@@ -64,6 +66,11 @@ interface EntregaClientProps {
   paqueteInicial?: PackageDetailDTO | null;
   countdownSegundos: number;
   esAdmin: boolean;
+  // Interseccion de roles con acceso a Recepcion Y Entrega (ADMIN,
+  // ADMIN_CAJA) — ver PERMISOS_POR_MODULO en src/types/index.ts. Un
+  // operador de solo-Entrega nunca recibe paquetes en su rol habitual, asi
+  // que no ve ni puede activar "Entrega excepcional".
+  puedeEntregaExcepcional: boolean;
   moneda: string;
 }
 
@@ -137,9 +144,18 @@ export function EntregaClient({
   paqueteInicial,
   countdownSegundos,
   esAdmin,
+  puedeEntregaExcepcional,
   moneda,
 }: EntregaClientProps) {
-  const [tab, setTab] = React.useState<'usb' | 'camara'>('usb');
+  const [tab, setTab] = React.useState<'usb' | 'camara' | 'teclado'>('usb');
+  // "Entrega excepcional": OFF por defecto (ver seccion 2 de la
+  // especificacion). Solo tiene efecto si puedeEntregaExcepcional — el
+  // backend igual la rechaza para cualquier otro rol, pero ni siquiera se
+  // ofrece el control en pantalla.
+  const [excepcionalActivo, setExcepcionalActivo] = React.useState(false);
+  const [confirmandoExcepcional, setConfirmandoExcepcional] = React.useState<string | null>(null);
+  const [registrandoExcepcional, setRegistrandoExcepcional] = React.useState(false);
+  const resolverExcepcionalRef = React.useRef<(() => void) | null>(null);
   const [query, setQuery] = React.useState(codigoInicial ?? '');
   const [paquete, setPaquete] = React.useState<PackageDetailDTO | null>(paqueteInicial ?? null);
   const [fase, setFase] = React.useState<FaseEntrega>(
@@ -271,6 +287,21 @@ export function EntregaClient({
       const res = await fetch(`/api/entrega/${encodeURIComponent(code)}`);
       const data = await res.json();
       if (!res.ok) {
+        if (res.status === 404 && excepcionalActivo && puedeEntregaExcepcional) {
+          // No figura como recibido y el operador autorizado activo el
+          // modo excepcional: se pausa aqui (misma tecnica que COUNTDOWN,
+          // ver resolverCicloRef) hasta que confirme o cancele el banner
+          // de advertencia — nunca se crea nada sin esa confirmacion
+          // explicita.
+          setPaquete(null);
+          setFase('ERROR');
+          setMensajeError(null);
+          setConfirmandoExcepcional(code);
+          await new Promise<void>((resolve) => {
+            resolverExcepcionalRef.current = resolve;
+          });
+          return;
+        }
         setPaquete(null);
         setFase('ERROR');
         setMensajeError(data.error ?? 'No se encontró el paquete.');
@@ -311,6 +342,49 @@ export function EntregaClient({
       setFase('ERROR');
       setMensajeError('Error de conexión. Intenta de nuevo.');
       playSound('error');
+    }
+  }
+
+  function cancelarExcepcional() {
+    const code = confirmandoExcepcional;
+    setConfirmandoExcepcional(null);
+    setMensajeError(code ? `No se encontró ningún paquete con el código "${code}".` : null);
+    resolverExcepcionalRef.current?.();
+    resolverExcepcionalRef.current = null;
+    focusScanner(inputRef);
+  }
+
+  async function confirmarExcepcional() {
+    const code = confirmandoExcepcional;
+    if (!code || registrandoExcepcional) return;
+    setRegistrandoExcepcional(true);
+    try {
+      const res = await fetch(`/api/entrega/${encodeURIComponent(code)}/excepcional`, { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) {
+        setConfirmandoExcepcional(null);
+        setFase('ERROR');
+        setMensajeError(data.error ?? 'No se pudo registrar la entrega excepcional.');
+        playSound('error');
+        return;
+      }
+      setConfirmandoExcepcional(null);
+      setPaquete(data);
+      setFase('FOUND');
+      setEntregadosRecientes((prev) => [aEntregaReciente(data), ...prev].slice(0, 15));
+      setEntregadosHoy((n) => n + 1);
+      reportarEscaneoExitoso();
+      playSound('ok');
+    } catch {
+      setConfirmandoExcepcional(null);
+      setFase('ERROR');
+      setMensajeError('Error de conexión. No se registró la entrega excepcional.');
+      playSound('error');
+    } finally {
+      setRegistrandoExcepcional(false);
+      resolverExcepcionalRef.current?.();
+      resolverExcepcionalRef.current = null;
+      focusScanner(inputRef);
     }
   }
 
@@ -604,6 +678,15 @@ export function EntregaClient({
                   >
                     <CameraIcon className="h-3.5 w-3.5" /> Cámara
                   </button>
+                  <button
+                    onClick={() => setTab('teclado')}
+                    className={cn(
+                      'flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors',
+                      tab === 'teclado' ? 'bg-white dark:bg-gray-900 text-ink dark:text-gray-100 shadow-sm' : 'text-ink-soft dark:text-gray-400 hover:text-ink dark:hover:text-gray-100'
+                    )}
+                  >
+                    <Keyboard className="h-3.5 w-3.5" /> Teclado
+                  </button>
                 </div>
               </div>
             </div>
@@ -628,17 +711,65 @@ export function EntregaClient({
                 />
                 {buscando && <Loader2 className="pointer-events-none absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 animate-spin text-gray-400 dark:text-gray-500" />}
               </div>
-            ) : (
+            ) : tab === 'camara' ? (
               <div className="mx-auto max-w-sm">
                 <CameraScanner onDetect={escanear} />
+              </div>
+            ) : (
+              <div className="mx-auto max-w-sm">
+                <TecladoVirtual onDetect={escanear} />
               </div>
             )}
             <p className="mt-2 text-xs text-gray-400 dark:text-gray-500">
               Al escanear, el paquete aparece y la cuenta regresiva de entrega comienza sola — no hace falta tocar ningún botón.
             </p>
             {fase === 'ERROR' && mensajeError && <p className="mt-2 text-sm text-red-600 dark:text-red-400">{mensajeError}</p>}
+
+            {puedeEntregaExcepcional && (
+              <label className="mt-3 flex cursor-pointer items-center justify-between gap-2 rounded-lg border border-gray-100 dark:border-gray-800/60 px-3 py-2.5">
+                <span className="flex items-center gap-1.5 text-sm font-medium text-ink dark:text-gray-100">
+                  <AlertTriangle className="h-3.5 w-3.5 text-amber-500" /> Entrega excepcional
+                </span>
+                <span
+                  role="switch"
+                  aria-checked={excepcionalActivo}
+                  onClick={() => setExcepcionalActivo((v) => !v)}
+                  className={cn(
+                    'relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors',
+                    excepcionalActivo ? 'bg-amber-500' : 'bg-gray-200 dark:bg-gray-700'
+                  )}
+                >
+                  <span className={cn('inline-block h-4 w-4 transform rounded-full bg-white transition-transform', excepcionalActivo ? 'translate-x-6' : 'translate-x-1')} />
+                </span>
+              </label>
+            )}
+            {puedeEntregaExcepcional && excepcionalActivo && (
+              <p className="mt-1.5 text-xs text-amber-600 dark:text-amber-400">
+                Activado: un código que no figure como recibido podrá entregarse igual, dejando constancia de que la recepción se omitió.
+              </p>
+            )}
           </CardContent>
         </Card>
+
+        {confirmandoExcepcional && (
+          <div role="alertdialog" className="rounded-xl border-2 border-amber-400 dark:border-amber-600 bg-amber-50 dark:bg-amber-500/10 p-4">
+            <p className="flex items-center gap-1.5 text-sm font-bold uppercase tracking-wide text-amber-700 dark:text-amber-400">
+              <AlertTriangle className="h-4 w-4" /> Entrega excepcional
+            </p>
+            <p className="mt-1.5 text-sm text-amber-800 dark:text-amber-300">
+              El código <span className="font-mono font-semibold">{confirmandoExcepcional}</span> no figura como recibido en el sistema. Se
+              registrará automáticamente como recepción omitida y entrega realizada.
+            </p>
+            <div className="mt-3 flex gap-2">
+              <Button variant="secondary" size="sm" onClick={cancelarExcepcional} disabled={registrandoExcepcional}>
+                Cancelar
+              </Button>
+              <Button size="sm" onClick={confirmarExcepcional} loading={registrandoExcepcional}>
+                Continuar
+              </Button>
+            </div>
+          </div>
+        )}
 
         {alertaEntregado && (
           <div
@@ -679,6 +810,11 @@ export function EntregaClient({
                   {paquete.origenEntrega === 'IMPORTACION' && (
                     <span className="rounded-full bg-gray-100 dark:bg-gray-800 px-2 py-0.5 text-[10px] font-medium text-ink-soft dark:text-gray-400">
                       Importación administrativa{paquete.lote ? ` · ${paquete.lote}` : ''}
+                    </span>
+                  )}
+                  {paquete.origenEntrega === 'EXCEPCIONAL' && (
+                    <span className="flex items-center gap-1 rounded-full bg-amber-100 dark:bg-amber-500/10 px-2 py-0.5 text-[10px] font-medium text-amber-700 dark:text-amber-400">
+                      <AlertTriangle className="h-2.5 w-2.5" /> Entrega excepcional
                     </span>
                   )}
                 </div>
@@ -1106,7 +1242,13 @@ export function EntregaClient({
                           <User className="h-3 w-3" /> {p.destinatario}
                         </span>
                       )}
-                      <span>{p.origenEntrega === 'IMPORTACION' ? `Importación administrativa${p.lote ? ` · ${p.lote}` : ''}` : 'Recepción'}</span>
+                      <span>
+                        {p.origenEntrega === 'IMPORTACION'
+                          ? `Importación administrativa${p.lote ? ` · ${p.lote}` : ''}`
+                          : p.origenEntrega === 'EXCEPCIONAL'
+                            ? 'Entrega excepcional'
+                            : 'Recepción'}
+                      </span>
                     </div>
                     {editando === p.code && (
                       <div className="mt-2 flex flex-wrap items-end gap-2 rounded-lg bg-gray-50 dark:bg-gray-800/40 p-3">

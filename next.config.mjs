@@ -6,6 +6,13 @@ const nextConfig = {
   eslint: {
     dirs: ['src'],
   },
+  // Necesario en la linea 14.x para que instrumentation.ts (cierre
+  // automatico de caja, ver src/lib/finanzas.ts) se ejecute al arrancar
+  // el servidor — sigue siendo "experimental" en esta version especifica,
+  // aunque ya es estable/default en versiones mas nuevas de Next.
+  experimental: {
+    instrumentationHook: true,
+  },
 };
 
 export default nextConfig;
