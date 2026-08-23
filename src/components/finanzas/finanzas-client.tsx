@@ -2,20 +2,22 @@
 
 // src/components/finanzas/finanzas-client.tsx
 import * as React from 'react';
-import { LayoutGrid, Receipt, Lock, PenSquare } from 'lucide-react';
+import { LayoutGrid, Receipt, Lock, PenSquare, ShieldCheck } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { ResumenTab } from '@/components/finanzas/resumen-tab';
 import { GastosTab } from '@/components/finanzas/gastos-tab';
 import { CierreCajaTab } from '@/components/finanzas/cierre-caja-tab';
 import { CorregirCobroTab } from '@/components/finanzas/corregir-cobro-tab';
+import { AuditoriaTab } from '@/components/finanzas/auditoria-tab';
 
-type TabId = 'resumen' | 'gastos' | 'cierre' | 'corregir';
+type TabId = 'resumen' | 'gastos' | 'cierre' | 'corregir' | 'auditoria';
 
 const TABS: Array<{ id: TabId; label: string; icon: typeof LayoutGrid }> = [
   { id: 'resumen', label: 'Resumen', icon: LayoutGrid },
   { id: 'gastos', label: 'Gastos', icon: Receipt },
   { id: 'cierre', label: 'Cierre de caja', icon: Lock },
   { id: 'corregir', label: 'Corregir cobro', icon: PenSquare },
+  { id: 'auditoria', label: 'Auditoría', icon: ShieldCheck },
 ];
 
 export function FinanzasClient({ moneda }: { moneda: string }) {
@@ -42,6 +44,7 @@ export function FinanzasClient({ moneda }: { moneda: string }) {
       {tab === 'gastos' && <GastosTab moneda={moneda} />}
       {tab === 'cierre' && <CierreCajaTab moneda={moneda} />}
       {tab === 'corregir' && <CorregirCobroTab />}
+      {tab === 'auditoria' && <AuditoriaTab moneda={moneda} />}
     </div>
   );
 }

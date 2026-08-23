@@ -358,3 +358,184 @@ export async function listarPagosPaquete(packageId: string): Promise<PagoDTO[]> 
 export async function ajustarCobroPaquete(pkg: Package, montoDelta: number, userId: string, motivo?: string): Promise<Package> {
   return registrarPago(pkg, 'AJUSTE', montoDelta, userId, motivo);
 }
+
+// ---------------------------------------------------------------------
+// Desglose: cada boliviano de un total de Finanzas debe poder rastrearse
+// hasta un movimiento real de Pago (paquete, monto, fecha/hora, operador).
+// ---------------------------------------------------------------------
+
+export interface PagoDetalleDTO {
+  id: string;
+  codigo: string;
+  tipo: string;
+  monto: number;
+  usuario: string;
+  createdAt: string;
+  motivo: string | null;
+}
+
+/** Lista, uno por uno, los movimientos de Pago que componen getResumenFinanciero() para el mismo período — el detalle detrás de "Ingresos". */
+export async function listarPagosPeriodo(rango: RangoFecha): Promise<PagoDetalleDTO[]> {
+  const createdAt = whereRango(rango);
+  const pagos = await prisma.pago.findMany({
+    where: createdAt ? { createdAt } : {},
+    orderBy: { createdAt: 'desc' },
+    take: 2000,
+    include: { user: { select: { nombre: true } }, package: { select: { code: true } } },
+  });
+  return pagos.map((p) => ({
+    id: p.id,
+    codigo: p.package.code,
+    tipo: p.tipo,
+    monto: p.monto,
+    usuario: p.user?.nombre ?? 'Sistema',
+    createdAt: p.createdAt.toISOString(),
+    motivo: p.motivo,
+  }));
+}
+
+// ---------------------------------------------------------------------
+// Auditoría financiera: quién recibió, quién entregó, quién cobró, quién
+// corrigió — y la única inconsistencia que puede detectarse de verdad con
+// los datos que existen: un paquete que ya figura ENTREGADO en el período
+// pero no tiene ningún Pago asociado (montoPagado <= 0). "estadoPago"
+// nunca puede quedar en PAGADO sin un Pago real detrás (ver
+// registrarPago() en package-transitions.ts, único lugar que lo toca), así
+// que esa combinación específica no puede ocurrir por diseño — no se
+// inventa una comprobación ahí donde el propio código ya lo garantiza.
+// ---------------------------------------------------------------------
+
+export interface AuditoriaOperadorDTO {
+  userId: string | null;
+  usuario: string;
+  recepciones: number;
+  entregas: number;
+  cobros: number;
+  montoCobrado: number;
+  anticipos: number;
+  montoAnticipos: number;
+  ajustes: number;
+  montoAjustes: number;
+  entregasSinCobro: number;
+}
+
+export interface AuditoriaFinancieraDTO {
+  ingresos: number;
+  pagosRegistrados: number;
+  paquetesEntregados: number;
+  entregasSinCobro: number;
+  codigosSinCobro: string[];
+  porOperador: AuditoriaOperadorDTO[];
+}
+
+function nombreUsuario(map: Map<string, string>, userId: string | null): string {
+  if (!userId) return 'Sistema';
+  return map.get(userId) ?? 'Usuario eliminado';
+}
+
+/** Auditoría por operador (Recepción/Entrega/Finanzas) + detección de inconsistencias reales, para el período dado. */
+export async function getAuditoriaFinanciera(rango: RangoFecha): Promise<AuditoriaFinancieraDTO> {
+  const fechaFiltro = whereRango(rango);
+
+  const [usuarios, resumen, entregasHist, cobrosPorOperador, anticiposPorOperador, ajustesPorOperador, recepcionesPorOperador, entregadosSinCobro, pagosRegistrados] =
+    await Promise.all([
+      prisma.user.findMany({ select: { id: true, nombre: true } }),
+      getResumenFinanciero(rango),
+      prisma.packageHistory.findMany({
+        where: { estado: 'ENTREGADO', ...(fechaFiltro ? { fecha: fechaFiltro } : {}) },
+        select: { userId: true, packageId: true },
+      }),
+      prisma.pago.groupBy({
+        by: ['userId'],
+        where: { tipo: 'COBRO_ENTREGA', ...(fechaFiltro ? { createdAt: fechaFiltro } : {}) },
+        _count: { _all: true },
+        _sum: { monto: true },
+      }),
+      prisma.pago.groupBy({
+        by: ['userId'],
+        where: { tipo: 'ANTICIPO', ...(fechaFiltro ? { createdAt: fechaFiltro } : {}) },
+        _count: { _all: true },
+        _sum: { monto: true },
+      }),
+      prisma.pago.groupBy({
+        by: ['userId'],
+        where: { tipo: 'AJUSTE', ...(fechaFiltro ? { createdAt: fechaFiltro } : {}) },
+        _count: { _all: true },
+        _sum: { monto: true },
+      }),
+      prisma.package.groupBy({
+        by: ['registradoPorId'],
+        where: fechaFiltro ? { ingresoAt: fechaFiltro } : {},
+        _count: { _all: true },
+      }),
+      prisma.package.findMany({
+        where: { status: 'ENTREGADO', montoPagado: { lte: 0 }, ...(fechaFiltro ? { entregaAt: fechaFiltro } : {}) },
+        select: { id: true, code: true },
+      }),
+      prisma.pago.count({ where: { tipo: 'COBRO_ENTREGA', ...(fechaFiltro ? { createdAt: fechaFiltro } : {}) } }),
+    ]);
+
+  const nombrePorId = new Map(usuarios.map((u) => [u.id, u.nombre] as const));
+  // Quien entregó cada paquete, para poder atribuir "entregado sin cobro" a
+  // un operador (el paquete no tiene su propio campo "entregadoPorId" — se
+  // reutiliza PackageHistory, ya escrito por transicionar() en la misma
+  // transaccion que la entrega, en vez de duplicar el dato en Package).
+  const entregadorPorPackageId = new Map(entregasHist.map((h) => [h.packageId, h.userId] as const));
+
+  const filas = new Map<string, AuditoriaOperadorDTO>();
+  function fila(userId: string | null): AuditoriaOperadorDTO {
+    const key = userId ?? '__sistema__';
+    let f = filas.get(key);
+    if (!f) {
+      f = {
+        userId,
+        usuario: nombreUsuario(nombrePorId, userId),
+        recepciones: 0,
+        entregas: 0,
+        cobros: 0,
+        montoCobrado: 0,
+        anticipos: 0,
+        montoAnticipos: 0,
+        ajustes: 0,
+        montoAjustes: 0,
+        entregasSinCobro: 0,
+      };
+      filas.set(key, f);
+    }
+    return f;
+  }
+
+  for (const r of recepcionesPorOperador) fila(r.registradoPorId).recepciones = r._count._all;
+  for (const h of entregasHist) fila(h.userId).entregas += 1;
+  for (const c of cobrosPorOperador) {
+    const f = fila(c.userId);
+    f.cobros = c._count._all;
+    f.montoCobrado = Math.round((c._sum.monto ?? 0) * 100) / 100;
+  }
+  for (const a of anticiposPorOperador) {
+    const f = fila(a.userId);
+    f.anticipos = a._count._all;
+    f.montoAnticipos = Math.round((a._sum.monto ?? 0) * 100) / 100;
+  }
+  for (const a of ajustesPorOperador) {
+    const f = fila(a.userId);
+    f.ajustes = a._count._all;
+    f.montoAjustes = Math.round((a._sum.monto ?? 0) * 100) / 100;
+  }
+  for (const pkg of entregadosSinCobro) {
+    fila(entregadorPorPackageId.get(pkg.id) ?? null).entregasSinCobro += 1;
+  }
+
+  const porOperador = Array.from(filas.values())
+    .filter((f) => f.recepciones + f.entregas + f.cobros + f.anticipos + f.ajustes + f.entregasSinCobro > 0)
+    .sort((a, b) => b.entregas + b.cobros - (a.entregas + a.cobros));
+
+  return {
+    ingresos: resumen.ingresos,
+    pagosRegistrados,
+    paquetesEntregados: entregasHist.length,
+    entregasSinCobro: entregadosSinCobro.length,
+    codigosSinCobro: entregadosSinCobro.map((p) => p.code),
+    porOperador,
+  };
+}

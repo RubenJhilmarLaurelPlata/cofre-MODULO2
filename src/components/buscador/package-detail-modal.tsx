@@ -34,7 +34,14 @@ const ESTADO_HISTORIAL_LABEL: Record<string, string> = {
   PENDIENTE_BAJAR: 'Solicitado bajar de depósito',
   ENTREGADO: 'Entregado',
   DENEGADO: 'Denegado',
+  PAGO_ANTICIPO: 'Pago anticipado',
+  PAGO_COBRO_ENTREGA: 'Cobro registrado',
+  PAGO_AJUSTE: 'Corrección de cobro',
 };
+
+function esEventoPago(estado: string): boolean {
+  return estado.startsWith('PAGO_');
+}
 
 export function PackageDetailModal({ detalle, tab, onTabChange, historial, cargandoHistorial, onClose }: PackageDetailModalProps) {
   return (
@@ -171,7 +178,7 @@ export function PackageDetailModal({ detalle, tab, onTabChange, historial, carga
               <ol className="space-y-4 border-l-2 border-gray-100 dark:border-gray-800/60 pl-4">
                 {historial.map((h, i) => (
                   <li key={i} className="relative">
-                    <span className="absolute -left-[21px] top-1 h-2.5 w-2.5 rounded-full bg-brand-500" />
+                    <span className={`absolute -left-[21px] top-1 h-2.5 w-2.5 rounded-full ${esEventoPago(h.estado) ? 'bg-emerald-500' : 'bg-brand-500'}`} />
                     <p className="text-sm font-medium text-ink dark:text-gray-100">{ESTADO_HISTORIAL_LABEL[h.estado] ?? h.estado}</p>
                     <p className="text-xs text-gray-400 dark:text-gray-500">
                       {fmtFechaCompleta(h.fecha)} — {h.usuario}

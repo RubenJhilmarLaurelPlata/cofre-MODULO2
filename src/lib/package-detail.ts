@@ -163,23 +163,59 @@ export interface HistorialItemDTO {
   nota: string | null;
 }
 
+const TIPO_PAGO_ESTADO: Record<string, string> = {
+  ANTICIPO: 'PAGO_ANTICIPO',
+  COBRO_ENTREGA: 'PAGO_COBRO_ENTREGA',
+  AJUSTE: 'PAGO_AJUSTE',
+};
+
+/**
+ * Linea de tiempo completa de un paquete, para el Buscador: no solo los
+ * cambios de estado (PackageHistory) sino tambien cada movimiento real de
+ * dinero (Pago) — asi recepcion, pago, entrega y correcciones aparecen
+ * juntos y en orden, sin tener que abrir Finanzas por separado (ver
+ * REGLA sobre "buscador de auditoria unificado").
+ */
 export async function getPackageHistorial(codeRaw: string): Promise<HistorialItemDTO[] | null> {
   const codigoNormalizado = normalizarCodigo(codeRaw);
   const pkg = await prisma.package.findUnique({ where: { codigoNormalizado }, select: { id: true } });
   if (!pkg) return null;
 
-  const historial = await prisma.packageHistory.findMany({
-    where: { packageId: pkg.id },
-    orderBy: { fecha: 'asc' },
-    include: { user: { select: { nombre: true } } },
+  const [historial, pagos, company] = await Promise.all([
+    prisma.packageHistory.findMany({
+      where: { packageId: pkg.id },
+      include: { user: { select: { nombre: true } } },
+    }),
+    prisma.pago.findMany({
+      where: { packageId: pkg.id },
+      include: { user: { select: { nombre: true } } },
+    }),
+    getCompanyConfig(),
+  ]);
+
+  const eventosEstado: Array<{ fecha: Date; item: HistorialItemDTO }> = historial.map((h) => ({
+    fecha: h.fecha,
+    item: { estado: h.estado, fecha: h.fecha.toISOString(), usuario: h.user?.nombre ?? 'Sistema', nota: h.nota },
+  }));
+
+  const eventosPago: Array<{ fecha: Date; item: HistorialItemDTO }> = pagos.map((p) => {
+    const montoTexto = `${company.moneda} ${p.monto.toFixed(2)}`;
+    const nota =
+      p.tipo === 'AJUSTE' && p.montoAnterior !== null && p.montoNuevo !== null
+        ? `De ${company.moneda} ${p.montoAnterior.toFixed(2)} a ${company.moneda} ${p.montoNuevo.toFixed(2)}${p.motivo ? ` — ${p.motivo}` : ''}`
+        : p.motivo || `Monto: ${montoTexto}`;
+    return {
+      fecha: p.createdAt,
+      item: {
+        estado: TIPO_PAGO_ESTADO[p.tipo] ?? 'PAGO_AJUSTE',
+        fecha: p.createdAt.toISOString(),
+        usuario: p.user?.nombre ?? 'Sistema',
+        nota,
+      },
+    };
   });
 
-  return historial.map((h) => ({
-    estado: h.estado,
-    fecha: h.fecha.toISOString(),
-    usuario: h.user?.nombre ?? 'Sistema',
-    nota: h.nota,
-  }));
+  return [...eventosEstado, ...eventosPago].sort((a, b) => a.fecha.getTime() - b.fecha.getTime()).map((e) => e.item);
 }
 
 /**
