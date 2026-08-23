@@ -54,6 +54,13 @@ model User {
   // misma fecha, puesta muy en el futuro).
   intentosFallidos Int       @default(0)
   bloqueadoHasta   DateTime?
+  // "Eliminar" (distinto de "Deshabilitar"/activo=false, que es
+  // reversible): marca logica, NUNCA un DELETE fisico — el usuario tiene
+  // historial real (paquetes registrados, pagos, auditoria) que debe
+  // conservarse intacto y seguir mostrando su nombre. null = nunca
+  // eliminado. Tambien pone activo=false (no puede iniciar sesion, mismo
+  // chequeo que ya existe para usuarios desactivados).
+  eliminadoAt      DateTime?
   createdAt        DateTime  @default(now())
   updatedAt        DateTime  @updatedAt
 

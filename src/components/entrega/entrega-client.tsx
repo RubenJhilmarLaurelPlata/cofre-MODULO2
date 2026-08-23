@@ -648,10 +648,21 @@ export function EntregaClient({
   return (
     <div className="grid grid-cols-1 gap-5 md:grid-cols-3">
       <div className="space-y-5 md:col-span-2">
-        <Card>
+        {/* Identidad de Entrega: acento rojo/rosa ("salida/entregar") — borde
+            superior + chip de icono, nunca la tarjeta entera. Ver Recepcion
+            (verde/"entrada") para el contraste equivalente. */}
+        <Card className="border-t-4 border-t-rose-400 dark:border-t-rose-500">
           <CardHeader>
             <div className="flex flex-wrap items-center justify-between gap-2">
-              <CardTitle>Buscar paquete</CardTitle>
+              <CardTitle className="flex items-center gap-2">
+                <span className="flex h-7 w-7 items-center justify-center rounded-lg bg-rose-500 text-white">
+                  <Truck className="h-4 w-4" />
+                </span>
+                Buscar paquete
+                <span className="hidden items-center gap-1 rounded-full bg-rose-50 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-rose-700 dark:bg-rose-500/10 dark:text-rose-400 sm:flex">
+                  Salida
+                </span>
+              </CardTitle>
               <div className="flex flex-wrap items-center gap-3">
                 {esAdmin && (
                   <Link href="/importacion" className="flex items-center gap-1 text-xs text-brand-600 dark:text-brand-400 hover:underline">
@@ -752,20 +763,20 @@ export function EntregaClient({
         </Card>
 
         {confirmandoExcepcional && (
-          <div role="alertdialog" className="rounded-xl border-2 border-amber-400 dark:border-amber-600 bg-amber-50 dark:bg-amber-500/10 p-4">
+          <div role="alertdialog" className="animate-scale-in rounded-xl border-2 border-amber-400 dark:border-amber-600 bg-amber-50 dark:bg-amber-500/10 p-4">
             <p className="flex items-center gap-1.5 text-sm font-bold uppercase tracking-wide text-amber-700 dark:text-amber-400">
-              <AlertTriangle className="h-4 w-4" /> Entrega excepcional
+              ⚠️ <AlertTriangle className="h-4 w-4" /> Entrega excepcional
             </p>
             <p className="mt-1.5 text-sm text-amber-800 dark:text-amber-300">
-              El código <span className="font-mono font-semibold">{confirmandoExcepcional}</span> no figura como recibido en el sistema. Se
-              registrará automáticamente como recepción omitida y entrega realizada.
+              El código <span className="font-mono font-semibold">{confirmandoExcepcional}</span> no existe en el sistema. Esta acción creará el
+              paquete y lo marcará como entregado, dejando constancia de que la recepción se omitió.
             </p>
             <div className="mt-3 flex gap-2">
               <Button variant="secondary" size="sm" onClick={cancelarExcepcional} disabled={registrandoExcepcional}>
                 Cancelar
               </Button>
               <Button size="sm" onClick={confirmarExcepcional} loading={registrandoExcepcional}>
-                Continuar
+                Confirmar entrega
               </Button>
             </div>
           </div>
@@ -787,10 +798,18 @@ export function EntregaClient({
         )}
 
         {feedback && (
+          // Identidad de Entrega: la confirmacion positiva usa el tono
+          // rojo/rosa controlado del modulo ("salida"), no el verde que usa
+          // Recepcion para "entrada" — a proposito distinto de esa pantalla
+          // aunque ambos sean "exito" (ver seccion "Entrega -
+          // microinteracciones" de la especificacion).
           <div
-            className={`flex items-center gap-2 rounded-xl border p-3 text-sm ${
-              feedback.ok ? 'border-emerald-200 dark:border-emerald-900/50 bg-emerald-50 dark:bg-emerald-500/10 text-emerald-700 dark:text-emerald-400' : 'border-red-200 dark:border-red-900/50 bg-red-50 dark:bg-red-500/10 text-red-700 dark:text-red-400'
-            }`}
+            className={cn(
+              'animate-fade-in-up flex items-center gap-2 rounded-xl border p-3 text-sm',
+              feedback.ok
+                ? 'border-rose-200 dark:border-rose-900/50 bg-rose-50 dark:bg-rose-500/10 text-rose-700 dark:text-rose-400'
+                : 'border-red-200 dark:border-red-900/50 bg-red-50 dark:bg-red-500/10 text-red-700 dark:text-red-400'
+            )}
           >
             {feedback.ok ? <CheckCircle2 className="h-4 w-4 shrink-0" /> : <XCircle className="h-4 w-4 shrink-0" />}
             {feedback.mensaje}
@@ -1177,9 +1196,9 @@ export function EntregaClient({
           izquierda y la derecha era solo una tarjeta con mucho espacio en
           blanco debajo). */}
       <div className="space-y-5">
-        <Card>
+        <Card className="border-rose-100 dark:border-rose-900/40">
           <CardContent className="flex items-center gap-3">
-            <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-brand-500 text-white">
+            <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-rose-500 text-white">
               <Truck className="h-5 w-5" strokeWidth={1.75} />
             </div>
             <div>

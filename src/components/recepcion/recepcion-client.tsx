@@ -281,11 +281,21 @@ export function RecepcionClient({ moneda, tarifaBase, montosRapidos, series, ing
           ESCANEAR -> CONDICION DE PAGO -> REGISTRAR -> SIGUIENTE), antes
           que "Ultimos paquetes" (que ahora va en la fila 2, ver abajo). */}
       <div className="space-y-4 md:col-start-1 md:col-span-2 md:row-start-1">
-      <Card>
+      {/* Identidad de Recepcion: acento verde ("entrada/registrar") — borde
+          superior + chip de icono, nunca la tarjeta entera, para no perder
+          la identidad naranja de marca. Ver Entrega (rojo/"salida") para el
+          contraste equivalente. */}
+      <Card className="border-t-4 border-t-emerald-400 dark:border-t-emerald-500">
         <CardHeader>
           <div className="flex flex-wrap items-center justify-between gap-2">
             <CardTitle className="flex items-center gap-2">
-              <ScanLine className="h-4 w-4 text-brand-500" /> Escanear
+              <span className="flex h-7 w-7 items-center justify-center rounded-lg bg-emerald-500 text-white">
+                <ScanLine className="h-4 w-4" />
+              </span>
+              Escanear
+              <span className="hidden items-center gap-1 rounded-full bg-emerald-50 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-400 sm:flex">
+                Entrada
+              </span>
             </CardTitle>
             <div className="flex items-center gap-3">
               <ScannerStatus />
@@ -324,8 +334,8 @@ export function RecepcionClient({ moneda, tarifaBase, montosRapidos, series, ing
         <CardContent className="space-y-3">
           {tab === 'usb' ? (
             <div>
-              <div onClick={enfocarInput} className="cursor-text rounded-xl border-2 border-dashed border-gray-200 dark:border-gray-800 bg-gray-50 dark:bg-gray-800/40 p-6 text-center sm:p-8">
-                <ScanLine className="mx-auto mb-2.5 h-7 w-7 text-gray-300 dark:text-gray-600" strokeWidth={1.5} />
+              <div onClick={enfocarInput} className="cursor-text rounded-xl border-2 border-dashed border-emerald-200 dark:border-emerald-900/40 bg-emerald-50/30 dark:bg-emerald-500/5 p-6 text-center sm:p-8">
+                <ScanLine className="mx-auto mb-2.5 h-7 w-7 text-emerald-300 dark:text-emerald-700" strokeWidth={1.5} />
                 <Input
                   ref={inputRef}
                   value={valor}
@@ -362,14 +372,18 @@ export function RecepcionClient({ moneda, tarifaBase, montosRapidos, series, ing
           {/* Ultimo resultado: forma parte del escaner, no una tarjeta aparte. */}
           {ultimo && (
             <div
+              key={`${ultimo.code}-${ultimo.hora}`}
               className={cn(
-                'flex items-center gap-3 rounded-lg border-2 px-3.5 py-2.5',
+                'animate-scale-in flex items-center gap-3 rounded-lg border-2 px-3.5 py-2.5',
                 ultimo.ok ? 'border-emerald-200 dark:border-emerald-900/50 bg-emerald-50/40 dark:bg-emerald-500/5' : 'border-red-200 dark:border-red-900/50 bg-red-50/40 dark:bg-red-500/5'
               )}
             >
               {ultimo.ok ? <CheckCircle2 className="h-6 w-6 shrink-0 text-emerald-500" /> : <XCircle className="h-6 w-6 shrink-0 text-red-500" />}
               <div className="min-w-0 flex-1">
-                <p className="truncate font-mono text-base font-semibold text-ink dark:text-gray-100">{ultimo.code}</p>
+                <p className="truncate font-mono text-base font-semibold text-ink dark:text-gray-100">
+                  {ultimo.ok && '✓ '}
+                  {ultimo.code}
+                </p>
                 <p className={cn('text-xs', ultimo.ok ? 'text-emerald-700 dark:text-emerald-400' : 'text-red-700 dark:text-red-400')}>{ultimo.mensaje}</p>
               </div>
               {ultimo.ok && ultimo.costoAcumulado !== undefined && (
@@ -497,8 +511,8 @@ export function RecepcionClient({ moneda, tarifaBase, montosRapidos, series, ing
       <div className="space-y-4 md:col-start-3 md:row-start-2">
         <LoteActivoPanel moneda={moneda} separador={separador} esAdmin={esAdmin} actualizarToken={loteActivoToken} />
 
-        <div className="flex items-center gap-3 rounded-lg border border-gray-200 bg-white px-3.5 py-2.5 dark:border-gray-800 dark:bg-gray-900">
-          <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-brand-500 text-white">
+        <div className="flex items-center gap-3 rounded-lg border border-emerald-100 dark:border-emerald-900/40 bg-white px-3.5 py-2.5 dark:bg-gray-900">
+          <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-emerald-500 text-white">
             <PackagePlus className="h-4 w-4" strokeWidth={1.75} />
           </div>
           <div>

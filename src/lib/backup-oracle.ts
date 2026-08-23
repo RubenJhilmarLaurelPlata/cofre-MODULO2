@@ -32,9 +32,52 @@ function formatearErrorComando(err: unknown): string {
 }
 
 const BACKUP_SCRIPT = process.env.BACKUP_SCRIPT_PATH ?? '/usr/local/bin/backup-cofre.sh';
-const OCI_BIN = process.env.OCI_CLI_PATH ?? 'oci';
+const OCI_BIN_CONFIGURADO = process.env.OCI_CLI_PATH;
 const ORACLE_BUCKET = process.env.ORACLE_BACKUP_BUCKET ?? 'cofre-express-backups';
 const ORACLE_NAMESPACE = process.env.ORACLE_NAMESPACE ?? 'grwpjc1fcohd';
+
+let ociBinResuelto: string | null = null;
+
+/**
+ * Resuelve la ruta real del CLI `oci`. Causa raiz del falso "No se
+ * encontró el comando OCI" reportado en produccion: `execFile('oci', …)`
+ * busca el binario en el PATH del PROCESO de Node (el que le da PM2/
+ * systemd al arrancar), que casi nunca incluye `~/.local/bin` — la
+ * ubicacion tipica de `pip install --user oci-cli` — aunque ese mismo
+ * comando funcione perfecto cuando el administrador entra por SSH (shell
+ * interactivo, que SI carga ~/.bash_profile/~/.profile). La solucion NO
+ * es cambiar como se autentica ni pedir configuracion nueva: si el
+ * binario no aparece con el PATH tal cual, se resuelve UNA vez via un
+ * shell de login (`bash -lc 'command -v oci'`, sin interpolar nada del
+ * usuario) y se reutiliza esa ruta absoluta en llamadas seguras
+ * (execFile con argumentos por arreglo, nunca por texto).
+ */
+async function resolverOciBin(): Promise<string> {
+  if (OCI_BIN_CONFIGURADO) return OCI_BIN_CONFIGURADO;
+  if (ociBinResuelto) return ociBinResuelto;
+
+  try {
+    await execFileAsync('oci', ['--version'], { timeout: 5_000 });
+    ociBinResuelto = 'oci';
+    return ociBinResuelto;
+  } catch {
+    // Sigue al fallback de abajo.
+  }
+
+  try {
+    const { stdout } = await execFileAsync('bash', ['-lc', 'command -v oci'], { timeout: 5_000 });
+    const ruta = stdout.trim();
+    if (ruta) {
+      ociBinResuelto = ruta;
+      return ociBinResuelto;
+    }
+  } catch {
+    // Ninguna de las dos formas encontró el binario — se informa tal cual
+    // mas abajo (formatearErrorComando), nunca se finge que existe.
+  }
+
+  return 'oci';
+}
 
 export interface ResultadoBackupReal {
   ok: boolean;
@@ -80,8 +123,9 @@ interface ObjetoOciCrudo {
 /** Lista los respaldos reales disponibles en el bucket de Oracle Object Storage vía el CLI `oci`. Nunca inventa una lista si el CLI falla. */
 export async function listarRespaldosOracle(): Promise<ResultadoListaOracle> {
   try {
+    const ociBin = await resolverOciBin();
     const { stdout } = await execFileAsync(
-      OCI_BIN,
+      ociBin,
       ['os', 'object', 'list', '--bucket-name', ORACLE_BUCKET, '--namespace', ORACLE_NAMESPACE, '--auth', 'instance_principal', '--output', 'json'],
       { timeout: 30_000, maxBuffer: 10 * 1024 * 1024 }
     );
@@ -130,8 +174,9 @@ export async function restaurarDesdeOracle(nombreArchivo: string): Promise<Resul
 
   const tmpFile = path.join(os.tmpdir(), `cofre-restore-${Date.now()}-${nombreArchivo.replace(/[^a-zA-Z0-9._-]/g, '_')}`);
   try {
+    const ociBin = await resolverOciBin();
     await execFileAsync(
-      OCI_BIN,
+      ociBin,
       ['os', 'object', 'get', '--bucket-name', ORACLE_BUCKET, '--namespace', ORACLE_NAMESPACE, '--name', nombreArchivo, '--file', tmpFile, '--auth', 'instance_principal'],
       { timeout: 120_000, maxBuffer: 10 * 1024 * 1024 }
     );

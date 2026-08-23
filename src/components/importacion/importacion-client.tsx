@@ -78,13 +78,35 @@ interface RegistroHistorial {
   createdAt: string;
 }
 
-const ESTADO_INFO: Record<FilaValidada['estado'], { label: string; variant: 'success' | 'warning' | 'danger' | 'neutral' }> = {
-  valido: { label: 'Válido', variant: 'success' },
-  ya_entregado: { label: 'Ya entregado', variant: 'neutral' },
-  duplicado: { label: 'Duplicado', variant: 'warning' },
-  invalido: { label: 'Inválido', variant: 'danger' },
-  no_encontrado: { label: 'No encontrado', variant: 'warning' },
+// Antes "no_encontrado" se mostraba con la misma conotacion de problema
+// que "invalido" ("No encontrado", ambar) — pero en este sistema ese
+// estado es exactamente el caso normal y esperado de "recepcion olvidada"
+// (ver crearPaquetesFaltantes en src/lib/importacion.ts): el paquete se
+// va a CREAR. Etiquetas y colores ahora dicen que va a pasar, no solo un
+// estado tecnico ("Detección inteligente" de la especificación).
+const ESTADO_INFO: Record<FilaValidada['estado'], { emoji: string; label: string; variant: 'success' | 'warning' | 'danger' | 'neutral' | 'info' }> = {
+  no_encontrado: { emoji: '🟢', label: 'Nuevo · se creará', variant: 'success' },
+  valido: { emoji: '🔵', label: 'Ya existe · se actualizará', variant: 'info' },
+  ya_entregado: { emoji: '🟠', label: 'Ya entregado', variant: 'warning' },
+  duplicado: { emoji: '🔴', label: 'Duplicado en el archivo', variant: 'danger' },
+  invalido: { emoji: '⚫', label: 'No se puede importar', variant: 'danger' },
 };
+
+/** Explica en una frase qué va a pasar con esta fila al confirmar — no solo "por qué" (eso ya lo trae f.motivo para los casos problemáticos), sino la ACCIÓN real que ejecutará el tipo de importación elegido. */
+function explicacionFila(f: FilaValidada, tipo: TipoImportacion): string {
+  if (f.motivo) return f.motivo;
+  if (f.estado === 'no_encontrado') {
+    return tipo === 'CREAR_Y_ENTREGAR'
+      ? 'Se creará este paquete con estos datos y se marcará como entregado.'
+      : 'No existe todavía — con el tipo de importación elegido no se creará (cambia a "Crear y entregar" si corresponde).';
+  }
+  if (f.estado === 'valido') {
+    return tipo === 'SOLO_REGISTRAR'
+      ? 'Se actualizarán sus datos (nombre, celular, monto) sin cambiar su estado.'
+      : 'Se actualizarán sus datos (nombre, celular, monto) y se marcará como entregado.';
+  }
+  return '';
+}
 
 const TIPO_LABEL: Record<TipoImportacion, string> = {
   SOLO_REGISTRAR: 'Solo datos',
@@ -425,11 +447,12 @@ export function ImportacionClient() {
           <CardContent className="space-y-4">
             <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">
               <ResumenNumero label="Detectados" valor={resumen.detectados} />
-              <ResumenNumero label="Válidos" valor={resumen.validos} color="text-emerald-600 dark:text-emerald-400" />
-              <ResumenNumero label="Duplicados" valor={resumen.duplicados} color="text-amber-600 dark:text-amber-400" />
-              <ResumenNumero label="Inválidos" valor={resumen.invalidos} color="text-red-600 dark:text-red-400" />
-              <ResumenNumero label="No encontrados" valor={resumen.noEncontrados} color="text-amber-600 dark:text-amber-400" />
+              <ResumenNumero label="🟢 Nuevos (se crearán)" valor={resumen.noEncontrados} color="text-emerald-600 dark:text-emerald-400" />
+              <ResumenNumero label="🔵 Ya existen (se actualizarán)" valor={resumen.validos} color="text-blue-600 dark:text-blue-400" />
+              <ResumenNumero label="🔴 Duplicados" valor={resumen.duplicados} color="text-red-600 dark:text-red-400" />
+              <ResumenNumero label="⚫ No se pueden importar" valor={resumen.invalidos} color="text-gray-600 dark:text-gray-400" />
             </div>
+            <p className="text-xs text-ink-soft dark:text-gray-400">Esto es lo que ocurrirá al confirmar la importación — revisa antes de continuar.</p>
 
             {/* Móvil: tarjetas — 6 columnas en una tabla de 375px de ancho
                 obligaban a achicar el texto hasta hacerlo ilegible o a
@@ -441,7 +464,9 @@ export function ImportacionClient() {
                 <div key={f.numeroFila} className="rounded-lg border border-gray-100 dark:border-gray-800/60 p-2.5">
                   <div className="flex items-center justify-between gap-2">
                     <span className="font-mono text-sm font-semibold text-ink dark:text-gray-100">{f.codigoOficial ?? f.codigo}</span>
-                    <Badge variant={ESTADO_INFO[f.estado].variant}>{ESTADO_INFO[f.estado].label}</Badge>
+                    <Badge variant={ESTADO_INFO[f.estado].variant}>
+                      {ESTADO_INFO[f.estado].emoji} {ESTADO_INFO[f.estado].label}
+                    </Badge>
                   </div>
                   <div className="mt-1 flex flex-wrap gap-x-3 gap-y-0.5 text-xs text-ink-soft dark:text-gray-400">
                     <span>Fila {f.numeroFila}</span>
@@ -449,7 +474,7 @@ export function ImportacionClient() {
                     {f.personaRecoge && <span>{f.personaRecoge}</span>}
                     {f.fechaRecepcionResuelta && <span>Recepción: {f.fechaRecepcionResuelta}</span>}
                   </div>
-                  {f.motivo && <p className="mt-1 text-xs text-gray-400 dark:text-gray-500">{f.motivo}</p>}
+                  {explicacionFila(f, tipo) && <p className="mt-1 text-xs text-gray-400 dark:text-gray-500">{explicacionFila(f, tipo)}</p>}
                 </div>
               ))}
             </div>
@@ -476,9 +501,11 @@ export function ImportacionClient() {
                       <td className="px-3 py-1.5 text-ink-soft dark:text-gray-400">{f.personaRecoge ?? '—'}</td>
                       <td className="px-3 py-1.5 text-ink-soft dark:text-gray-400">{f.fechaRecepcionResuelta ?? '—'}</td>
                       <td className="px-3 py-1.5">
-                        <Badge variant={ESTADO_INFO[f.estado].variant}>{ESTADO_INFO[f.estado].label}</Badge>
+                        <Badge variant={ESTADO_INFO[f.estado].variant}>
+                          {ESTADO_INFO[f.estado].emoji} {ESTADO_INFO[f.estado].label}
+                        </Badge>
                       </td>
-                      <td className="px-3 py-1.5 text-xs text-gray-400 dark:text-gray-500">{f.motivo ?? '—'}</td>
+                      <td className="px-3 py-1.5 text-xs text-gray-400 dark:text-gray-500">{explicacionFila(f, tipo) || '—'}</td>
                     </tr>
                   ))}
                 </tbody>

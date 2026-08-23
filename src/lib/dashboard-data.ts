@@ -77,6 +77,34 @@ export function sumarCosto(
   return Math.round(total * 100) / 100;
 }
 
+export interface PuntoCobrado {
+  fecha: string;
+  monto: number;
+}
+
+/**
+ * Serie diaria de COBRADO real: dinero efectivamente recibido (Pago.monto
+ * por dia, igual criterio que getResumenFinanciero) — NUNCA la tarifa
+ * acumulada/estimada de los paquetes entregados ese dia. Antes esta serie
+ * (y cobradoHoy/cobradoAyer/etc. mas abajo) usaban sumarCosto() sobre
+ * paquetes entregados, lo que podia divergir de Finanzas y Reportes para
+ * el mismo periodo exacto (un anticipo pagado dias antes de la entrega,
+ * un ajuste, una tarifa especial) — ver "Finanzas: una sola fuente de
+ * verdad". Ahora las tres pantallas sacan "cobrado" del mismo lugar:
+ * la tabla Pago.
+ */
+function calcularSerieIngresos(pagos: Array<{ createdAt: Date; monto: number }>, desde: Date, diasCount: number): PuntoCobrado[] {
+  const serie: PuntoCobrado[] = [];
+  for (let i = 0; i < diasCount; i++) {
+    const dia = addDays(desde, i);
+    const diaSiguiente = addDays(dia, 1);
+    const delDia = pagos.filter((p) => p.createdAt >= dia && p.createdAt < diaSiguiente);
+    const monto = Math.round(delDia.reduce((acc, p) => acc + p.monto, 0) * 100) / 100;
+    serie.push({ fecha: dateKey(dia), monto });
+  }
+  return serie;
+}
+
 export interface DashboardData {
   ingresadosHoy: number;
   ingresadosAyer: number;
@@ -94,6 +122,7 @@ export interface DashboardData {
   montoEstimadoSiSeRetiranHoy: number;
   estados: Record<'EN_PAQUETERIA' | 'EN_DEPOSITO' | 'PENDIENTE_BAJAR' | 'ENTREGADO' | 'DENEGADO', number>;
   ultimos7: SeriePunto[];
+  cobradoUltimos7: PuntoCobrado[];
   actividadReciente: Array<{ code: string; estado: string; fecha: Date; usuario: string; montoPagado: number }>;
   moneda: string;
 }
@@ -114,29 +143,27 @@ export async function getDashboardData(): Promise<DashboardData> {
     conteoEstados,
     ingresadosHoy,
     ingresadosAyer,
-    entregadosHoyList,
-    entregadosAyerList,
-    entregadosSemanaList,
-    entregadosSemanaAnteriorList,
-    entregadosMesList,
-    entregadosMesAnteriorList,
+    entregadosHoy,
+    entregadosAyer,
     activos,
     ingresosUltimos7,
+    pagosUltimos7,
     denegadosHoy,
     actividadRaw,
-    resumenGastosMes,
+    resumenHoy,
+    resumenAyer,
+    resumenSemana,
+    resumenSemanaAnterior,
+    resumenMes,
+    resumenMesAnterior,
   ] = await Promise.all([
     getCompanyConfig(),
     getHolidaySet(),
     prisma.package.groupBy({ by: ['status'], _count: { status: true } }),
     prisma.package.count({ where: { ingresoAt: { gte: hoy, lt: manana } } }),
     prisma.package.count({ where: { ingresoAt: { gte: ayer, lt: hoy } } }),
-    prisma.package.findMany({ where: { entregaAt: { gte: hoy, lt: manana } }, select: SELECT_PARA_COSTO }),
-    prisma.package.findMany({ where: { entregaAt: { gte: ayer, lt: hoy } }, select: SELECT_PARA_COSTO }),
-    prisma.package.findMany({ where: { entregaAt: { gte: inicioSemana, lt: manana } }, select: SELECT_PARA_COSTO }),
-    prisma.package.findMany({ where: { entregaAt: { gte: inicioSemanaAnterior, lt: inicioSemana } }, select: SELECT_PARA_COSTO }),
-    prisma.package.findMany({ where: { entregaAt: { gte: inicioMes, lt: manana } }, select: SELECT_PARA_COSTO }),
-    prisma.package.findMany({ where: { entregaAt: { gte: inicioMesAnterior, lt: inicioMes } }, select: SELECT_PARA_COSTO }),
+    prisma.package.count({ where: { entregaAt: { gte: hoy, lt: manana } } }),
+    prisma.package.count({ where: { entregaAt: { gte: ayer, lt: hoy } } }),
     prisma.package.findMany({
       where: { status: { in: ['EN_PAQUETERIA', 'EN_DEPOSITO', 'PENDIENTE_BAJAR'] } },
       select: SELECT_PARA_COSTO,
@@ -148,15 +175,25 @@ export async function getDashboardData(): Promise<DashboardData> {
       where: { OR: [{ ingresoAt: { gte: hace6Dias, lt: manana } }, { entregaAt: { gte: hace6Dias, lt: manana } }] },
       select: { ingresoAt: true, entregaAt: true },
     }),
+    // Dinero real recibido en los ultimos 7 dias (ver calcularSerieIngresos).
+    prisma.pago.findMany({ where: { createdAt: { gte: hace6Dias, lt: manana } }, select: { createdAt: true, monto: true } }),
     prisma.package.count({ where: { denegadoAt: { gte: hoy, lt: manana } } }),
     prisma.packageHistory.findMany({
       orderBy: { fecha: 'desc' },
       take: 8,
       include: { package: { select: { code: true, montoPagado: true } }, user: { select: { nombre: true } } },
     }),
-    // Gastos del mes (Fase 4A): reutiliza el mismo calculo que ya usa
-    // Finanzas — nunca se reimplementa la suma de Gasto aparte.
+    // "Cobrado" = SIEMPRE el libro real de Pago (getResumenFinanciero),
+    // nunca una estimacion de tarifa recalculada aqui — es la misma
+    // funcion que ya usan Finanzas y Reportes, para que consultar
+    // exactamente el mismo periodo de un mismo dato exacto en las tres
+    // pantallas (ver "Finanzas: una sola fuente de verdad").
+    getResumenFinanciero({ desde: hoy, hasta: manana }),
+    getResumenFinanciero({ desde: ayer, hasta: hoy }),
+    getResumenFinanciero({ desde: inicioSemana, hasta: manana }),
+    getResumenFinanciero({ desde: inicioSemanaAnterior, hasta: inicioSemana }),
     getResumenFinanciero({ desde: inicioMes, hasta: manana }),
+    getResumenFinanciero({ desde: inicioMesAnterior, hasta: inicioMes }),
   ]);
 
   const reglas = {
@@ -177,24 +214,26 @@ export async function getDashboardData(): Promise<DashboardData> {
   });
 
   const ultimos7 = calcularSerieDiaria(ingresosUltimos7, hace6Dias, 7);
+  const cobradoUltimos7 = calcularSerieIngresos(pagosUltimos7, hace6Dias, 7);
 
   return {
     ingresadosHoy,
     ingresadosAyer,
-    entregadosHoy: entregadosHoyList.length,
-    entregadosAyer: entregadosAyerList.length,
+    entregadosHoy,
+    entregadosAyer,
     denegadosHoy,
-    cobradoHoy: sumarCosto(entregadosHoyList, reglas, feriados),
-    cobradoAyer: sumarCosto(entregadosAyerList, reglas, feriados),
-    cobradoSemana: sumarCosto(entregadosSemanaList, reglas, feriados),
-    cobradoSemanaAnterior: sumarCosto(entregadosSemanaAnteriorList, reglas, feriados),
-    cobradoMes: sumarCosto(entregadosMesList, reglas, feriados),
-    cobradoMesAnterior: sumarCosto(entregadosMesAnteriorList, reglas, feriados),
-    gastosMes: resumenGastosMes.gastos,
+    cobradoHoy: resumenHoy.ingresos,
+    cobradoAyer: resumenAyer.ingresos,
+    cobradoSemana: resumenSemana.ingresos,
+    cobradoSemanaAnterior: resumenSemanaAnterior.ingresos,
+    cobradoMes: resumenMes.ingresos,
+    cobradoMesAnterior: resumenMesAnterior.ingresos,
+    gastosMes: resumenMes.gastos,
     paquetesActivos: activos.length,
     montoEstimadoSiSeRetiranHoy: sumarCosto(activos, reglas, feriados),
     estados,
     ultimos7,
+    cobradoUltimos7,
     actividadReciente: actividadRaw.map((h) => ({
       code: h.package.code,
       estado: h.estado,

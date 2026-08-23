@@ -149,6 +149,7 @@ const ACCIONES_NOTIFICABLES = [
   'RESPALDO_ORACLE_ERROR',
   'RESPALDO_ORACLE_RESTAURADO',
   'ENTREGA_EXCEPCIONAL',
+  'USUARIO_ELIMINADO',
 ];
 
 export async function getNotificaciones(limit = 50): Promise<AuditLogDTO[]> {

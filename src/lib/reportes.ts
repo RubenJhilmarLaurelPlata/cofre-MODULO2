@@ -10,6 +10,7 @@ import { getCompanyConfig, getHolidaySet } from '@/lib/config';
 import { diasTranscurridos, dateKey } from '@/lib/pricing';
 import { fechaReferencia, construirFiltroTextoPaquete } from '@/lib/package-detail';
 import { sumarCosto } from '@/lib/dashboard-data';
+import { getResumenFinanciero } from '@/lib/finanzas';
 import { buscarLotes } from '@/lib/etiquetas';
 import { canonicalizarSeparadores } from '@/lib/codigo';
 import type { Prisma } from '@prisma/client';
@@ -219,22 +220,46 @@ export async function getReporteFinanciero(filtros: FiltrosReporte): Promise<Rep
   const reglas = { tarifaBase: company.tarifaBase, diasIncluidos: company.diasIncluidos, costoAdicionalDia: company.costoAdicionalDia };
 
   const where: Prisma.PackageWhereInput = { ...filtrosComunesPaquete(filtros), ingresoAt: { gte, lt } };
-  const paquetes = await prisma.package.findMany({
-    where,
-    include: { registradoPor: { select: { nombre: true } } },
-    orderBy: { ingresoAt: 'desc' },
-    take: 2000,
-  });
+  const [paquetes, resumen] = await Promise.all([
+    prisma.package.findMany({
+      where,
+      include: { registradoPor: { select: { nombre: true } } },
+      orderBy: { ingresoAt: 'desc' },
+      take: 2000,
+    }),
+    // "Cobrado" real del periodo: SIEMPRE getResumenFinanciero (el libro de
+    // Pago), la misma fuente exacta que usan Dashboard y Finanzas — nunca
+    // una tarifa recalculada aparte, para que consultar el mismo periodo
+    // de un mismo dato de tres pantallas diferentes (Dashboard/Finanzas/
+    // Reportes) sea siempre el mismo numero (ver "Finanzas: una sola
+    // fuente de verdad"). Antes este reporte sumaba la tarifa acumulada de
+    // los paquetes ENTREGADOS cuyo INGRESO cayera en el rango — una
+    // definicion de "cobrado" doblemente distinta a la de Dashboard (que
+    // usa la fecha de ENTREGA) y a la de Finanzas (que usa la fecha real
+    // del pago).
+    getResumenFinanciero({ desde: gte, hasta: lt }),
+  ]);
 
   const entregados = paquetes.filter((p) => p.status === 'ENTREGADO');
   const activos = paquetes.filter((p) => ['EN_PAQUETERIA', 'EN_DEPOSITO', 'PENDIENTE_BAJAR'].includes(p.status));
+  const denegados = paquetes.filter((p) => p.status === 'DENEGADO');
 
-  const cobrado = sumarCosto(entregados, reglas, feriados);
+  const cobrado = resumen.ingresos;
+  // "Pendiente"/"potencial" son deliberadamente distintos de "cobrado":
+  // mientras cobrado es dinero real ya recibido (Pago), esto es una
+  // ESTIMACION de tarifa sobre paquetes activos que ingresaron en el
+  // periodo consultado — util para saber "cuanto podria cobrarse todavia
+  // de lo que entro en este rango", pero no pretende igualar ningun otro
+  // numero del sistema (el equivalente en Dashboard, "Si se retiran hoy",
+  // es un snapshot global de AHORA, no acotado a un periodo pasado).
   const pendiente = sumarCosto(activos, reglas, feriados);
 
   // Costo por paquete calculado una sola vez y reutilizado en las 3
   // agregaciones (por operador, por tipo, por dia), en vez de recalcularlo
-  // 3 veces para el mismo paquete.
+  // 3 veces para el mismo paquete. Esta distribucion sigue siendo una
+  // ESTIMACION de tarifa (no hay hoy una forma de atribuir cada Pago real
+  // a un operador/tipo especifico) — ver etiqueta "(estimado)" en las
+  // columnas de las tablas de abajo.
   const costoPorPaquete = new Map(entregados.map((p) => [p.id, sumarCosto([p], reglas, feriados)]));
 
   const porOperador = new Map<string, { nombre: string; total: number; cantidad: number }>();
@@ -255,11 +280,15 @@ export async function getReporteFinanciero(filtros: FiltrosReporte): Promise<Rep
     porTipo.set(p.inicial, actual);
   }
 
+  // Serie diaria de COBRADO real (Pago.createdAt) — no la tarifa acumulada
+  // de los paquetes: debe coincidir con el numero "Cobrado en el período"
+  // de arriba dia por dia, igual criterio que cobradoUltimos7 del
+  // Dashboard (ver src/lib/dashboard-data.ts).
+  const pagosDelPeriodo = await prisma.pago.findMany({ where: { createdAt: { gte, lt } }, select: { createdAt: true, monto: true } });
   const porDia = new Map<string, number>();
-  for (const p of entregados) {
-    if (!p.entregaAt) continue;
-    const key = dateKey(p.entregaAt);
-    porDia.set(key, (porDia.get(key) ?? 0) + (costoPorPaquete.get(p.id) ?? 0));
+  for (const pago of pagosDelPeriodo) {
+    const key = dateKey(pago.createdAt);
+    porDia.set(key, (porDia.get(key) ?? 0) + pago.monto);
   }
   const puntos = diasSerie(gte, lt).map((d) => ({ etiqueta: d, valor: Math.round((porDia.get(d) ?? 0) * 100) / 100 }));
 
@@ -267,19 +296,22 @@ export async function getReporteFinanciero(filtros: FiltrosReporte): Promise<Rep
     resumen: [
       { label: 'Período', value: etiqueta },
       { label: 'Cobrado en el período', value: `${company.moneda} ${cobrado.toFixed(2)}` },
-      { label: 'Total pendiente por cobrar', value: `${company.moneda} ${pendiente.toFixed(2)}` },
-      { label: 'Monto potencial si se retiran ahora', value: `${company.moneda} ${pendiente.toFixed(2)}` },
-      { label: 'Paquetes entregados (cobrados)', value: String(entregados.length) },
+      { label: 'Gastos en el período', value: `${company.moneda} ${resumen.gastos.toFixed(2)}` },
+      { label: 'Resultado neto', value: `${company.moneda} ${resumen.resultadoNeto.toFixed(2)}` },
+      { label: 'Paquetes cobrados (con algún pago)', value: String(resumen.paquetesCobrados) },
+      { label: 'Pendiente por cobrar (de lo recibido en el período)', value: `${company.moneda} ${pendiente.toFixed(2)}` },
+      { label: 'Paquetes entregados', value: String(entregados.length) },
       { label: 'Paquetes activos (pendientes)', value: String(activos.length) },
+      { label: 'Paquetes denegados', value: String(denegados.length) },
     ],
-    serie: { titulo: 'Ingresos por día', nombreValor: 'Cobrado', puntos },
+    serie: { titulo: 'Cobrado por día', nombreValor: 'Cobrado', puntos },
     tablas: [
       {
-        titulo: 'Ingresos por operador',
+        titulo: 'Tarifa acumulada por operador (estimado)',
         columnas: [
           { key: 'operador', label: 'Operador' },
           { key: 'cantidad', label: 'Paquetes entregados' },
-          { key: 'total', label: 'Total cobrado' },
+          { key: 'total', label: 'Tarifa acumulada (estimado)' },
         ],
         filas: Array.from(porOperador.values()).map((v) => ({
           operador: v.nombre,
@@ -288,11 +320,11 @@ export async function getReporteFinanciero(filtros: FiltrosReporte): Promise<Rep
         })),
       },
       {
-        titulo: 'Ingresos por tipo',
+        titulo: 'Tarifa acumulada por tipo (estimado)',
         columnas: [
           { key: 'tipo', label: 'Tipo' },
           { key: 'cantidad', label: 'Paquetes entregados' },
-          { key: 'total', label: 'Total cobrado' },
+          { key: 'total', label: 'Tarifa acumulada (estimado)' },
         ],
         filas: Array.from(porTipo.entries()).map(([inicial, v]) => ({
           tipo: inicial,

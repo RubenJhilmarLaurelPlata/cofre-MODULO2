@@ -2,7 +2,7 @@
 
 // src/components/configuracion/usuarios-tab.tsx
 import * as React from 'react';
-import { Search, UserPlus, Pencil, Lock, Unlock, UserX, UserCheck, KeyRound, X, Save, CheckCircle2, XCircle } from 'lucide-react';
+import { Search, UserPlus, Pencil, Lock, Unlock, UserX, UserCheck, KeyRound, X, Save, CheckCircle2, XCircle, Trash2 } from 'lucide-react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Input, Label } from '@/components/ui/input';
@@ -14,8 +14,9 @@ interface UsuarioDTO {
   username: string;
   nombre: string;
   role: string;
-  estado: 'ACTIVO' | 'INACTIVO' | 'BLOQUEADO';
+  estado: 'ACTIVO' | 'INACTIVO' | 'BLOQUEADO' | 'ELIMINADO';
   bloqueadoHasta: string | null;
+  eliminadoAt: string | null;
   ultimoAccesoAt: string | null;
   ultimoLoginAt: string | null;
   createdAt: string;
@@ -23,8 +24,9 @@ interface UsuarioDTO {
 
 const ESTADO_BADGE: Record<UsuarioDTO['estado'], { label: string; variant: 'success' | 'neutral' | 'danger' }> = {
   ACTIVO: { label: 'Activo', variant: 'success' },
-  INACTIVO: { label: 'Inactivo', variant: 'neutral' },
+  INACTIVO: { label: 'Inactivo (deshabilitado)', variant: 'neutral' },
   BLOQUEADO: { label: 'Bloqueado', variant: 'danger' },
+  ELIMINADO: { label: 'Eliminado', variant: 'danger' },
 };
 
 function fmtFecha(iso: string | null): string {
@@ -130,7 +132,7 @@ export function UsuariosTab() {
     }
   }
 
-  async function ejecutarAccion(id: string, accion: 'bloquear' | 'desbloquear' | 'desactivar' | 'reactivar') {
+  async function ejecutarAccion(id: string, accion: 'bloquear' | 'desbloquear' | 'desactivar' | 'reactivar' | 'eliminar') {
     setAccionEnCurso(id);
     setError(null);
     try {
@@ -204,6 +206,7 @@ export function UsuariosTab() {
               <option value="ACTIVO">Activo</option>
               <option value="INACTIVO">Inactivo</option>
               <option value="BLOQUEADO">Bloqueado</option>
+              <option value="ELIMINADO">Eliminado</option>
             </select>
           </div>
 
@@ -348,6 +351,15 @@ export function UsuariosTab() {
                       <X className="h-3.5 w-3.5" />
                     </Button>
                   </div>
+                ) : u.estado === 'ELIMINADO' ? (
+                  // Terminal: un usuario eliminado no tiene mas acciones
+                  // disponibles (no puede iniciar sesion, no puede
+                  // reactivarse desde aqui) — su historial de operaciones
+                  // sigue intacto y visible en Reportes/Auditoria con su
+                  // nombre real, nunca se borro nada de eso.
+                  <p className="border-t border-gray-100 dark:border-gray-800/60 pt-3 text-xs text-gray-400 dark:text-gray-500">
+                    Este usuario fue eliminado. Su historial de operaciones se conserva intacto.
+                  </p>
                 ) : (
                   <div className="flex flex-wrap gap-2 border-t border-gray-100 dark:border-gray-800/60 pt-3">
                     <Button size="sm" variant="secondary" onClick={() => abrirEdicion(u)}>
@@ -379,11 +391,28 @@ export function UsuariosTab() {
                         size="sm"
                         variant="destructive"
                         loading={accionEnCurso === u.id}
-                        onClick={() => window.confirm(`¿Desactivar a ${u.nombre}?`) && ejecutarAccion(u.id, 'desactivar')}
+                        onClick={() => window.confirm(`¿Desactivar a ${u.nombre}? Podrás reactivarlo más tarde y no perderá ningún dato.`) && ejecutarAccion(u.id, 'desactivar')}
                       >
                         <UserX className="h-3.5 w-3.5" /> Desactivar
                       </Button>
                     )}
+                    {/* "Eliminar" es deliberadamente distinto de "Desactivar":
+                        no es reversible desde la interfaz. El historial de
+                        paquetes/pagos/auditoria de este usuario NUNCA se
+                        borra — solo deja de poder iniciar sesion y de
+                        aparecer como usuario activo. */}
+                    <Button
+                      size="sm"
+                      variant="destructive"
+                      loading={accionEnCurso === u.id}
+                      onClick={() =>
+                        window.confirm(
+                          `¿Eliminar a ${u.nombre}? Ya no podrá iniciar sesión ni aparecer como usuario activo. Su historial de paquetes, pagos y auditoría se conservará intacto con su nombre. Esta acción NO se puede deshacer desde la interfaz.`
+                        ) && ejecutarAccion(u.id, 'eliminar')
+                      }
+                    >
+                      <Trash2 className="h-3.5 w-3.5" /> Eliminar
+                    </Button>
                   </div>
                 )}
               </CardContent>

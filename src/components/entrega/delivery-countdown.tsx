@@ -5,6 +5,7 @@ import * as React from 'react';
 import { X, Check } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
+import { cn } from '@/lib/utils';
 
 const ESTADO_PAGO_LABEL: Record<string, string> = { PENDIENTE: 'Pendiente de pago', PARCIAL: 'Pago parcial', PAGADO: 'Pagado' };
 const ESTADO_PAGO_VARIANT: Record<string, 'neutral' | 'warning' | 'success'> = { PENDIENTE: 'neutral', PARCIAL: 'warning', PAGADO: 'success' };
@@ -49,7 +50,7 @@ export function DeliveryCountdown({ code, seconds = 5, moneda, monto, estadoPago
       aria-modal="true"
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
     >
-      <div className="w-full max-w-sm rounded-2xl bg-white dark:bg-gray-900 p-8 text-center shadow-popover">
+      <div className="animate-scale-in w-full max-w-sm rounded-2xl border-t-4 border-t-rose-400 dark:border-t-rose-500 bg-white dark:bg-gray-900 p-8 text-center shadow-popover">
         <p className="text-xs font-semibold uppercase tracking-wide text-ink-soft dark:text-gray-400">Entregando paquete</p>
         <p className="mt-2 break-all font-mono text-3xl font-bold text-ink dark:text-gray-100">{code}</p>
 
@@ -75,7 +76,10 @@ export function DeliveryCountdown({ code, seconds = 5, moneda, monto, estadoPago
         <div className="my-3 flex items-center justify-center">
           <div
             key={restante}
-            className="flex h-24 w-24 items-center justify-center rounded-full border-4 border-brand-500 text-4xl font-bold text-brand-600"
+            className={cn(
+              'animate-scale-in flex h-24 w-24 items-center justify-center rounded-full border-4 text-4xl font-bold',
+              restante > 0 ? 'border-brand-500 text-brand-600' : 'border-rose-500 text-rose-600'
+            )}
           >
             {restante > 0 ? restante : <Check className="h-10 w-10" strokeWidth={2.5} />}
           </div>

@@ -25,6 +25,7 @@ import { ESTADO_LABELS } from '@/components/ui/status-badge';
 import { CameraScanner } from '@/components/scanner/camera-scanner';
 import { TecladoVirtual } from '@/components/scanner/teclado-virtual';
 import { PackageDetailModal } from '@/components/buscador/package-detail-modal';
+import { ResultadoDestacado } from '@/components/buscador/resultado-destacado';
 import { VoiceInputButton } from '@/components/ui/voice-input-button';
 import { cn } from '@/lib/utils';
 import { playSound } from '@/lib/sound';
@@ -356,6 +357,12 @@ export function BuscadorClient({ resultadosIniciales, limite, puedeIrAEntrega, p
         </span>
         {truncado && <span className="flex items-center gap-1 text-xs text-amber-600"><Info className="h-3.5 w-3.5" /> Mostrando los primeros {limite}. Afina la búsqueda para ver menos resultados.</span>}
       </div>
+
+      {/* Notificacion grande de estado — solo cuando la busqueda encontro
+          EXACTAMENTE un paquete (el caso mas comun: escanear un codigo y
+          ver que pasa). Con varios resultados (busqueda por nombre/filtro)
+          se mantiene la grilla compacta de siempre, mas abajo. */}
+      {resultados.length === 1 && !cargando && <ResultadoDestacado p={resultados[0]!} />}
 
       {resultados.length === 0 && !cargando ? (
         <div className="flex items-center gap-2.5 rounded-xl border border-dashed border-gray-200 dark:border-gray-800 px-4 py-3 text-gray-400 dark:text-gray-500">

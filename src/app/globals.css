@@ -47,3 +47,60 @@
     @apply bg-gray-200 rounded-full dark:bg-gray-700;
   }
 }
+
+/*
+ * Animaciones sutiles compartidas (identidad "premium" pedida para toda
+ * la app: entrada de tarjetas, resultados de escaneo, dialogos). Fuera de
+ * cualquier @layer para que ganen siempre sin depender del orden de
+ * Tailwind. Cortas (<=420ms) y con traslado minimo a proposito — deben
+ * transmitir calidad sin sentirse lentas, especialmente en movil donde
+ * esta pantalla se usa todo el dia. prefers-reduced-motion las anula por
+ * completo (ultima regla, siempre gana).
+ */
+@keyframes cofre-fade-in-up {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+@keyframes cofre-scale-in {
+  from {
+    opacity: 0;
+    transform: scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+@keyframes cofre-pulse-dot {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+.animate-fade-in-up {
+  animation: cofre-fade-in-up 0.32s ease-out both;
+}
+.animate-scale-in {
+  animation: cofre-scale-in 0.22s ease-out both;
+}
+.animate-pulse-dot {
+  animation: cofre-pulse-dot 2s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-fade-in-up,
+  .animate-scale-in,
+  .animate-pulse-dot {
+    animation: none !important;
+  }
+}

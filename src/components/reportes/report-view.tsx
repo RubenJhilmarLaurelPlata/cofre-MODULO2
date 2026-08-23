@@ -5,13 +5,59 @@
 // Operadores, Deposito, Etiquetas), ya que todos comparten la misma forma
 // (resumen + grafica + tablas) calculada en src/lib/reportes.ts.
 import * as React from 'react';
-import { Calendar, XCircle } from 'lucide-react';
+import {
+  Calendar,
+  XCircle,
+  Wallet,
+  Receipt,
+  TrendingUp,
+  Clock,
+  Truck,
+  Boxes,
+  Ban,
+  PackagePlus,
+  Archive,
+  ArrowDownToLine,
+  Activity,
+  Tag,
+} from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 import { Card, CardContent } from '@/components/ui/card';
 import { StatCard } from '@/components/dashboard/stat-card';
 import { ReportChart } from '@/components/reportes/report-chart';
 import { ReportTable } from '@/components/reportes/report-table';
 import type { ReporteResultado } from '@/lib/reportes';
+
+/**
+ * Antes los 5 reportes mostraban el MISMO icono generico en cada tarjeta
+ * de resumen (siempre el que llega por prop) sin importar si el dato era
+ * dinero, paquetes o tiempo — sensacion plana ("Reportes debe tener el
+ * mismo nivel visual del Dashboard"). Esto asigna un icono y, para las
+ * cifras de dinero mas importantes, un acento de color por palabra clave
+ * del label real (nunca por posicion/indice, para no depender del orden
+ * exacto de cada uno de los 5 reportes).
+ */
+function iconoPara(label: string): LucideIcon | null {
+  const l = label.toLowerCase();
+  if (l.includes('cobrado') || l.includes('ingreso')) return Wallet;
+  if (l.includes('gasto')) return Receipt;
+  if (l.includes('resultado neto')) return TrendingUp;
+  if (l.includes('pendiente') || l.includes('promedio') || l.includes('máximo') || l.includes('mínimo') || l.includes('atención')) return Clock;
+  if (l.includes('entregad') || l.includes('bajad')) return Truck;
+  if (l.includes('depósito')) return Archive;
+  if (l.includes('bajar')) return ArrowDownToLine;
+  if (l.includes('denegad')) return Ban;
+  if (l.includes('ingresad') || l.includes('registrad') || l.includes('generad')) return PackagePlus;
+  if (l.includes('movimiento')) return Activity;
+  if (l.includes('código') || l.includes('lote') || l.includes('reimpres')) return Tag;
+  if (l.includes('paquetería') || l.includes('activo')) return Boxes;
+  return null;
+}
+
+function esDestacado(label: string): boolean {
+  const l = label.toLowerCase();
+  return l.includes('cobrado en el período') || l.includes('resultado neto');
+}
 
 interface ReportViewProps {
   endpoint: string;
@@ -78,7 +124,7 @@ export function ReportView({ endpoint, queryString, icon }: ReportViewProps) {
 
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4">
         {resto.map((item) => (
-          <StatCard key={item.label} icon={icon} label={item.label} value={item.value} />
+          <StatCard key={item.label} icon={iconoPara(item.label) ?? icon} label={item.label} value={item.value} accent={esDestacado(item.label)} />
         ))}
       </div>
 

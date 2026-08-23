@@ -8,6 +8,7 @@ import { Button } from '@/components/ui/button';
 import { MobileNav } from '@/components/layout/mobile-nav';
 import { ThemeToggle } from '@/components/layout/theme-toggle';
 import { ROLE_LABELS, type Role } from '@/types';
+import { cn } from '@/lib/utils';
 
 const TITULOS: Record<string, [string, string]> = {
   '/dashboard': ['Dashboard', 'Resumen general del negocio en tiempo real'],
@@ -27,12 +28,24 @@ function tituloParaRuta(pathname: string): [string, string] {
   return TITULOS[base] ?? ['Cofre Express', ''];
 }
 
+/** Identidad visual inmediata por modulo (seccion "Diferenciar Recepcion y Entrega"): un punto de color + microcopy junto al titulo, visible incluso en el encabezado movil, para que el operador reconozca a primera vista si esta "recibiendo" (verde/entrada) o "entregando" (rojo/salida) sin tener que leer el titulo completo. */
+const IDENTIDAD_POR_RUTA: Record<string, { color: string; texto: string }> = {
+  '/recepcion': { color: 'bg-emerald-500', texto: 'Entrada' },
+  '/entrega': { color: 'bg-rose-500', texto: 'Salida' },
+};
+
+function identidadParaRuta(pathname: string) {
+  const base = '/' + (pathname.split('/').filter(Boolean)[0] ?? '');
+  return IDENTIDAD_POR_RUTA[base] ?? null;
+}
+
 export function Topbar({ nombre, role, logoUrl }: { nombre: string; role: Role; logoUrl?: string | null }) {
   const router = useRouter();
   const pathname = usePathname();
   const [menuOpen, setMenuOpen] = React.useState(false);
   const [loggingOut, setLoggingOut] = React.useState(false);
   const [title, subtitle] = tituloParaRuta(pathname);
+  const identidad = identidadParaRuta(pathname);
 
   async function handleLogout() {
     setLoggingOut(true);
@@ -60,7 +73,15 @@ export function Topbar({ nombre, role, logoUrl }: { nombre: string; role: Role; 
             <Menu className="h-5 w-5" />
           </button>
           <div>
-            <h1 className="text-sm font-semibold leading-tight text-ink dark:text-gray-100 md:text-base">{title}</h1>
+            <h1 className="flex items-center gap-1.5 text-sm font-semibold leading-tight text-ink dark:text-gray-100 md:text-base">
+              {title}
+              {identidad && (
+                <span className="flex items-center gap-1 rounded-full bg-gray-100 px-1.5 py-0.5 text-[10px] font-medium text-ink-soft dark:bg-gray-800 dark:text-gray-400">
+                  <span className={cn('h-1.5 w-1.5 rounded-full', identidad.color)} aria-hidden />
+                  {identidad.texto}
+                </span>
+              )}
+            </h1>
             {subtitle && <p className="hidden text-xs text-ink-soft dark:text-gray-400 lg:block">{subtitle}</p>}
           </div>
         </div>
