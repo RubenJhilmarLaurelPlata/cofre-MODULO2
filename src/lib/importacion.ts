@@ -16,6 +16,7 @@ export type CampoSistema =
   | 'codigo'
   | 'monto'
   | 'personaRecoge'
+  | 'celular'
   | 'cliente'
   | 'emprendimiento'
   | 'fecha'
@@ -28,6 +29,7 @@ export const CAMPOS_SISTEMA: Array<{ value: CampoSistema; label: string }> = [
   { value: 'codigo', label: 'Código' },
   { value: 'monto', label: 'Monto cobrado' },
   { value: 'personaRecoge', label: 'Persona que recogió' },
+  { value: 'celular', label: 'Celular de quien recogió' },
   { value: 'cliente', label: 'Cliente / remitente (quien deja)' },
   { value: 'emprendimiento', label: 'Emprendimiento' },
   { value: 'fecha', label: 'Fecha de entrega (YYYY-MM-DD)' },
@@ -53,6 +55,11 @@ export interface FilaImportacion {
   // Persona que RECOGE el paquete (Fase 2) — distinta de "cliente"
   // (quien lo DEJA). Se guarda como Package.destinatario.
   personaRecoge?: string;
+  // Celular de quien recoge — se guarda como Package.destinatarioTelefono.
+  // Antes la importacion no tenia NINGUN campo para esto (bug real
+  // confirmado): el archivo podia traer el celular en una columna, pero
+  // no habia forma de mapearla — se perdia en silencio.
+  celular?: string;
   cliente?: string;
   emprendimiento?: string;
   observaciones?: string;
@@ -116,6 +123,21 @@ const COLUMNAS_INEQUIVOCAS: Record<string, CampoSistema> = {
   recogio: 'personaRecoge',
   destinatario: 'personaRecoge',
 
+  // Celular de quien recoge. A proposito NO se incluye el simple
+  // "numero"/"número" (podria ser un numero de pedido, de casillero,
+  // etc. — igual de ambiguo que "nombre"/"cliente" arriba); solo frases
+  // que ya dejan claro que se trata de un telefono.
+  celular: 'celular',
+  telefono: 'celular',
+  movil: 'celular',
+  whatsapp: 'celular',
+  'telefono celular': 'celular',
+  'numero celular': 'celular',
+  'nro celular': 'celular',
+  'n celular': 'celular',
+  'celular de contacto': 'celular',
+  'telefono de contacto': 'celular',
+
   emprendimiento: 'emprendimiento',
   fecha: 'fecha',
   hora: 'hora',
@@ -135,8 +157,25 @@ const COLUMNAS_INEQUIVOCAS: Record<string, CampoSistema> = {
   descripcion: 'descripcion',
 };
 
+/**
+ * Antes solo hacia trim+lowercase — "Teléfono", "N° Celular" o "Nro.
+ * Celular" nunca coincidian con ninguna clave del diccionario de abajo
+ * (bug real confirmado: la columna de celular jamas se detectaba
+ * automaticamente). Ahora tambien quita acentos, puntos/grados/guiones y
+ * colapsa espacios, para que las variantes razonables de un mismo
+ * encabezado normalicen al mismo texto.
+ */
+const DIACRITICOS_RE = new RegExp('[̀-ͯ]', 'g');
+
 function normalizarEncabezado(s: string): string {
-  return s.trim().toLowerCase();
+  return s
+    .normalize('NFD')
+    .replace(DIACRITICOS_RE, '') // acentos/diacriticos
+    .trim()
+    .toLowerCase()
+    .replace(/[°.\-_]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 /** Parser CSV simple: soporta campos entre comillas con comas adentro, suficiente para el uso real (nombres/observaciones cortas). */
@@ -340,7 +379,52 @@ export interface OpcionesFechaRecepcion {
  * modificarla) para que un codigo con apostrofe en vez de guion se
  * reconozca igual que en Recepcion/Buscador/Entrega.
  */
-export async function validarFilas(filas: FilaImportacion[], opcionesFecha?: OpcionesFechaRecepcion): Promise<ResumenValidacion> {
+/**
+ * Edicion puntual de una fila hecha por el administrador en la
+ * previsualizacion (antes de confirmar) — código, nombre de quien
+ * recoge, celular o monto. Se aplica ANTES de validarFilas() (nunca
+ * despues): asi una edicion de código pasa por exactamente la misma
+ * validacion real contra la base de datos que si el archivo hubiera
+ * traido ese valor desde el principio — el servidor sigue siendo quien
+ * decide si el resultado es valido/duplicado/etc, nunca confia en un
+ * resumen ya calculado que vuelva del cliente (ver comentario al inicio
+ * de src/app/api/importacion/route.ts).
+ */
+export interface EdicionFila {
+  numeroFila: number;
+  codigo?: string;
+  monto?: number;
+  personaRecoge?: string;
+  celular?: string;
+}
+
+export function aplicarEdicionesFilas(filas: FilaImportacion[], ediciones?: EdicionFila[]): FilaImportacion[] {
+  if (!ediciones || ediciones.length === 0) return filas;
+  const porFila = new Map(ediciones.map((e) => [e.numeroFila, e]));
+  return filas.map((fila) => {
+    const edicion = porFila.get(fila.numeroFila);
+    if (!edicion) return fila;
+    return {
+      ...fila,
+      ...(edicion.codigo !== undefined ? { codigo: edicion.codigo } : {}),
+      ...(edicion.monto !== undefined ? { monto: edicion.monto } : {}),
+      ...(edicion.personaRecoge !== undefined ? { personaRecoge: edicion.personaRecoge } : {}),
+      ...(edicion.celular !== undefined ? { celular: edicion.celular } : {}),
+    };
+  });
+}
+
+/**
+ * @param montoDefault Monto a usar cuando la fila no trae uno (ej. la
+ * columna Monto no existia en el archivo, o la celda vino vacia) — antes
+ * esas filas quedaban con monto=undefined y jamas registraban ningun
+ * Pago al confirmar, sin que el administrador lo notara en la
+ * previsualizacion. Normalmente es company.tarifaBase (hoy Bs 2,
+ * configurable en Configuración → Tarifas — nunca un numero fijo
+ * hardcodeado aparte de esa misma configuracion). Sigue siendo editable
+ * fila por fila antes de confirmar.
+ */
+export async function validarFilas(filas: FilaImportacion[], opcionesFecha?: OpcionesFechaRecepcion, montoDefault?: number): Promise<ResumenValidacion> {
   const vistos = new Map<string, number>(); // codigoNormalizado -> primera fila donde aparecio
   const normalizados = filas.map((f) => normalizarCodigo(f.codigo));
 
@@ -353,7 +437,8 @@ export async function validarFilas(filas: FilaImportacion[], opcionesFecha?: Opc
     : [];
   const porCodigoNormalizado = new Map(existentes.map((p) => [p.codigoNormalizado, p]));
 
-  const validadas: FilaValidada[] = filas.map((fila, i) => {
+  const validadas: FilaValidada[] = filas.map((filaOriginal, i) => {
+    const fila: FilaImportacion = montoDefault !== undefined && filaOriginal.monto === undefined ? { ...filaOriginal, monto: montoDefault } : filaOriginal;
     const codigoNorm = normalizados[i]!;
 
     if (!fila.codigo || !CODIGO_VALIDO_RE.test(codigoNorm)) {
@@ -462,6 +547,7 @@ export async function confirmarImportacion(filas: FilaValidada[], userId: string
               // entrega hecha con el lector.
               origenEntrega: 'IMPORTACION',
               ...(fila.personaRecoge ? { destinatario: fila.personaRecoge } : {}),
+              ...(fila.celular ? { destinatarioTelefono: fila.celular } : {}),
             },
           });
           if (res.count === 0) return null;
@@ -563,6 +649,7 @@ export async function crearPaquetesFaltantes(filas: FilaValidada[], userId: stri
               registradoPorId: userId,
               clienteId: cliente?.id ?? null,
               destinatario: fila.personaRecoge || null,
+              destinatarioTelefono: fila.celular || null,
               observaciones: fila.observaciones || '',
               descripcion: fila.descripcion || null,
             },
@@ -616,8 +703,14 @@ export async function registrarSoloDatos(filas: FilaValidada[], userId: string):
         const pkg = await prisma.package.findUnique({ where: { id: fila.packageId! } });
         if (!pkg) throw new Error('El paquete ya no existe.');
 
-        if (fila.personaRecoge) {
-          await prisma.package.update({ where: { id: pkg.id }, data: { destinatario: fila.personaRecoge } });
+        if (fila.personaRecoge || fila.celular) {
+          await prisma.package.update({
+            where: { id: pkg.id },
+            data: {
+              ...(fila.personaRecoge ? { destinatario: fila.personaRecoge } : {}),
+              ...(fila.celular ? { destinatarioTelefono: fila.celular } : {}),
+            },
+          });
         }
         if (fila.monto && fila.monto > 0) {
           await registrarPago(pkg, 'AJUSTE', fila.monto, userId, 'Importación administrativa (solo datos)');

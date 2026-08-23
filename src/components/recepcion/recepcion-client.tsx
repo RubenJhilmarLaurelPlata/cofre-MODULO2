@@ -297,7 +297,14 @@ export function RecepcionClient({ moneda, tarifaBase, montosRapidos, series, ing
                 Entrada
               </span>
             </CardTitle>
-            <div className="flex items-center gap-3">
+            {/* flex-wrap aquí es lo que faltaba (bug real confirmado con
+                medicion: a 360/375px "Teclado" quedaba con su borde
+                derecho fuera del viewport, clippeado por el
+                overflow-x:auto implicito de <main> — nunca aparecia como
+                overflow de scrollWidth del documento, por eso pasaba
+                inadvertido). Mismo criterio que ya usa Entrega, ver
+                entrega-client.tsx. */}
+            <div className="flex flex-wrap items-center gap-3">
               <ScannerStatus />
               <div className="flex gap-1 rounded-lg bg-gray-100 dark:bg-gray-800 p-1">
                 <button

@@ -9,7 +9,7 @@ import { prisma } from '@/lib/prisma';
 import { getCompanyConfig, getHolidaySet } from '@/lib/config';
 import { diasTranscurridos, dateKey } from '@/lib/pricing';
 import { fechaReferencia, construirFiltroTextoPaquete } from '@/lib/package-detail';
-import { sumarCosto } from '@/lib/dashboard-data';
+import { sumarCosto, inicioSemanaLunes } from '@/lib/dashboard-data';
 import { getResumenFinanciero } from '@/lib/finanzas';
 import { buscarLotes } from '@/lib/etiquetas';
 import { canonicalizarSeparadores } from '@/lib/codigo';
@@ -90,7 +90,7 @@ export function resolverRangoFechas(filtros: Pick<FiltrosReporte, 'modo' | 'fech
       return { gte: ayer, lt: hoy, etiqueta: `Ayer (${fmtFecha(ayer)})` };
     }
     case 'semana': {
-      const inicio = addDays(hoy, -hoy.getDay());
+      const inicio = inicioSemanaLunes(hoy);
       return { gte: inicio, lt: addDays(hoy, 1), etiqueta: `Esta semana (${fmtFecha(inicio)} — ${fmtFecha(hoy)})` };
     }
     case 'mes': {

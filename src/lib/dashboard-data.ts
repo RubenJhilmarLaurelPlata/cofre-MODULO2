@@ -18,6 +18,24 @@ export function addDays(d: Date, n: number): Date {
   return x;
 }
 
+/**
+ * Lunes de la semana que contiene `d` — NUNCA `d.getDay()` a secas (esa
+ * es la causa raiz de un bug real confirmado: Date.getDay() usa la
+ * convencion domingo=0/lunes=1/.../sabado=6, asi que "d menos d.getDay()
+ * dias" da domingo como inicio de semana. Cofre Express opera
+ * LUNES→SÁBADO, domingo no cuenta para nada (ver pricing.ts) — con esa
+ * formula, un domingo cualquiera "esta semana" colapsaba a un solo dia
+ * (el domingo mismo), dejando afuera el sabado anterior con toda su
+ * actividad real. Antes esta formula vivia duplicada e identica en
+ * dashboard-data.ts y reportes.ts; ahora es una sola funcion que ambos
+ * importan, para que "esta semana" signifique EXACTAMENTE lo mismo en
+ * Dashboard, Finanzas y Reportes.
+ */
+export function inicioSemanaLunes(d: Date): Date {
+  const diasDesdeLunes = (d.getDay() + 6) % 7; // domingo(0)->6, lunes(1)->0, ..., sabado(6)->5
+  return addDays(d, -diasDesdeLunes);
+}
+
 export interface SeriePunto {
   fecha: string;
   ingresados: number;
@@ -131,7 +149,7 @@ export async function getDashboardData(): Promise<DashboardData> {
   const hoy = startOfDay(new Date());
   const manana = addDays(hoy, 1);
   const ayer = addDays(hoy, -1);
-  const inicioSemana = addDays(hoy, -hoy.getDay());
+  const inicioSemana = inicioSemanaLunes(hoy);
   const inicioSemanaAnterior = addDays(inicioSemana, -7);
   const inicioMes = new Date(hoy.getFullYear(), hoy.getMonth(), 1);
   const inicioMesAnterior = new Date(hoy.getFullYear(), hoy.getMonth() - 1, 1);

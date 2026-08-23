@@ -14,13 +14,14 @@ import { Badge } from '@/components/ui/badge';
 import { Input, Label } from '@/components/ui/input';
 import { cn } from '@/lib/utils';
 
-type CampoSistema = 'codigo' | 'monto' | 'personaRecoge' | 'cliente' | 'emprendimiento' | 'fecha' | 'hora' | 'fechaRecepcion' | 'observaciones' | 'descripcion';
+type CampoSistema = 'codigo' | 'monto' | 'personaRecoge' | 'celular' | 'cliente' | 'emprendimiento' | 'fecha' | 'hora' | 'fechaRecepcion' | 'observaciones' | 'descripcion';
 type TipoImportacion = 'SOLO_REGISTRAR' | 'MARCAR_ENTREGADOS' | 'CREAR_Y_ENTREGAR';
 
 const CAMPOS_SISTEMA: Array<{ value: CampoSistema; label: string }> = [
   { value: 'codigo', label: 'Código' },
   { value: 'monto', label: 'Monto cobrado' },
   { value: 'personaRecoge', label: 'Persona que recogió' },
+  { value: 'celular', label: 'Celular de quien recogió' },
   { value: 'cliente', label: 'Cliente / remitente (quien deja)' },
   { value: 'emprendimiento', label: 'Emprendimiento' },
   { value: 'fecha', label: 'Fecha de entrega (AAAA-MM-DD)' },
@@ -41,6 +42,7 @@ interface FilaValidada {
   codigoOficial?: string;
   monto?: number;
   personaRecoge?: string;
+  celular?: string;
   fechaRecepcionResuelta?: string;
   estado: 'valido' | 'duplicado' | 'invalido' | 'no_encontrado' | 'ya_entregado';
   motivo?: string;
@@ -167,6 +169,7 @@ export function ImportacionClient() {
     setResumen(null);
     setResultado(null);
     setError(null);
+    setEdiciones({});
   }
 
   async function elegirArchivo(file: File | null) {
@@ -204,6 +207,47 @@ export function ImportacionClient() {
   const codigoMapeado = mapeo.includes('codigo');
   const necesitaMapeo = (encabezados?.length ?? 0) > 0;
 
+  // Ediciones puntuales del administrador sobre una fila de la
+  // previsualización (Código/Nombre/Celular/Monto) — antes la tabla era
+  // de solo lectura y para corregir un dato simple había que volver al
+  // Excel. Se guardan por numeroFila y se envían al servidor tanto al
+  // re-previsualizar como al confirmar (ver aplicarEdicionesFilas en
+  // src/lib/importacion.ts — el servidor vuelve a validar todo desde
+  // cero con el valor editado, nunca confía ciegamente en el cliente).
+  interface EdicionFila {
+    codigo?: string;
+    monto?: number;
+    personaRecoge?: string;
+    celular?: string;
+  }
+  const [ediciones, setEdiciones] = React.useState<Record<number, EdicionFila>>({});
+
+  function codigoMostrado(f: FilaValidada): string {
+    return ediciones[f.numeroFila]?.codigo ?? f.codigoOficial ?? f.codigo;
+  }
+  function nombreMostrado(f: FilaValidada): string {
+    return ediciones[f.numeroFila]?.personaRecoge ?? f.personaRecoge ?? '';
+  }
+  function celularMostrado(f: FilaValidada): string {
+    return ediciones[f.numeroFila]?.celular ?? f.celular ?? '';
+  }
+  function montoMostrado(f: FilaValidada): number {
+    return ediciones[f.numeroFila]?.monto ?? f.monto ?? 0;
+  }
+
+  function editarFila(numeroFila: number, campo: keyof EdicionFila, valor: string) {
+    setEdiciones((prev) => ({
+      ...prev,
+      [numeroFila]: { ...prev[numeroFila], [campo]: campo === 'monto' ? Math.max(0, Number(valor) || 0) : valor },
+    }));
+  }
+
+  function ediciones_a_enviar(): string | null {
+    const entradas = Object.entries(ediciones).filter(([, v]) => Object.keys(v).length > 0);
+    if (entradas.length === 0) return null;
+    return JSON.stringify(entradas.map(([numeroFila, v]) => ({ numeroFila: Number(numeroFila), ...v })));
+  }
+
   async function previsualizar() {
     if (!archivo || procesando) return;
     setProcesando('previsualizar');
@@ -215,6 +259,8 @@ export function ImportacionClient() {
       if (necesitaMapeo) formData.append('mapeo', JSON.stringify(mapeo));
       formData.append('modoFechaRecepcion', modoFechaRecepcion);
       if (modoFechaRecepcion === 'unica') formData.append('fechaRecepcionUnica', fechaRecepcionUnica);
+      const edicionesJson = ediciones_a_enviar();
+      if (edicionesJson) formData.append('ediciones', edicionesJson);
       const res = await fetch('/api/importacion', { method: 'POST', body: formData });
       const data = await res.json();
       if (!res.ok) {
@@ -255,6 +301,8 @@ export function ImportacionClient() {
       if (necesitaMapeo) formData.append('mapeo', JSON.stringify(mapeo));
       formData.append('modoFechaRecepcion', modoFechaRecepcion);
       if (modoFechaRecepcion === 'unica') formData.append('fechaRecepcionUnica', fechaRecepcionUnica);
+      const edicionesJson = ediciones_a_enviar();
+      if (edicionesJson) formData.append('ediciones', edicionesJson);
       const res = await fetch('/api/importacion', { method: 'POST', body: formData });
       const data = await res.json();
       if (!res.ok) {
@@ -459,34 +507,62 @@ export function ImportacionClient() {
                 desbordar la pagina horizontalmente. Mismo criterio que el
                 historial de lotes mas abajo en este mismo archivo (ver
                 "Móvil: tarjetas, no la tabla de escritorio comprimida"). */}
-            <div className="max-h-96 space-y-2 overflow-y-auto md:hidden">
+            <p className="text-xs text-ink-soft dark:text-gray-400">
+              Puedes corregir Código, Nombre, Celular o Monto de cualquier fila antes de confirmar — no hace falta volver al archivo original.
+            </p>
+
+            <div className="max-h-[32rem] space-y-2 overflow-y-auto md:hidden">
               {resumen.filas.map((f) => (
-                <div key={f.numeroFila} className="rounded-lg border border-gray-100 dark:border-gray-800/60 p-2.5">
+                <div key={f.numeroFila} className="space-y-2 rounded-lg border border-gray-100 dark:border-gray-800/60 p-2.5">
                   <div className="flex items-center justify-between gap-2">
-                    <span className="font-mono text-sm font-semibold text-ink dark:text-gray-100">{f.codigoOficial ?? f.codigo}</span>
+                    <Input
+                      value={codigoMostrado(f)}
+                      onChange={(e) => editarFila(f.numeroFila, 'codigo', e.target.value)}
+                      className="h-8 w-36 font-mono text-xs"
+                    />
                     <Badge variant={ESTADO_INFO[f.estado].variant}>
                       {ESTADO_INFO[f.estado].emoji} {ESTADO_INFO[f.estado].label}
                     </Badge>
                   </div>
-                  <div className="mt-1 flex flex-wrap gap-x-3 gap-y-0.5 text-xs text-ink-soft dark:text-gray-400">
-                    <span>Fila {f.numeroFila}</span>
-                    {f.monto !== undefined && <span>Bs {f.monto}</span>}
-                    {f.personaRecoge && <span>{f.personaRecoge}</span>}
-                    {f.fechaRecepcionResuelta && <span>Recepción: {f.fechaRecepcionResuelta}</span>}
+                  <div className="grid grid-cols-2 gap-2">
+                    <div>
+                      <label className="mb-0.5 block text-[10px] text-gray-400 dark:text-gray-500">Nombre</label>
+                      <Input value={nombreMostrado(f)} onChange={(e) => editarFila(f.numeroFila, 'personaRecoge', e.target.value)} placeholder="—" className="h-8 text-xs" />
+                    </div>
+                    <div>
+                      <label className="mb-0.5 block text-[10px] text-gray-400 dark:text-gray-500">Celular</label>
+                      <Input value={celularMostrado(f)} onChange={(e) => editarFila(f.numeroFila, 'celular', e.target.value)} placeholder="—" className="h-8 text-xs" />
+                    </div>
+                    <div>
+                      <label className="mb-0.5 block text-[10px] text-gray-400 dark:text-gray-500">Monto (Bs)</label>
+                      <Input
+                        type="number"
+                        min={0}
+                        step="0.5"
+                        value={montoMostrado(f)}
+                        onChange={(e) => editarFila(f.numeroFila, 'monto', e.target.value)}
+                        className="h-8 text-xs"
+                      />
+                    </div>
+                    <div className="flex flex-col justify-end text-[11px] text-gray-400 dark:text-gray-500">
+                      <span>Fila {f.numeroFila}</span>
+                      {f.fechaRecepcionResuelta && <span>Recepción: {f.fechaRecepcionResuelta}</span>}
+                    </div>
                   </div>
-                  {explicacionFila(f, tipo) && <p className="mt-1 text-xs text-gray-400 dark:text-gray-500">{explicacionFila(f, tipo)}</p>}
+                  {explicacionFila(f, tipo) && <p className="text-xs text-gray-400 dark:text-gray-500">{explicacionFila(f, tipo)}</p>}
                 </div>
               ))}
             </div>
 
-            <div className="hidden max-h-72 overflow-y-auto rounded-lg border border-gray-100 dark:border-gray-800/60 md:block">
+            <div className="hidden max-h-[28rem] overflow-y-auto rounded-lg border border-gray-100 dark:border-gray-800/60 md:block">
               <table className="w-full text-sm">
                 <thead className="sticky top-0 bg-gray-50 dark:bg-gray-800/60">
                   <tr className="text-left text-xs text-gray-400 dark:text-gray-500">
                     <th className="px-3 py-2 font-medium">Fila</th>
                     <th className="px-3 py-2 font-medium">Código</th>
-                    <th className="px-3 py-2 font-medium">Monto</th>
-                    <th className="px-3 py-2 font-medium">Persona</th>
+                    <th className="px-3 py-2 font-medium">Nombre</th>
+                    <th className="px-3 py-2 font-medium">Celular</th>
+                    <th className="px-3 py-2 font-medium">Monto (Bs)</th>
                     <th className="px-3 py-2 font-medium">Recepción</th>
                     <th className="px-3 py-2 font-medium">Estado</th>
                     <th className="px-3 py-2 font-medium">Detalle</th>
@@ -496,9 +572,25 @@ export function ImportacionClient() {
                   {resumen.filas.map((f) => (
                     <tr key={f.numeroFila}>
                       <td className="px-3 py-1.5 text-gray-400 dark:text-gray-500">{f.numeroFila}</td>
-                      <td className="px-3 py-1.5 font-mono text-ink dark:text-gray-100">{f.codigoOficial ?? f.codigo}</td>
-                      <td className="px-3 py-1.5 text-ink-soft dark:text-gray-400">{f.monto !== undefined ? `Bs ${f.monto}` : '—'}</td>
-                      <td className="px-3 py-1.5 text-ink-soft dark:text-gray-400">{f.personaRecoge ?? '—'}</td>
+                      <td className="px-2 py-1">
+                        <Input value={codigoMostrado(f)} onChange={(e) => editarFila(f.numeroFila, 'codigo', e.target.value)} className="h-8 w-32 font-mono text-xs" />
+                      </td>
+                      <td className="px-2 py-1">
+                        <Input value={nombreMostrado(f)} onChange={(e) => editarFila(f.numeroFila, 'personaRecoge', e.target.value)} placeholder="—" className="h-8 w-32 text-xs" />
+                      </td>
+                      <td className="px-2 py-1">
+                        <Input value={celularMostrado(f)} onChange={(e) => editarFila(f.numeroFila, 'celular', e.target.value)} placeholder="—" className="h-8 w-28 text-xs" />
+                      </td>
+                      <td className="px-2 py-1">
+                        <Input
+                          type="number"
+                          min={0}
+                          step="0.5"
+                          value={montoMostrado(f)}
+                          onChange={(e) => editarFila(f.numeroFila, 'monto', e.target.value)}
+                          className="h-8 w-20 text-xs"
+                        />
+                      </td>
                       <td className="px-3 py-1.5 text-ink-soft dark:text-gray-400">{f.fechaRecepcionResuelta ?? '—'}</td>
                       <td className="px-3 py-1.5">
                         <Badge variant={ESTADO_INFO[f.estado].variant}>
@@ -511,6 +603,15 @@ export function ImportacionClient() {
                 </tbody>
               </table>
             </div>
+
+            {Object.keys(ediciones).length > 0 && (
+              <div className="flex flex-wrap items-center gap-2 rounded-lg bg-brand-50 dark:bg-brand-500/10 px-3 py-2 text-xs text-brand-700 dark:text-brand-400">
+                <span>Editaste {Object.keys(ediciones).length} fila{Object.keys(ediciones).length === 1 ? '' : 's'}.</span>
+                <Button size="sm" variant="secondary" onClick={previsualizar} loading={procesando === 'previsualizar'}>
+                  Revisar cambios
+                </Button>
+              </div>
+            )}
           </CardContent>
         </Card>
       )}

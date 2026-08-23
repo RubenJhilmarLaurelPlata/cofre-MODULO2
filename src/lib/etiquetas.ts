@@ -96,10 +96,17 @@ export function calcularFechasLote(params: ParametrosFecha): string[] {
       return [params.fecha];
 
     case 'semana': {
-      // Semana domingo -> sabado, igual que el dashboard (ver dashboard-data.ts).
+      // Semana lunes -> sabado (domingo no es dia operativo, ver
+      // pricing.ts), igual que Dashboard/Finanzas/Reportes — ver
+      // inicioSemanaLunes() en dashboard-data.ts. Antes decia "domingo ->
+      // sabado" (bug real corregido junto con el mismo calculo duplicado
+      // en dashboard-data.ts/reportes.ts: con la formula vieja, generar
+      // etiquetas de "la semana" un domingo cualquiera arrancaba esa
+      // semana en el domingo mismo en vez del lunes correspondiente).
       const ref = parseDateOnly(params.fechaReferencia);
+      const diasDesdeLunes = (ref.getDay() + 6) % 7;
       const inicioSemana = new Date(ref);
-      inicioSemana.setDate(ref.getDate() - ref.getDay());
+      inicioSemana.setDate(ref.getDate() - diasDesdeLunes);
       const dias: string[] = [];
       for (let i = 0; i < 7; i++) {
         const d = new Date(inicioSemana);

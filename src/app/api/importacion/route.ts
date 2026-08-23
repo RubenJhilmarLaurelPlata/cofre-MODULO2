@@ -15,6 +15,7 @@ import {
   parseXLSX,
   detectarEncabezados,
   validarFilas,
+  aplicarEdicionesFilas,
   ejecutarImportacion,
   registrarImportLog,
   type FormatoImportacion,
@@ -22,6 +23,7 @@ import {
   type CampoSistema,
   type TipoImportacion,
   type OpcionesFechaRecepcion,
+  type EdicionFila,
 } from '@/lib/importacion';
 
 const MAX_BYTES = 8_000_000;
@@ -104,6 +106,20 @@ export async function POST(req: Request) {
     else if (formato === 'CSV') filas = parseCSV(buffer.toString('utf-8'), mapeo);
     else filas = await parseXLSX(buffer, mapeo);
 
+    // Ediciones del administrador hechas en la previsualizacion (código,
+    // monto, persona que recoge, celular) — se aplican ANTES de validar,
+    // nunca despues (ver comentario de aplicarEdicionesFilas en
+    // src/lib/importacion.ts).
+    const edicionesRaw = formData.get('ediciones');
+    if (typeof edicionesRaw === 'string' && edicionesRaw.trim()) {
+      try {
+        const parsed = JSON.parse(edicionesRaw);
+        if (Array.isArray(parsed)) filas = aplicarEdicionesFilas(filas, parsed as EdicionFila[]);
+      } catch {
+        return NextResponse.json({ error: 'Las ediciones enviadas no son válidas.' }, { status: 400 });
+      }
+    }
+
     if (filas.length === 0) {
       return NextResponse.json({ error: 'El archivo no tiene filas para importar.' }, { status: 400 });
     }
@@ -130,7 +146,12 @@ export async function POST(req: Request) {
       opcionesFecha = { modo: 'unica', fechaUnica };
     }
 
-    const resumen = await validarFilas(filas, opcionesFecha);
+    // Monto por defecto (Problema 3): si la fila no trae un monto valido
+    // (columna ausente o celda vacia), se usa la tarifa base configurada
+    // (Configuración → Tarifas, hoy Bs 2) — nunca un numero fijo aparte de
+    // esa configuracion. Sigue siendo editable fila por fila.
+    const company = await getCompanyConfig();
+    const resumen = await validarFilas(filas, opcionesFecha, company.tarifaBase);
 
     if (accion === 'previsualizar') {
       return NextResponse.json({ resumen });
@@ -143,7 +164,6 @@ export async function POST(req: Request) {
     }
     const tipo = tipoRaw as TipoImportacion;
 
-    const company = await getCompanyConfig();
     const branchId = session.branchId ?? company.sucursalActualId ?? (await prisma.branch.findFirst({ where: { activo: true } }))?.id;
     if (!branchId) {
       return NextResponse.json({ error: 'No hay ninguna sucursal activa configurada.' }, { status: 400 });
