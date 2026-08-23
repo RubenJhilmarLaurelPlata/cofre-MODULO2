@@ -10,7 +10,7 @@ import { NextResponse } from 'next/server';
 import { z } from 'zod';
 import { prisma } from '@/lib/prisma';
 import { getSession } from '@/lib/auth';
-import { registrarPago } from '@/lib/package-transitions';
+import { corregirCobroAbsoluto } from '@/lib/package-transitions';
 import { registrarAuditoria, extraerContextoRequest } from '@/lib/auditoria';
 import { getPackageDetail } from '@/lib/package-detail';
 import { conLoteImportacion } from '@/lib/entrega-lote';
@@ -56,9 +56,8 @@ export async function PATCH(req: Request, { params }: { params: { code: string }
   const { montoCorregido, motivo, destinatario, destinatarioTelefono, destinatarioObservaciones, observaciones } = parsed.data;
   const { ip, userAgent } = extraerContextoRequest(req);
 
-  if (montoCorregido !== undefined && Math.round(montoCorregido * 100) !== Math.round(pkg.montoPagado * 100)) {
-    const delta = Math.round((montoCorregido - pkg.montoPagado) * 100) / 100;
-    await registrarPago(pkg, 'AJUSTE', delta, session.id, motivo || `Corrección manual del monto cobrado en ${code}`);
+  if (montoCorregido !== undefined) {
+    await corregirCobroAbsoluto(code, montoCorregido, session.id, motivo || `Corrección manual del monto cobrado en ${code}`);
   }
 
   const camposDirectos = { destinatario, destinatarioTelefono, destinatarioObservaciones, observaciones };

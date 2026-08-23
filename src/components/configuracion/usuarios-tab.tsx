@@ -64,14 +64,14 @@ export function UsuariosTab() {
       if (roleFiltro) params.set('role', roleFiltro);
       if (estadoFiltro) params.set('estado', estadoFiltro);
       const res = await fetch(`/api/configuracion/usuarios?${params.toString()}`);
-      const data = await res.json();
-      if (!res.ok) {
-        setError(data.error ?? 'No se pudo cargar la lista de usuarios.');
+      const data = await res.json().catch(() => null);
+      if (!res.ok || data === null) {
+        setError((data && data.error) || 'No se pudieron cargar los usuarios. Intenta de nuevo.');
         return;
       }
       setUsuarios(data);
     } catch {
-      setError('Error de conexión. Intenta de nuevo.');
+      setError('No se pudieron cargar los usuarios. Verifica tu conexión e intenta de nuevo.');
     } finally {
       setCargando(false);
     }
@@ -278,6 +278,15 @@ export function UsuariosTab() {
 
       {cargando ? (
         <p className="py-8 text-center text-sm text-gray-400 dark:text-gray-500">Cargando…</p>
+      ) : error ? (
+        <Card>
+          <CardContent className="flex flex-col items-center gap-3 py-12 text-center text-sm text-gray-400 dark:text-gray-500">
+            <p>No se pudieron cargar los usuarios.</p>
+            <Button size="sm" variant="secondary" onClick={buscar}>
+              Reintentar
+            </Button>
+          </CardContent>
+        </Card>
       ) : usuarios.length === 0 ? (
         <Card>
           <CardContent className="py-12 text-center text-sm text-gray-400 dark:text-gray-500">No se encontró ningún usuario con esos filtros.</CardContent>

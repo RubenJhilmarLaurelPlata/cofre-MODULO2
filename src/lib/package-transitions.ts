@@ -125,6 +125,64 @@ export async function registrarPago(pkg: Package, tipo: TipoPago, montoDelta: nu
   return actualizado;
 }
 
+/**
+ * Corrige el monto pagado de un paquete a un valor ABSOLUTO (Finanzas >
+ * Corregir cobro), a diferencia de registrarPago() que aplica un delta ya
+ * decidido por el llamador sobre un "pkg" leido hace un rato. Esta funcion
+ * vuelve a leer el paquete DENTRO de la misma transaccion interactiva
+ * antes de calcular el delta: con SQLite en connection_limit=1 (ver
+ * .env.example), esa transaccion ocupa la unica conexion durante toda su
+ * duracion, asi que una segunda correccion casi simultanea sobre el mismo
+ * paquete no puede empezar la suya hasta que esta termine, y para entonces
+ * lee el monto YA corregido. Sin esto, dos PATCH concurrentes con el mismo
+ * "montoCorregido" leian el mismo montoPagado anterior y las dos escribian
+ * su propia fila de AJUSTE — duplicando el ajuste en el libro de Pago
+ * aunque el campo "montoPagado" terminara reflejando un solo incremento
+ * (confirmado con una prueba real de dos correcciones concurrentes antes
+ * de este fix).
+ */
+export async function corregirCobroAbsoluto(code: string, montoCorregido: number, userId: string, motivo?: string): Promise<Package> {
+  const [company, feriados] = await Promise.all([getCompanyConfig(), getHolidaySet()]);
+  const montoRedondeado = Math.round(montoCorregido * 100) / 100;
+
+  const actualizado = await prisma.$transaction(async (tx) => {
+    const pkg = await tx.package.findUnique({ where: { codigoNormalizado: normalizarCodigo(code) } });
+    if (!pkg) throw new PaqueteNoEncontradoError(code);
+
+    const montoAnterior = pkg.montoPagado;
+    if (Math.round(montoAnterior * 100) === Math.round(montoRedondeado * 100)) {
+      return pkg; // Sin cambio real que registrar (evita una fila de AJUSTE de Bs0).
+    }
+
+    const montoDelta = Math.round((montoRedondeado - montoAnterior) * 100) / 100;
+    const costoActual = calcularCosto(
+      pkg.ingresoAt,
+      fechaReferencia(pkg),
+      { tarifaBase: company.tarifaBase, diasIncluidos: company.diasIncluidos, costoAdicionalDia: company.costoAdicionalDia },
+      feriados,
+      pkg.tarifaBaseOverride,
+      pkg.diasIncluidosOverride
+    ).total;
+    const estadoPago: PaymentStatus = montoRedondeado <= 0 ? 'PENDIENTE' : montoRedondeado >= costoActual ? 'PAGADO' : 'PARCIAL';
+
+    const nuevo = await tx.package.update({ where: { id: pkg.id }, data: { montoPagado: montoRedondeado, estadoPago } });
+    await tx.pago.create({
+      data: { packageId: pkg.id, tipo: 'AJUSTE', monto: montoDelta, montoAnterior, montoNuevo: montoRedondeado, motivo: motivo || null, userId },
+    });
+    return nuevo;
+  }, TRANSACTION_OPTS);
+
+  await registrarAuditoria({
+    userId,
+    accion: 'PAGO_AJUSTE',
+    modulo: 'finanzas',
+    valorAnterior: { code },
+    valorNuevo: { code, montoPagado: actualizado.montoPagado, motivo: motivo || undefined },
+  });
+
+  return actualizado;
+}
+
 export async function entregarPaquete(
   code: string,
   userId: string,

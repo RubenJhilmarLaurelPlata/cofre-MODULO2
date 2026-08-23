@@ -25,9 +25,13 @@ export function LoginForm() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ username, password }),
       });
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error ?? 'No se pudo iniciar sesión');
+      // El servidor siempre responde JSON (ver /api/auth/login), pero un
+      // 502/503 real del proxy o un corte de red a mitad de respuesta no
+      // lo son — sin este catch, res.json() lanzaba "Unexpected end of
+      // JSON input" en vez de un mensaje entendible.
+      const data = await res.json().catch(() => null);
+      if (!res.ok || data === null) {
+        throw new Error((data && data.error) || 'No se pudo iniciar sesión. Intenta de nuevo en unos segundos.');
       }
       const params = new URLSearchParams(window.location.search);
       const next = params.get('next');

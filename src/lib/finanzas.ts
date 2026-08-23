@@ -364,34 +364,169 @@ export async function ajustarCobroPaquete(pkg: Package, montoDelta: number, user
 // hasta un movimiento real de Pago (paquete, monto, fecha/hora, operador).
 // ---------------------------------------------------------------------
 
+// Clasificacion de cada movimiento, para no mezclar visualmente una
+// entrega normal, una entrega excepcional, un anticipo o un ajuste (ver
+// especificacion, seccion 3). Se deriva de datos que ya existen — nunca de
+// una suposicion: tipo=COBRO_ENTREGA + Package.origenEntrega (el mismo
+// campo que ya distingue una entrega excepcional real de una normal, ver
+// entregaExcepcional() en package-transitions.ts).
+export type ClasificacionMovimiento = 'ENTREGA_NORMAL' | 'ENTREGA_EXCEPCIONAL' | 'ENTREGA_IMPORTACION' | 'ANTICIPO' | 'AJUSTE';
+
+export const CLASIFICACION_LABEL: Record<ClasificacionMovimiento, string> = {
+  ENTREGA_NORMAL: 'Entrega normal',
+  ENTREGA_EXCEPCIONAL: 'Entrega excepcional',
+  ENTREGA_IMPORTACION: 'Entrega vía importación',
+  ANTICIPO: 'Anticipo (paquete aún no entregado)',
+  AJUSTE: 'Ajuste / corrección',
+};
+
+function clasificarMovimiento(tipo: string, origenEntrega: string | null): ClasificacionMovimiento {
+  if (tipo === 'ANTICIPO') return 'ANTICIPO';
+  if (tipo === 'AJUSTE') return 'AJUSTE';
+  // tipo === 'COBRO_ENTREGA'
+  if (origenEntrega === 'EXCEPCIONAL') return 'ENTREGA_EXCEPCIONAL';
+  if (origenEntrega === 'IMPORTACION') return 'ENTREGA_IMPORTACION';
+  return 'ENTREGA_NORMAL';
+}
+
 export interface PagoDetalleDTO {
   id: string;
   codigo: string;
   tipo: string;
+  clasificacion: ClasificacionMovimiento;
+  clasificacionLabel: string;
   monto: number;
   usuario: string;
   createdAt: string;
   motivo: string | null;
+  estadoPaquete: string;
 }
 
-/** Lista, uno por uno, los movimientos de Pago que componen getResumenFinanciero() para el mismo período — el detalle detrás de "Ingresos". */
+/** Lista, uno por uno, los movimientos de Pago que componen getResumenFinanciero() para el mismo período — el detalle detrás de "Ingresos", clasificado (entrega normal/excepcional/vía importación, anticipo o ajuste) para no mezclar situaciones distintas. */
 export async function listarPagosPeriodo(rango: RangoFecha): Promise<PagoDetalleDTO[]> {
   const createdAt = whereRango(rango);
   const pagos = await prisma.pago.findMany({
     where: createdAt ? { createdAt } : {},
     orderBy: { createdAt: 'desc' },
     take: 2000,
-    include: { user: { select: { nombre: true } }, package: { select: { code: true } } },
+    include: { user: { select: { nombre: true } }, package: { select: { code: true, origenEntrega: true, status: true } } },
   });
-  return pagos.map((p) => ({
-    id: p.id,
-    codigo: p.package.code,
-    tipo: p.tipo,
-    monto: p.monto,
-    usuario: p.user?.nombre ?? 'Sistema',
-    createdAt: p.createdAt.toISOString(),
-    motivo: p.motivo,
-  }));
+  return pagos.map((p) => {
+    const clasificacion = clasificarMovimiento(p.tipo, p.package.origenEntrega);
+    return {
+      id: p.id,
+      codigo: p.package.code,
+      tipo: p.tipo,
+      clasificacion,
+      clasificacionLabel: CLASIFICACION_LABEL[clasificacion],
+      monto: p.monto,
+      usuario: p.user?.nombre ?? 'Sistema',
+      createdAt: p.createdAt.toISOString(),
+      motivo: p.motivo,
+      estadoPaquete: p.package.status,
+    };
+  });
+}
+
+// ---------------------------------------------------------------------
+// Reconciliacion: responde exactamente "de que se componen los N paquetes
+// cobrados" cuando no coincide con "M entregados" — sin asumir la causa,
+// desglosandola en las categorias reales que existen en el schema (ver
+// especificacion, seccion 5). Los "cobros sin entrega" son la explicacion
+// mas probable de una diferencia real: un anticipo pagado en el periodo
+// para un paquete que se entrega (y por lo tanto factura su
+// COBRO_ENTREGA) en OTRO periodo, o un ajuste sobre una entrega de otro
+// dia — ninguno de los dos es un error, son movimientos financieros reales
+// que ocurrieron en fechas distintas a las de la entrega.
+// ---------------------------------------------------------------------
+
+export interface ReconciliacionDTO {
+  entregas: { normales: number; excepcionales: number; importacion: number; total: number };
+  cobros: {
+    cobrosEntrega: number;
+    montoCobrosEntrega: number;
+    anticipos: number;
+    montoAnticipos: number;
+    ajustes: number;
+    montoAjustes: number;
+    totalPaquetesCobrados: number;
+    montoTotal: number;
+  };
+  diferencia: {
+    cobrosAsociadosAEntrega: number;
+    cobrosSinEntrega: number;
+    anticipos: number;
+    ajustes: number;
+  };
+}
+
+export async function getReconciliacion(rango: RangoFecha): Promise<ReconciliacionDTO> {
+  const fechaFiltro = whereRango(rango);
+
+  const [entregasHist, pagos] = await Promise.all([
+    prisma.packageHistory.findMany({
+      where: { estado: 'ENTREGADO', ...(fechaFiltro ? { fecha: fechaFiltro } : {}) },
+      select: { packageId: true, package: { select: { origenEntrega: true } } },
+    }),
+    prisma.pago.findMany({
+      where: fechaFiltro ? { createdAt: fechaFiltro } : {},
+      select: { packageId: true, tipo: true, monto: true },
+    }),
+  ]);
+
+  let normales = 0;
+  let excepcionales = 0;
+  let importacion = 0;
+  for (const h of entregasHist) {
+    if (h.package.origenEntrega === 'EXCEPCIONAL') excepcionales++;
+    else if (h.package.origenEntrega === 'IMPORTACION') importacion++;
+    else normales++;
+  }
+
+  const cobroEntregaPkgIds = new Set(pagos.filter((p) => p.tipo === 'COBRO_ENTREGA').map((p) => p.packageId));
+  let cobrosEntrega = 0;
+  let montoCobrosEntrega = 0;
+  let anticipos = 0;
+  let montoAnticipos = 0;
+  let ajustes = 0;
+  let montoAjustes = 0;
+  for (const p of pagos) {
+    if (p.tipo === 'COBRO_ENTREGA') {
+      cobrosEntrega++;
+      montoCobrosEntrega += p.monto;
+    } else if (p.tipo === 'ANTICIPO') {
+      anticipos++;
+      montoAnticipos += p.monto;
+    } else if (p.tipo === 'AJUSTE') {
+      ajustes++;
+      montoAjustes += p.monto;
+    }
+  }
+
+  const paquetesConPago = new Set(pagos.map((p) => p.packageId));
+  const cobrosSinEntrega = Array.from(paquetesConPago).filter((id) => !cobroEntregaPkgIds.has(id)).length;
+  const montoTotal = Math.round(pagos.reduce((acc, p) => acc + p.monto, 0) * 100) / 100;
+  const r2 = (n: number) => Math.round(n * 100) / 100;
+
+  return {
+    entregas: { normales, excepcionales, importacion, total: entregasHist.length },
+    cobros: {
+      cobrosEntrega,
+      montoCobrosEntrega: r2(montoCobrosEntrega),
+      anticipos,
+      montoAnticipos: r2(montoAnticipos),
+      ajustes,
+      montoAjustes: r2(montoAjustes),
+      totalPaquetesCobrados: paquetesConPago.size,
+      montoTotal,
+    },
+    diferencia: {
+      cobrosAsociadosAEntrega: cobroEntregaPkgIds.size,
+      cobrosSinEntrega,
+      anticipos,
+      ajustes,
+    },
+  };
 }
 
 // ---------------------------------------------------------------------
@@ -410,6 +545,9 @@ export interface AuditoriaOperadorDTO {
   usuario: string;
   recepciones: number;
   entregas: number;
+  entregasNormales: number;
+  entregasExcepcionales: number;
+  entregasImportacion: number;
   cobros: number;
   montoCobrado: number;
   anticipos: number;
@@ -417,6 +555,17 @@ export interface AuditoriaOperadorDTO {
   ajustes: number;
   montoAjustes: number;
   entregasSinCobro: number;
+  cobrosSinEntrega: number;
+}
+
+export interface PagoDuplicadoDTO {
+  codigo: string;
+  tipo: string;
+  monto: number;
+  primeraFecha: string;
+  segundaFecha: string;
+  segundosEntre: number;
+  usuario: string;
 }
 
 export interface AuditoriaFinancieraDTO {
@@ -425,6 +574,7 @@ export interface AuditoriaFinancieraDTO {
   paquetesEntregados: number;
   entregasSinCobro: number;
   codigosSinCobro: string[];
+  posiblesDuplicados: PagoDuplicadoDTO[];
   porOperador: AuditoriaOperadorDTO[];
 }
 
@@ -433,17 +583,27 @@ function nombreUsuario(map: Map<string, string>, userId: string | null): string 
   return map.get(userId) ?? 'Usuario eliminado';
 }
 
+// Dos movimientos del mismo paquete, mismo tipo y mismo monto, a menos de
+// esta ventana de tiempo entre si, son sospechosos de ser un doble envio
+// accidental (ej. una correccion enviada dos veces por un doble clic) en
+// vez de dos correcciones deliberadas separadas — ver seccion 10.F/H de la
+// especificacion. entregarPaquete() ya esta protegido atomicamente contra
+// esto (verificado con pruebas reales, ver informe), asi que en la
+// practica esto solo puede detectar el caso mas dificil de blindar del
+// mismo modo: dos PATCH de "corregir cobro" casi simultaneos.
+const VENTANA_DUPLICADO_SEGUNDOS = 15;
+
 /** Auditoría por operador (Recepción/Entrega/Finanzas) + detección de inconsistencias reales, para el período dado. */
 export async function getAuditoriaFinanciera(rango: RangoFecha): Promise<AuditoriaFinancieraDTO> {
   const fechaFiltro = whereRango(rango);
 
-  const [usuarios, resumen, entregasHist, cobrosPorOperador, anticiposPorOperador, ajustesPorOperador, recepcionesPorOperador, entregadosSinCobro, pagosRegistrados] =
+  const [usuarios, resumen, entregasHist, cobrosPorOperador, anticiposPorOperador, ajustesPorOperador, recepcionesPorOperador, entregadosSinCobro, pagosRegistrados, pagos] =
     await Promise.all([
       prisma.user.findMany({ select: { id: true, nombre: true } }),
       getResumenFinanciero(rango),
       prisma.packageHistory.findMany({
         where: { estado: 'ENTREGADO', ...(fechaFiltro ? { fecha: fechaFiltro } : {}) },
-        select: { userId: true, packageId: true },
+        select: { userId: true, packageId: true, package: { select: { origenEntrega: true } } },
       }),
       prisma.pago.groupBy({
         by: ['userId'],
@@ -473,6 +633,11 @@ export async function getAuditoriaFinanciera(rango: RangoFecha): Promise<Auditor
         select: { id: true, code: true },
       }),
       prisma.pago.count({ where: { tipo: 'COBRO_ENTREGA', ...(fechaFiltro ? { createdAt: fechaFiltro } : {}) } }),
+      prisma.pago.findMany({
+        where: fechaFiltro ? { createdAt: fechaFiltro } : {},
+        select: { packageId: true, tipo: true, monto: true, userId: true, createdAt: true, package: { select: { code: true } } },
+        orderBy: { createdAt: 'asc' },
+      }),
     ]);
 
   const nombrePorId = new Map(usuarios.map((u) => [u.id, u.nombre] as const));
@@ -481,6 +646,7 @@ export async function getAuditoriaFinanciera(rango: RangoFecha): Promise<Auditor
   // reutiliza PackageHistory, ya escrito por transicionar() en la misma
   // transaccion que la entrega, en vez de duplicar el dato en Package).
   const entregadorPorPackageId = new Map(entregasHist.map((h) => [h.packageId, h.userId] as const));
+  const cobroEntregaPkgIds = new Set(pagos.filter((p) => p.tipo === 'COBRO_ENTREGA').map((p) => p.packageId));
 
   const filas = new Map<string, AuditoriaOperadorDTO>();
   function fila(userId: string | null): AuditoriaOperadorDTO {
@@ -492,6 +658,9 @@ export async function getAuditoriaFinanciera(rango: RangoFecha): Promise<Auditor
         usuario: nombreUsuario(nombrePorId, userId),
         recepciones: 0,
         entregas: 0,
+        entregasNormales: 0,
+        entregasExcepcionales: 0,
+        entregasImportacion: 0,
         cobros: 0,
         montoCobrado: 0,
         anticipos: 0,
@@ -499,6 +668,7 @@ export async function getAuditoriaFinanciera(rango: RangoFecha): Promise<Auditor
         ajustes: 0,
         montoAjustes: 0,
         entregasSinCobro: 0,
+        cobrosSinEntrega: 0,
       };
       filas.set(key, f);
     }
@@ -506,7 +676,13 @@ export async function getAuditoriaFinanciera(rango: RangoFecha): Promise<Auditor
   }
 
   for (const r of recepcionesPorOperador) fila(r.registradoPorId).recepciones = r._count._all;
-  for (const h of entregasHist) fila(h.userId).entregas += 1;
+  for (const h of entregasHist) {
+    const f = fila(h.userId);
+    f.entregas += 1;
+    if (h.package.origenEntrega === 'EXCEPCIONAL') f.entregasExcepcionales += 1;
+    else if (h.package.origenEntrega === 'IMPORTACION') f.entregasImportacion += 1;
+    else f.entregasNormales += 1;
+  }
   for (const c of cobrosPorOperador) {
     const f = fila(c.userId);
     f.cobros = c._count._all;
@@ -525,10 +701,51 @@ export async function getAuditoriaFinanciera(rango: RangoFecha): Promise<Auditor
   for (const pkg of entregadosSinCobro) {
     fila(entregadorPorPackageId.get(pkg.id) ?? null).entregasSinCobro += 1;
   }
+  // "Cobros sin entrega": anticipos/ajustes de este operador cuyo paquete
+  // no tiene un COBRO_ENTREGA en este mismo periodo (la entrega ocurrio en
+  // otro dia, o el paquete todavia no fue entregado) — la explicacion mas
+  // probable de que "paquetes cobrados" supere a "entregados" (ver
+  // getReconciliacion arriba).
+  for (const p of pagos) {
+    if ((p.tipo === 'ANTICIPO' || p.tipo === 'AJUSTE') && !cobroEntregaPkgIds.has(p.packageId)) {
+      fila(p.userId).cobrosSinEntrega += 1;
+    }
+  }
 
   const porOperador = Array.from(filas.values())
     .filter((f) => f.recepciones + f.entregas + f.cobros + f.anticipos + f.ajustes + f.entregasSinCobro > 0)
     .sort((a, b) => b.entregas + b.cobros - (a.entregas + a.cobros));
+
+  // Posibles duplicados: mismo paquete + mismo tipo + mismo monto, dos
+  // veces, a menos de VENTANA_DUPLICADO_SEGUNDOS entre si.
+  const porClave = new Map<string, typeof pagos>();
+  for (const p of pagos) {
+    const clave = `${p.packageId}|${p.tipo}|${p.monto}`;
+    const lista = porClave.get(clave) ?? [];
+    lista.push(p);
+    porClave.set(clave, lista);
+  }
+  const posiblesDuplicados: PagoDuplicadoDTO[] = [];
+  for (const lista of porClave.values()) {
+    if (lista.length < 2) continue;
+    for (let i = 1; i < lista.length; i++) {
+      const actual = lista[i];
+      const anterior = lista[i - 1];
+      if (!actual || !anterior) continue;
+      const segundos = (actual.createdAt.getTime() - anterior.createdAt.getTime()) / 1000;
+      if (segundos <= VENTANA_DUPLICADO_SEGUNDOS) {
+        posiblesDuplicados.push({
+          codigo: actual.package.code,
+          tipo: actual.tipo,
+          monto: actual.monto,
+          primeraFecha: anterior.createdAt.toISOString(),
+          segundaFecha: actual.createdAt.toISOString(),
+          segundosEntre: Math.round(segundos * 10) / 10,
+          usuario: nombreUsuario(nombrePorId, actual.userId),
+        });
+      }
+    }
+  }
 
   return {
     ingresos: resumen.ingresos,
@@ -536,6 +753,7 @@ export async function getAuditoriaFinanciera(rango: RangoFecha): Promise<Auditor
     paquetesEntregados: entregasHist.length,
     entregasSinCobro: entregadosSinCobro.length,
     codigosSinCobro: entregadosSinCobro.map((p) => p.code),
+    posiblesDuplicados,
     porOperador,
   };
 }
