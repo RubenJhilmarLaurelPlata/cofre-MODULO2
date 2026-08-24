@@ -153,16 +153,42 @@ function fmtDias(n: number): string {
 
 export async function getReportePaquetes(filtros: FiltrosReporte): Promise<ReporteResultado> {
   const { gte, lt, etiqueta } = resolverRangoFechas(filtros);
-  const where: Prisma.PackageWhereInput = { ...filtrosComunesPaquete(filtros), ingresoAt: { gte, lt } };
+  const comunes = filtrosComunesPaquete(filtros);
+  // "Ingresados" sigue siendo el cohorte base de la tabla/serie/tiempo
+  // promedio (tiene sentido: "de los que llegaron en este periodo, cuanto
+  // tiempo llevan almacenados"). Pero "entregados" y "denegados" NUNCA
+  // deben salir de este mismo cohorte filtrado por ingresoAt — un paquete
+  // ingresado el 20/08 y entregado hoy es una entrega de HOY, no del
+  // 20/08. Antes, "Total entregados" contaba status==ENTREGADO dentro del
+  // conjunto ingresado en el periodo, lo que subcontaba entregas reales
+  // (ver especificacion, "Bug critico: Reportes confunde ingreso con
+  // entrega" — confirmado: Dashboard entregaAt-based mostraba 58,
+  // Reportes ingresoAt+status mostraba 23, para el mismo dia).
+  const where: Prisma.PackageWhereInput = { ...comunes, ingresoAt: { gte, lt } };
 
-  const paquetes = await prisma.package.findMany({
-    where,
-    include: { registradoPor: { select: { nombre: true } } },
-    orderBy: { ingresoAt: 'desc' },
-    take: 2000,
-  });
+  const [paquetes, totalEntregados, totalDenegados, actualEnPaqueteria, actualEnDeposito, actualPendienteBajar] = await Promise.all([
+    prisma.package.findMany({
+      where,
+      include: { registradoPor: { select: { nombre: true } } },
+      orderBy: { ingresoAt: 'desc' },
+      take: 2000,
+    }),
+    // "Total entregados": entregaAt (no ingresoAt) dentro del periodo —
+    // incluye paquetes ingresados en cualquier fecha anterior.
+    prisma.package.count({ where: { ...comunes, entregaAt: { gte, lt } } }),
+    // "Denegados": denegadoAt (no ingresoAt) dentro del periodo, mismo motivo.
+    prisma.package.count({ where: { ...comunes, denegadoAt: { gte, lt } } }),
+    // "En paquetería/depósito/pendientes de bajar": estos NO representan
+    // un evento con fecha propia dentro del periodo — son un ESTADO
+    // ACTUAL (ver especificacion, seccion 2: "En depósito NO significa
+    // ingresaron en este período"). Se reporta el conteo actual, igual
+    // criterio que ya usa Dashboard (src/lib/dashboard-data.ts), para que
+    // ambas pantallas sean conceptualmente coherentes.
+    prisma.package.count({ where: { ...comunes, status: 'EN_PAQUETERIA' } }),
+    prisma.package.count({ where: { ...comunes, status: 'EN_DEPOSITO' } }),
+    prisma.package.count({ where: { ...comunes, status: 'PENDIENTE_BAJAR' } }),
+  ]);
 
-  const porEstado = (estado: PackageStatus) => paquetes.filter((p) => p.status === estado).length;
   const dias = paquetes.map((p) => diasTranscurridos(p.ingresoAt, fechaReferencia(p)));
   const promedio = dias.length ? dias.reduce((a, b) => a + b, 0) / dias.length : 0;
   const maximo = dias.length ? Math.max(...dias) : 0;
@@ -175,12 +201,12 @@ export async function getReportePaquetes(filtros: FiltrosReporte): Promise<Repor
   return {
     resumen: [
       { label: 'Período', value: etiqueta },
-      { label: 'Total ingresados', value: String(paquetes.length) },
-      { label: 'Total entregados', value: String(porEstado('ENTREGADO')) },
-      { label: 'En paquetería', value: String(porEstado('EN_PAQUETERIA')) },
-      { label: 'En depósito', value: String(porEstado('EN_DEPOSITO')) },
-      { label: 'Pendientes de bajar', value: String(porEstado('PENDIENTE_BAJAR')) },
-      { label: 'Denegados', value: String(porEstado('DENEGADO')) },
+      { label: 'Total ingresados (en el período)', value: String(paquetes.length) },
+      { label: 'Total entregados (en el período)', value: String(totalEntregados) },
+      { label: 'Denegados (en el período)', value: String(totalDenegados) },
+      { label: 'En paquetería (estado actual)', value: String(actualEnPaqueteria) },
+      { label: 'En depósito (estado actual)', value: String(actualEnDeposito) },
+      { label: 'Pendientes de bajar (estado actual)', value: String(actualPendienteBajar) },
       { label: 'Tiempo promedio almacenado', value: fmtDias(promedio) },
       { label: 'Tiempo máximo', value: fmtDias(maximo) },
       { label: 'Tiempo mínimo', value: fmtDias(minimo) },
