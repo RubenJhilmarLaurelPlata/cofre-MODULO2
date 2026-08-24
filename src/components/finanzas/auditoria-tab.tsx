@@ -8,7 +8,7 @@
 // y posibles pagos duplicados) — ver getAuditoriaFinanciera/
 // getReconciliacion en src/lib/finanzas.ts para el porqué de cada cálculo.
 import * as React from 'react';
-import { AlertTriangle, CheckCircle2, Loader2 } from 'lucide-react';
+import { AlertTriangle, CheckCircle2, Loader2, ChevronDown, ChevronUp } from 'lucide-react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { RangoFechaSelector, rangoFechaInicial, rangoFechaAQuery, type RangoFechaValue } from '@/components/finanzas/rango-fecha-selector';
 
@@ -66,15 +66,48 @@ interface Reconciliacion {
   diferencia: { cobrosAsociadosAEntrega: number; cobrosSinEntrega: number; anticipos: number; ajustes: number };
 }
 
+interface MovimientoPaquete {
+  tipo: string;
+  clasificacionLabel: string;
+  monto: number;
+  createdAt: string;
+  usuario: string;
+}
+
+interface PaqueteReconciliado {
+  codigo: string;
+  status: string;
+  origenEntrega: string | null;
+  ingresoAt: string;
+  entregaAt: string | null;
+  movimientos: MovimientoPaquete[];
+}
+
+interface ReconciliacionDetalle {
+  soloEntregados: PaqueteReconciliado[];
+  soloCobrados: PaqueteReconciliado[];
+  ambos: PaqueteReconciliado[];
+}
+
+function fmtFechaHora(iso: string | null): string {
+  if (!iso) return '—';
+  return new Intl.DateTimeFormat('es-BO', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }).format(new Date(iso));
+}
+
 export function AuditoriaTab({ moneda }: { moneda: string }) {
   const [rango, setRango] = React.useState<RangoFechaValue>(rangoFechaInicial());
   const [datos, setDatos] = React.useState<Auditoria | null>(null);
   const [reconciliacion, setReconciliacion] = React.useState<Reconciliacion | null>(null);
   const [cargando, setCargando] = React.useState(true);
+  const [detalleAbierto, setDetalleAbierto] = React.useState(false);
+  const [detalle, setDetalle] = React.useState<ReconciliacionDetalle | null>(null);
+  const [cargandoDetalle, setCargandoDetalle] = React.useState(false);
 
   React.useEffect(() => {
     let cancelado = false;
     setCargando(true);
+    setDetalle(null);
+    setDetalleAbierto(false);
     const qs = new URLSearchParams(rangoFechaAQuery(rango)).toString();
     Promise.all([
       fetch(`/api/finanzas/auditoria?${qs}`).then((r) => r.json()),
@@ -92,6 +125,22 @@ export function AuditoriaTab({ moneda }: { moneda: string }) {
       cancelado = true;
     };
   }, [rango]);
+
+  async function abrirDetalle() {
+    const siguiente = !detalleAbierto;
+    setDetalleAbierto(siguiente);
+    if (siguiente && !detalle) {
+      setCargandoDetalle(true);
+      try {
+        const qs = new URLSearchParams(rangoFechaAQuery(rango)).toString();
+        const res = await fetch(`/api/finanzas/reconciliacion-detalle?${qs}`);
+        const data = await res.json();
+        setDetalle(res.ok ? data : { soloEntregados: [], soloCobrados: [], ambos: [] });
+      } finally {
+        setCargandoDetalle(false);
+      }
+    }
+  }
 
   const hayInconsistencia = (datos?.entregasSinCobro ?? 0) > 0;
   const hayDuplicados = (datos?.posiblesDuplicados.length ?? 0) > 0;
@@ -231,6 +280,99 @@ export function AuditoriaTab({ moneda }: { moneda: string }) {
                 )}
               </div>
             </CardContent>
+          </Card>
+
+          <Card>
+            <button type="button" onClick={abrirDetalle} className="flex w-full items-center justify-between px-4 py-3 text-left">
+              <span className="text-sm font-medium text-ink dark:text-gray-100">
+                Ver exactamente cuáles paquetes componen cada conjunto (código por código)
+              </span>
+              {detalleAbierto ? <ChevronUp className="h-4 w-4 text-gray-400" /> : <ChevronDown className="h-4 w-4 text-gray-400" />}
+            </button>
+            {detalleAbierto && (
+              <CardContent className="space-y-6 pt-0">
+                {cargandoDetalle || !detalle ? (
+                  <div className="flex items-center justify-center py-8 text-gray-400 dark:text-gray-500">
+                    <Loader2 className="h-5 w-5 animate-spin" />
+                  </div>
+                ) : (
+                  <>
+                    <div>
+                      <p className="mb-2 text-xs font-semibold text-ink dark:text-gray-100">
+                        Solo cobrados ({detalle.soloCobrados.length}) — tienen un movimiento de Pago en este período pero no fueron entregados en este
+                        mismo período
+                      </p>
+                      {detalle.soloCobrados.length === 0 ? (
+                        <p className="text-xs text-gray-400 dark:text-gray-500">Ninguno en este período.</p>
+                      ) : (
+                        <div className="scrollbar-thin overflow-x-auto rounded-lg border border-gray-100 dark:border-gray-800/60">
+                          <table className="w-full min-w-[640px] text-left text-sm">
+                            <thead>
+                              <tr className="border-b border-gray-100 dark:border-gray-800/60 bg-gray-50 dark:bg-gray-800/40">
+                                <th className="px-3 py-2 text-xs font-semibold text-ink-soft dark:text-gray-400">Código</th>
+                                <th className="px-3 py-2 text-xs font-semibold text-ink-soft dark:text-gray-400">Estado actual</th>
+                                <th className="px-3 py-2 text-xs font-semibold text-ink-soft dark:text-gray-400">Motivo (movimientos)</th>
+                              </tr>
+                            </thead>
+                            <tbody className="divide-y divide-gray-100 dark:divide-gray-800">
+                              {detalle.soloCobrados.map((p) => (
+                                <tr key={p.codigo}>
+                                  <td className="whitespace-nowrap px-3 py-2 font-mono text-xs text-ink dark:text-gray-100">{p.codigo}</td>
+                                  <td className="whitespace-nowrap px-3 py-2 text-xs text-ink-soft dark:text-gray-400">{p.status}</td>
+                                  <td className="px-3 py-2 text-xs text-ink-soft dark:text-gray-400">
+                                    {p.movimientos.map((m, i) => (
+                                      <span key={i} className="mr-2 inline-block whitespace-nowrap">
+                                        {m.clasificacionLabel} {moneda}
+                                        {m.monto.toFixed(2)} ({fmtFechaHora(m.createdAt)}, {m.usuario})
+                                      </span>
+                                    ))}
+                                  </td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      )}
+                    </div>
+
+                    <div>
+                      <p className="mb-2 text-xs font-semibold text-ink dark:text-gray-100">
+                        Solo entregados ({detalle.soloEntregados.length}) — entregados en este período sin ningún movimiento de Pago en este mismo
+                        período
+                      </p>
+                      {detalle.soloEntregados.length === 0 ? (
+                        <p className="text-xs text-gray-400 dark:text-gray-500">Ninguno en este período.</p>
+                      ) : (
+                        <div className="scrollbar-thin overflow-x-auto rounded-lg border border-gray-100 dark:border-gray-800/60">
+                          <table className="w-full min-w-[520px] text-left text-sm">
+                            <thead>
+                              <tr className="border-b border-gray-100 dark:border-gray-800/60 bg-gray-50 dark:bg-gray-800/40">
+                                <th className="px-3 py-2 text-xs font-semibold text-ink-soft dark:text-gray-400">Código</th>
+                                <th className="px-3 py-2 text-xs font-semibold text-ink-soft dark:text-gray-400">Tipo de entrega</th>
+                                <th className="px-3 py-2 text-xs font-semibold text-ink-soft dark:text-gray-400">Fecha de entrega</th>
+                              </tr>
+                            </thead>
+                            <tbody className="divide-y divide-gray-100 dark:divide-gray-800">
+                              {detalle.soloEntregados.map((p) => (
+                                <tr key={p.codigo}>
+                                  <td className="whitespace-nowrap px-3 py-2 font-mono text-xs text-ink dark:text-gray-100">{p.codigo}</td>
+                                  <td className="whitespace-nowrap px-3 py-2 text-xs text-ink-soft dark:text-gray-400">
+                                    {p.origenEntrega === 'EXCEPCIONAL' ? 'Excepcional' : p.origenEntrega === 'IMPORTACION' ? 'Importación' : 'Normal'}
+                                  </td>
+                                  <td className="whitespace-nowrap px-3 py-2 text-xs text-gray-400 dark:text-gray-500">{fmtFechaHora(p.entregaAt)}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      )}
+                    </div>
+
+                    <p className="text-xs text-gray-400 dark:text-gray-500">Ambos (entregado y cobrado en este mismo período): {detalle.ambos.length}</p>
+                  </>
+                )}
+              </CardContent>
+            )}
           </Card>
 
           {hayInconsistencia && (

@@ -208,7 +208,13 @@ export async function getDashboardData(): Promise<DashboardData> {
     // pantallas (ver "Finanzas: una sola fuente de verdad").
     getResumenFinanciero({ desde: hoy, hasta: manana }),
     getResumenFinanciero({ desde: ayer, hasta: hoy }),
-    getResumenFinanciero({ desde: inicioSemana, hasta: manana }),
+    // "hasta: addDays(inicioSemana, 7)" (semana calendario completa,
+    // lunes-domingo) en vez de "manana" (que cortaba la semana en "hoy") —
+    // misma definicion exacta que resolverRangoFechas() en reportes.ts
+    // usa para Finanzas/Reportes (ver "Fechas: esta semana"). No cambia
+    // ningun resultado hoy (no existen registros con fecha futura), pero
+    // evita que las tres pantallas apliquen limites distintos.
+    getResumenFinanciero({ desde: inicioSemana, hasta: addDays(inicioSemana, 7) }),
     getResumenFinanciero({ desde: inicioSemanaAnterior, hasta: inicioSemana }),
     getResumenFinanciero({ desde: inicioMes, hasta: manana }),
     getResumenFinanciero({ desde: inicioMesAnterior, hasta: inicioMes }),

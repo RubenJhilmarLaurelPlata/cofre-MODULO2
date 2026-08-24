@@ -155,6 +155,11 @@ export function EntregaClient({
   const [excepcionalActivo, setExcepcionalActivo] = React.useState(false);
   const [confirmandoExcepcional, setConfirmandoExcepcional] = React.useState<string | null>(null);
   const [registrandoExcepcional, setRegistrandoExcepcional] = React.useState(false);
+  // Motivo obligatorio: sin el, hoy no quedaba ninguna justificacion de
+  // por que se omitio Recepcion (ver especificacion, "Entregas
+  // excepcionales" — nunca inventar un motivo, pedirlo siempre).
+  const [motivoExcepcionalInput, setMotivoExcepcionalInput] = React.useState('');
+  const [montoExcepcionalInput, setMontoExcepcionalInput] = React.useState('');
   const resolverExcepcionalRef = React.useRef<(() => void) | null>(null);
   const [query, setQuery] = React.useState(codigoInicial ?? '');
   const [paquete, setPaquete] = React.useState<PackageDetailDTO | null>(paqueteInicial ?? null);
@@ -348,6 +353,8 @@ export function EntregaClient({
   function cancelarExcepcional() {
     const code = confirmandoExcepcional;
     setConfirmandoExcepcional(null);
+    setMotivoExcepcionalInput('');
+    setMontoExcepcionalInput('');
     setMensajeError(code ? `No se encontró ningún paquete con el código "${code}".` : null);
     resolverExcepcionalRef.current?.();
     resolverExcepcionalRef.current = null;
@@ -356,10 +363,18 @@ export function EntregaClient({
 
   async function confirmarExcepcional() {
     const code = confirmandoExcepcional;
-    if (!code || registrandoExcepcional) return;
+    if (!code || registrandoExcepcional || !motivoExcepcionalInput.trim()) return;
     setRegistrandoExcepcional(true);
     try {
-      const res = await fetch(`/api/entrega/${encodeURIComponent(code)}/excepcional`, { method: 'POST' });
+      const montoCobrado = Number(montoExcepcionalInput);
+      const res = await fetch(`/api/entrega/${encodeURIComponent(code)}/excepcional`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          motivoExcepcional: motivoExcepcionalInput.trim(),
+          ...(montoExcepcionalInput.trim() && Number.isFinite(montoCobrado) ? { montoCobrado } : {}),
+        }),
+      });
       const data = await res.json();
       if (!res.ok) {
         setConfirmandoExcepcional(null);
@@ -382,6 +397,8 @@ export function EntregaClient({
       playSound('error');
     } finally {
       setRegistrandoExcepcional(false);
+      setMotivoExcepcionalInput('');
+      setMontoExcepcionalInput('');
       resolverExcepcionalRef.current?.();
       resolverExcepcionalRef.current = null;
       focusScanner(inputRef);
@@ -771,11 +788,34 @@ export function EntregaClient({
               El código <span className="font-mono font-semibold">{confirmandoExcepcional}</span> no existe en el sistema. Esta acción creará el
               paquete y lo marcará como entregado, dejando constancia de que la recepción se omitió.
             </p>
+            <div className="mt-3 space-y-2">
+              <label className="block text-xs font-semibold text-amber-800 dark:text-amber-300">
+                Motivo de la excepción (obligatorio)
+              </label>
+              <input
+                type="text"
+                value={motivoExcepcionalInput}
+                onChange={(e) => setMotivoExcepcionalInput(e.target.value)}
+                placeholder="Ej: el cliente llegó sin que el paquete pasara por Recepción"
+                maxLength={300}
+                className="w-full rounded-lg border border-amber-300 dark:border-amber-700 bg-white dark:bg-gray-900 px-3 py-2 text-sm text-ink dark:text-gray-100 outline-none focus:border-amber-500 focus:ring-2 focus:ring-amber-200"
+              />
+              <label className="block text-xs font-semibold text-amber-800 dark:text-amber-300">Monto a cobrar (opcional)</label>
+              <input
+                type="number"
+                min={0}
+                step="0.5"
+                value={montoExcepcionalInput}
+                onChange={(e) => setMontoExcepcionalInput(e.target.value)}
+                placeholder="Dejar vacío si no corresponde cobrar ahora"
+                className="w-full rounded-lg border border-amber-300 dark:border-amber-700 bg-white dark:bg-gray-900 px-3 py-2 text-sm text-ink dark:text-gray-100 outline-none focus:border-amber-500 focus:ring-2 focus:ring-amber-200"
+              />
+            </div>
             <div className="mt-3 flex gap-2">
               <Button variant="secondary" size="sm" onClick={cancelarExcepcional} disabled={registrandoExcepcional}>
                 Cancelar
               </Button>
-              <Button size="sm" onClick={confirmarExcepcional} loading={registrandoExcepcional}>
+              <Button size="sm" onClick={confirmarExcepcional} loading={registrandoExcepcional} disabled={!motivoExcepcionalInput.trim()}>
                 Confirmar entrega
               </Button>
             </div>

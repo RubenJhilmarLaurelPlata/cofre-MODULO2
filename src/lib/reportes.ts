@@ -90,8 +90,16 @@ export function resolverRangoFechas(filtros: Pick<FiltrosReporte, 'modo' | 'fech
       return { gte: ayer, lt: hoy, etiqueta: `Ayer (${fmtFecha(ayer)})` };
     }
     case 'semana': {
+      // Semana calendario COMPLETA (lunes a domingo), no "desde el lunes
+      // hasta hoy": si hoy es lunes, la semana sigue siendo de 7 dias
+      // (aunque los dias futuros todavia no tengan ningun registro, por
+      // eso la suma no cambia) — antes "lt" y la etiqueta se cortaban en
+      // "hoy", mostrando por ejemplo "Esta semana (24/08/2026 —
+      // 24/08/2026)" un lunes, que parece un rango de un solo dia. Ver
+      // especificacion, "Fechas: esta semana".
       const inicio = inicioSemanaLunes(hoy);
-      return { gte: inicio, lt: addDays(hoy, 1), etiqueta: `Esta semana (${fmtFecha(inicio)} — ${fmtFecha(hoy)})` };
+      const fin = addDays(inicio, 6);
+      return { gte: inicio, lt: addDays(inicio, 7), etiqueta: `Esta semana (${fmtFecha(inicio)} — ${fmtFecha(fin)})` };
     }
     case 'mes': {
       const inicio = new Date(hoy.getFullYear(), hoy.getMonth(), 1);

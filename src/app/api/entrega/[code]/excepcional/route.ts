@@ -18,6 +18,10 @@ import type { Role } from '@/types';
 const ROLES_PERMITIDOS: Role[] = ['ADMIN', 'ADMIN_CAJA'];
 
 const bodySchema = z.object({
+  // Obligatorio: sin esto, no queda ninguna justificacion de por que se
+  // omitio Recepcion para este paquete (ver especificacion, "Entregas
+  // excepcionales" — nunca se inventa, siempre se pide).
+  motivoExcepcional: z.string().trim().min(1, 'El motivo de la excepción es obligatorio').max(300),
   destinatario: z.string().max(120).optional(),
   destinatarioTelefono: z.string().max(30).optional(),
   destinatarioObservaciones: z.string().max(500).optional(),
@@ -32,9 +36,12 @@ export async function POST(req: Request, { params }: { params: { code: string } 
     return NextResponse.json({ error: 'No tienes permiso para realizar una entrega excepcional.' }, { status: 403 });
   }
 
-  const json = await req.json().catch(() => ({}));
+  const json = await req.json().catch(() => null);
   const parsed = bodySchema.safeParse(json);
-  const opts = parsed.success ? parsed.data : {};
+  if (!parsed.success) {
+    return NextResponse.json({ error: parsed.error.issues[0]?.message ?? 'Datos inválidos.' }, { status: 400 });
+  }
+  const opts = parsed.data;
 
   try {
     const company = await getCompanyConfig();

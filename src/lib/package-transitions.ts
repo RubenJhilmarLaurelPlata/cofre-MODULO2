@@ -86,8 +86,17 @@ export type TipoPago = 'ANTICIPO' | 'COBRO_ENTREGA' | 'AJUSTE';
  * recalcula "estadoPago" comparando lo pagado contra el costo acumulado
  * en este momento (que sigue creciendo con los dias, pagos anticipados
  * no lo congelan — ver especificacion, seccion Pagos anticipados).
+ *
+ * "fecha" (opcional, default "ahora"): SOLO existe para que Importacion
+ * pueda registrar un cobro con la fecha REAL de una entrega historica (ver
+ * crearPaquetesFaltantes/confirmarImportacion en importacion.ts) — sin
+ * esto, un paquete importado con entregaAt del 20/08 terminaba con su
+ * Pago fechado "hoy", y Finanzas lo contaba como cobrado hoy en vez de en
+ * su fecha real (ver especificacion, "Importacion con fechas"). El resto
+ * de los llamadores (Recepcion, Entrega, correcciones) nunca la pasan:
+ * para ellos el movimiento ocurre genuinamente ahora.
  */
-export async function registrarPago(pkg: Package, tipo: TipoPago, montoDelta: number, userId: string | null, motivo?: string): Promise<Package> {
+export async function registrarPago(pkg: Package, tipo: TipoPago, montoDelta: number, userId: string | null, motivo?: string, fecha?: Date): Promise<Package> {
   const [company, feriados] = await Promise.all([getCompanyConfig(), getHolidaySet()]);
   const costoActual = calcularCosto(
     pkg.ingresoAt,
@@ -110,7 +119,7 @@ export async function registrarPago(pkg: Package, tipo: TipoPago, montoDelta: nu
   const [actualizado] = await prisma.$transaction([
     prisma.package.update({ where: { id: pkg.id }, data: { montoPagado: montoNuevo, estadoPago } }),
     prisma.pago.create({
-      data: { packageId: pkg.id, tipo, monto: montoDelta, montoAnterior, montoNuevo, motivo: motivo || null, userId },
+      data: { packageId: pkg.id, tipo, monto: montoDelta, montoAnterior, montoNuevo, motivo: motivo || null, userId, ...(fecha ? { createdAt: fecha } : {}) },
     }),
   ]);
 
@@ -286,6 +295,9 @@ export class SerieNoConfiguradaError extends Error {
 }
 
 export interface EntregaExcepcionalOpts {
+  // Obligatorio: por que este codigo se entrega sin haber pasado por
+  // Recepcion (ver comentario de entregaExcepcional() mas abajo).
+  motivoExcepcional: string;
   destinatario?: string;
   destinatarioTelefono?: string;
   destinatarioObservaciones?: string;
@@ -309,9 +321,11 @@ export interface EntregaExcepcionalOpts {
  * requiere ningun cambio de schema. Dos filas de PackageHistory dejan la
  * trazabilidad explicita: "Recepción omitida" y luego "Entrega
  * excepcional" — nunca se ve igual que una recepcion+entrega normal en el
- * historial.
+ * historial. opts.motivoExcepcional es OBLIGATORIO (validado ya en la
+ * ruta) y queda grabado tal cual en la nota del historial — nunca se
+ * inventa un motivo generico cuando el operador no dio uno real.
  */
-export async function entregaExcepcional(code: string, userId: string, branchId: string, opts?: EntregaExcepcionalOpts): Promise<Package> {
+export async function entregaExcepcional(code: string, userId: string, branchId: string, opts: EntregaExcepcionalOpts): Promise<Package> {
   const codigoNormalizado = normalizarCodigo(code);
   const existente = await prisma.package.findUnique({ where: { codigoNormalizado } });
   if (existente) {
@@ -342,18 +356,18 @@ export async function entregaExcepcional(code: string, userId: string, branchId:
         entregaAt: now,
         tarifaBaseOverride: serie.tarifaBaseOverride,
         registradoPorId: userId,
-        destinatario: opts?.destinatario || null,
-        destinatarioTelefono: opts?.destinatarioTelefono || null,
-        destinatarioObservaciones: opts?.destinatarioObservaciones || null,
-        observaciones: opts?.observaciones || '',
+        destinatario: opts.destinatario || null,
+        destinatarioTelefono: opts.destinatarioTelefono || null,
+        destinatarioObservaciones: opts.destinatarioObservaciones || null,
+        observaciones: opts.observaciones || '',
         origenEntrega: 'EXCEPCIONAL',
       },
     });
     await tx.packageHistory.create({
-      data: { packageId: nuevo.id, estado: 'EN_PAQUETERIA', fecha: now, userId, nota: 'Recepción omitida (entrega excepcional)' },
+      data: { packageId: nuevo.id, estado: 'EN_PAQUETERIA', fecha: now, userId, nota: `Recepción omitida (entrega excepcional): ${opts.motivoExcepcional}` },
     });
     await tx.packageHistory.create({
-      data: { packageId: nuevo.id, estado: 'ENTREGADO', fecha: now, userId, nota: 'Entrega excepcional: paquete no figuraba como recibido' },
+      data: { packageId: nuevo.id, estado: 'ENTREGADO', fecha: now, userId, nota: `Entrega excepcional: paquete no figuraba como recibido — ${opts.motivoExcepcional}` },
     });
     return nuevo;
   }, TRANSACTION_OPTS);
@@ -362,10 +376,10 @@ export async function entregaExcepcional(code: string, userId: string, branchId:
     userId,
     accion: 'ENTREGA_EXCEPCIONAL',
     modulo: 'entrega',
-    valorNuevo: { code: pkg.code, status: pkg.status },
+    valorNuevo: { code: pkg.code, status: pkg.status, motivoExcepcional: opts.motivoExcepcional },
   });
 
-  if (opts?.montoCobrado !== undefined && opts.montoCobrado !== 0) {
+  if (opts.montoCobrado !== undefined && opts.montoCobrado !== 0) {
     return registrarPago(pkg, 'COBRO_ENTREGA', opts.montoCobrado, userId, opts.motivoCobro);
   }
   return pkg;

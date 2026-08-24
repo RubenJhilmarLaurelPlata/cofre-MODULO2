@@ -400,6 +400,18 @@ export interface PagoDetalleDTO {
   createdAt: string;
   motivo: string | null;
   estadoPaquete: string;
+  ingresoAt: string;
+  entregaAt: string | null;
+  // Flags honestas (seccion 1.H/I/J de la especificacion) — nunca se
+  // asume "Pago = entrega": el modelo permite anticipos y ajustes sobre
+  // paquetes en cualquier estado y en cualquier fecha.
+  pagoSinEntregar: boolean;
+  fechaPagoDistintaIngreso: boolean;
+  fechaPagoDistintaEntrega: boolean;
+}
+
+function mismoDia(a: Date, b: Date): boolean {
+  return a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
 }
 
 /** Lista, uno por uno, los movimientos de Pago que componen getResumenFinanciero() para el mismo período — el detalle detrás de "Ingresos", clasificado (entrega normal/excepcional/vía importación, anticipo o ajuste) para no mezclar situaciones distintas. */
@@ -409,7 +421,7 @@ export async function listarPagosPeriodo(rango: RangoFecha): Promise<PagoDetalle
     where: createdAt ? { createdAt } : {},
     orderBy: { createdAt: 'desc' },
     take: 2000,
-    include: { user: { select: { nombre: true } }, package: { select: { code: true, origenEntrega: true, status: true } } },
+    include: { user: { select: { nombre: true } }, package: { select: { code: true, origenEntrega: true, status: true, ingresoAt: true, entregaAt: true } } },
   });
   return pagos.map((p) => {
     const clasificacion = clasificarMovimiento(p.tipo, p.package.origenEntrega);
@@ -423,6 +435,11 @@ export async function listarPagosPeriodo(rango: RangoFecha): Promise<PagoDetalle
       usuario: p.user?.nombre ?? 'Sistema',
       createdAt: p.createdAt.toISOString(),
       motivo: p.motivo,
+      ingresoAt: p.package.ingresoAt.toISOString(),
+      entregaAt: p.package.entregaAt ? p.package.entregaAt.toISOString() : null,
+      pagoSinEntregar: p.package.status !== 'ENTREGADO',
+      fechaPagoDistintaIngreso: !mismoDia(p.createdAt, p.package.ingresoAt),
+      fechaPagoDistintaEntrega: p.package.entregaAt ? !mismoDia(p.createdAt, p.package.entregaAt) : true,
       estadoPaquete: p.package.status,
     };
   });
@@ -527,6 +544,115 @@ export async function getReconciliacion(rango: RangoFecha): Promise<Reconciliaci
       ajustes,
     },
   };
+}
+
+// ---------------------------------------------------------------------
+// Reconciliacion DETALLADA: la comparacion de conjuntos que
+// getReconciliacion() resume en numeros, aqui es por CODIGO — para poder
+// responder, sin asumir nada, exactamente cuales paquetes explican una
+// diferencia entre "entregados" y "cobrados" (ver especificacion, "Prueba
+// especifica 47 vs 88": nunca aceptar "probablemente son anticipos" como
+// respuesta, mostrar el conjunto real).
+// ---------------------------------------------------------------------
+
+export interface PaqueteReconciliadoDTO {
+  codigo: string;
+  status: string;
+  origenEntrega: string | null;
+  ingresoAt: string;
+  entregaAt: string | null;
+  movimientos: Array<{ tipo: string; clasificacionLabel: string; monto: number; createdAt: string; usuario: string }>;
+}
+
+export interface ReconciliacionDetalladaDTO {
+  // Entregados en el periodo (por PackageHistory ENTREGADO) que NO tienen
+  // ningun Pago en este mismo periodo.
+  soloEntregados: PaqueteReconciliadoDTO[];
+  // Tienen algun Pago en el periodo, pero NO fueron entregados en este
+  // mismo periodo (la entrega fue otro dia, o el paquete aun no se
+  // entrega) — este es el conjunto que explica, uno por uno, por que
+  // "cobrados" puede superar a "entregados".
+  soloCobrados: PaqueteReconciliadoDTO[];
+  // Entregados Y con algun Pago, ambos en este mismo periodo.
+  ambos: PaqueteReconciliadoDTO[];
+}
+
+export async function getReconciliacionDetallada(rango: RangoFecha): Promise<ReconciliacionDetalladaDTO> {
+  const fechaFiltro = whereRango(rango);
+
+  const [entregasHist, pagos] = await Promise.all([
+    prisma.packageHistory.findMany({
+      where: { estado: 'ENTREGADO', ...(fechaFiltro ? { fecha: fechaFiltro } : {}) },
+      select: { packageId: true },
+    }),
+    prisma.pago.findMany({
+      where: fechaFiltro ? { createdAt: fechaFiltro } : {},
+      orderBy: { createdAt: 'asc' },
+      select: {
+        packageId: true,
+        tipo: true,
+        monto: true,
+        createdAt: true,
+        user: { select: { nombre: true } },
+        package: { select: { code: true, status: true, origenEntrega: true, ingresoAt: true, entregaAt: true } },
+      },
+    }),
+  ]);
+
+  const entregadosIds = new Set(entregasHist.map((h) => h.packageId));
+  const pagosPorPackage = new Map<string, typeof pagos>();
+  for (const p of pagos) {
+    const lista = pagosPorPackage.get(p.packageId) ?? [];
+    lista.push(p);
+    pagosPorPackage.set(p.packageId, lista);
+  }
+
+  function aDTO(packageId: string): PaqueteReconciliadoDTO {
+    const lista = pagosPorPackage.get(packageId) ?? [];
+    const primero = lista[0];
+    const pkg = primero?.package;
+    return {
+      codigo: pkg?.code ?? packageId,
+      status: pkg?.status ?? '—',
+      origenEntrega: pkg?.origenEntrega ?? null,
+      ingresoAt: pkg?.ingresoAt.toISOString() ?? '',
+      entregaAt: pkg?.entregaAt ? pkg.entregaAt.toISOString() : null,
+      movimientos: lista.map((p) => ({
+        tipo: p.tipo,
+        clasificacionLabel: CLASIFICACION_LABEL[clasificarMovimiento(p.tipo, p.package.origenEntrega)],
+        monto: p.monto,
+        createdAt: p.createdAt.toISOString(),
+        usuario: p.user?.nombre ?? 'Sistema',
+      })),
+    };
+  }
+
+  const soloCobrados: PaqueteReconciliadoDTO[] = [];
+  const ambos: PaqueteReconciliadoDTO[] = [];
+  for (const packageId of pagosPorPackage.keys()) {
+    (entregadosIds.has(packageId) ? ambos : soloCobrados).push(aDTO(packageId));
+  }
+
+  // "Solo entregados" no tiene movimientos de Pago que buscar en el mapa
+  // anterior — se arma directamente desde el propio Package.
+  const idsSoloEntregados = Array.from(entregadosIds).filter((id) => !pagosPorPackage.has(id));
+  const paquetesSoloEntregados =
+    idsSoloEntregados.length > 0
+      ? await prisma.package.findMany({
+          where: { id: { in: idsSoloEntregados } },
+          select: { id: true, code: true, status: true, origenEntrega: true, ingresoAt: true, entregaAt: true },
+        })
+      : [];
+  const soloEntregados: PaqueteReconciliadoDTO[] = paquetesSoloEntregados.map((pkg) => ({
+    codigo: pkg.code,
+    status: pkg.status,
+    origenEntrega: pkg.origenEntrega,
+    ingresoAt: pkg.ingresoAt.toISOString(),
+    entregaAt: pkg.entregaAt ? pkg.entregaAt.toISOString() : null,
+    movimientos: [],
+  }));
+
+  return { soloEntregados, soloCobrados, ambos };
 }
 
 // ---------------------------------------------------------------------

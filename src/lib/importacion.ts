@@ -557,7 +557,10 @@ export async function confirmarImportacion(filas: FilaValidada[], userId: string
         if (!actualizado) return false;
 
         if (fila.monto && fila.monto > 0) {
-          await registrarPago(actualizado, 'COBRO_ENTREGA', fila.monto, userId, 'Importación administrativa');
+          // "entregaAt" (no "ahora"): si el archivo trae fecha, el cobro
+          // debe quedar contabilizado en Finanzas ese dia — nunca hoy (ver
+          // especificacion, "Importacion con fechas").
+          await registrarPago(actualizado, 'COBRO_ENTREGA', fila.monto, userId, 'Importación administrativa', entregaAt);
         }
         return true;
       })
@@ -660,7 +663,8 @@ export async function crearPaquetesFaltantes(filas: FilaValidada[], userId: stri
         }, TRANSACTION_OPTS);
 
         if (fila.monto && fila.monto > 0) {
-          await registrarPago(nuevo, 'COBRO_ENTREGA', fila.monto, userId, 'Importación administrativa (registro faltante)');
+          // "entregaAt" (no "ahora"), mismo motivo que en confirmarImportacion arriba.
+          await registrarPago(nuevo, 'COBRO_ENTREGA', fila.monto, userId, 'Importación administrativa (registro faltante)', entregaAt);
         }
         return { packageId: nuevo.id, code: nuevo.code };
       })
