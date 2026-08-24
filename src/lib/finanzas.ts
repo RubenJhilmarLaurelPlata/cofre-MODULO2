@@ -883,3 +883,191 @@ export async function getAuditoriaFinanciera(rango: RangoFecha): Promise<Auditor
     porOperador,
   };
 }
+
+// ---------------------------------------------------------------------
+// Inconsistencias GLOBALES (sin rango de fechas — son problemas de
+// integridad de datos, no de un periodo): a diferencia de
+// getAuditoriaFinanciera (que solo mira "entregado sin cobro" dentro de un
+// rango), esto escanea toda la base para las comprobaciones que sí tienen
+// sentido sobre el historial completo. Cada chequeo documenta por qué
+// existe y qué significa un resultado — nunca se corrige nada aquí, solo
+// se reporta (ver especificación, "Auditoría de inconsistencias": no
+// autocorregir datos reales).
+// ---------------------------------------------------------------------
+
+export interface InconsistenciaDTO {
+  tipo: string;
+  descripcion: string;
+  codigo: string;
+  fecha: string | null;
+  operador: string | null;
+  monto: number | null;
+  accionRecomendada: string;
+}
+
+const TAKE_INCONSISTENCIAS = 500;
+
+export async function getInconsistenciasGlobales(): Promise<InconsistenciaDTO[]> {
+  const resultado: InconsistenciaDTO[] = [];
+
+  const [
+    entregadosSinPago,
+    multiplesCobroEntrega,
+    ajustesConPagos,
+    todosLosPagosConPaquete,
+    entregasExcepcionales,
+    entregadosSinHistorial,
+    pagosNegativosInvalidos,
+  ] = await Promise.all([
+    // 1) ENTREGADO sin ningun Pago (estructuralmente posible: una entrega
+    // sin montoCobrado no genera Pago).
+    prisma.package.findMany({ where: { status: 'ENTREGADO', montoPagado: { lte: 0 } }, select: { code: true, entregaAt: true }, take: TAKE_INCONSISTENCIAS }),
+    // 4) Mas de un COBRO_ENTREGA para el mismo paquete — no deberia poder
+    // ocurrir (transicionar() es atomico), pero se verifica de verdad en
+    // vez de asumir que la proteccion nunca falla.
+    prisma.pago.groupBy({ by: ['packageId'], where: { tipo: 'COBRO_ENTREGA' }, _count: { _all: true }, having: { packageId: { _count: { gt: 1 } } } }),
+    // 6) AJUSTE sobre un paquete que nunca tuvo COBRO_ENTREGA ni ANTICIPO
+    // — corrige un cobro que nunca existio.
+    prisma.pago.findMany({ where: { tipo: 'AJUSTE' }, select: { packageId: true, monto: true, createdAt: true, userId: true, user: { select: { nombre: true } }, package: { select: { code: true } } } }),
+    // 7) montoPagado guardado vs. lo que realmente suma su propio ledger
+    // de Pago — deberian coincidir siempre por construccion (registrarPago
+    // es el UNICO lugar que toca ambos a la vez); una diferencia real solo
+    // puede venir de una edicion manual de la BD o un bug.
+    prisma.package.findMany({ where: {}, select: { id: true, code: true, montoPagado: true }, take: 5000 }),
+    // 10) Entregas excepcionales cuya nota de historial no quedo con un
+    // motivo real (creadas ANTES de que motivoExcepcional fuera
+    // obligatorio) — no se inventa el motivo, se marca como pendiente.
+    prisma.package.findMany({
+      where: { origenEntrega: 'EXCEPCIONAL' },
+      select: {
+        code: true,
+        entregaAt: true,
+        historial: { where: { estado: 'EN_PAQUETERIA' }, select: { nota: true, userId: true, user: { select: { nombre: true } } }, take: 1 },
+      },
+    }),
+    // 14) Paquete ENTREGADO sin ninguna fila de historial ENTREGADO — no
+    // deberia poder pasar (transicionar() escribe ambos en la misma
+    // transaccion), pero se verifica.
+    prisma.package.findMany({ where: { status: 'ENTREGADO' }, select: { id: true, code: true, entregaAt: true } }),
+    // 13) Pago negativo/invalido fuera de un AJUSTE (un COBRO_ENTREGA o
+    // ANTICIPO nunca deberian ser <= 0 — un ajuste SI puede ser negativo,
+    // eso es una reduccion legitima).
+    prisma.pago.findMany({
+      where: { tipo: { in: ['COBRO_ENTREGA', 'ANTICIPO'] }, monto: { lte: 0 } },
+      select: { monto: true, createdAt: true, userId: true, user: { select: { nombre: true } }, package: { select: { code: true } } },
+    }),
+  ]);
+
+  for (const pkg of entregadosSinPago) {
+    resultado.push({
+      tipo: 'ENTREGADO_SIN_PAGO',
+      descripcion: 'Paquete entregado sin ningún movimiento de Pago asociado.',
+      codigo: pkg.code,
+      fecha: pkg.entregaAt ? pkg.entregaAt.toISOString() : null,
+      operador: null,
+      monto: null,
+      accionRecomendada: 'Revisar si fue una entrega gratuita deliberada o si el operador olvidó registrar el cobro (Finanzas → Corregir cobro).',
+    });
+  }
+
+  for (const dup of multiplesCobroEntrega) {
+    const pkg = await prisma.package.findUnique({ where: { id: dup.packageId }, select: { code: true } });
+    resultado.push({
+      tipo: 'MULTIPLES_COBRO_ENTREGA',
+      descripcion: `Este paquete tiene ${(dup._count as { _all: number })._all} movimientos COBRO_ENTREGA (se espera como máximo 1 por entrega).`,
+      codigo: pkg?.code ?? dup.packageId,
+      fecha: null,
+      operador: null,
+      monto: null,
+      accionRecomendada: 'Revisar manualmente el ledger de Pago de este paquete en Finanzas → Corregir cobro; puede requerir un AJUSTE compensatorio.',
+    });
+  }
+
+  const tienePagoPrevioGenuino = new Map<string, boolean>();
+  for (const p of ajustesConPagos) {
+    if (!tienePagoPrevioGenuino.has(p.packageId)) {
+      const previo = await prisma.pago.findFirst({ where: { packageId: p.packageId, tipo: { in: ['COBRO_ENTREGA', 'ANTICIPO'] } }, select: { id: true } });
+      tienePagoPrevioGenuino.set(p.packageId, !!previo);
+    }
+    if (!tienePagoPrevioGenuino.get(p.packageId)) {
+      resultado.push({
+        tipo: 'AJUSTE_SIN_COBRO_ORIGINAL',
+        descripcion: 'Existe un AJUSTE sobre este paquete pero nunca hubo un COBRO_ENTREGA ni ANTICIPO previo que corregir.',
+        codigo: p.package.code,
+        fecha: p.createdAt.toISOString(),
+        operador: p.user?.nombre ?? 'Sistema',
+        monto: p.monto,
+        accionRecomendada: 'Verificar con quien hizo la corrección si el ajuste realmente correspondía a este paquete.',
+      });
+    }
+  }
+
+  const sumasPorPackage = await prisma.pago.groupBy({ by: ['packageId'], _sum: { monto: true } });
+  const sumaPorId = new Map(sumasPorPackage.map((s) => [s.packageId, Math.round((s._sum.monto ?? 0) * 100) / 100] as const));
+  for (const pkg of todosLosPagosConPaquete) {
+    const sumaLedger = sumaPorId.get(pkg.id) ?? 0;
+    if (Math.round(pkg.montoPagado * 100) !== Math.round(sumaLedger * 100)) {
+      resultado.push({
+        tipo: 'MONTO_PAGADO_DESINCRONIZADO',
+        descripcion: `Package.montoPagado (Bs${pkg.montoPagado.toFixed(2)}) no coincide con la suma real de su ledger de Pago (Bs${sumaLedger.toFixed(2)}).`,
+        codigo: pkg.code,
+        fecha: null,
+        operador: null,
+        monto: pkg.montoPagado,
+        accionRecomendada: 'Investigar si hubo una edición manual de la base de datos fuera de registrarPago(); no corregir automáticamente.',
+      });
+    }
+  }
+
+  for (const pkg of entregasExcepcionales) {
+    const nota = pkg.historial[0]?.nota ?? '';
+    const tieneMotivoReal = nota.includes(':') && nota.split(':').slice(1).join(':').trim().length > 0;
+    if (!tieneMotivoReal) {
+      resultado.push({
+        tipo: 'EXCEPCIONAL_SIN_MOTIVO',
+        descripcion: 'Entrega excepcional registrada antes de que el motivo fuera obligatorio — no queda ninguna justificación real capturada.',
+        codigo: pkg.code,
+        fecha: pkg.entregaAt ? pkg.entregaAt.toISOString() : null,
+        operador: pkg.historial[0]?.user?.nombre ?? null,
+        monto: null,
+        accionRecomendada: 'No se puede reconstruir el motivo retroactivamente sin inventarlo — dejar constancia de que es anterior al fix, no corregir con un texto genérico.',
+      });
+    }
+  }
+
+  const idsConHistorialEntregado = new Set(
+    (
+      await prisma.packageHistory.findMany({
+        where: { estado: 'ENTREGADO', packageId: { in: entregadosSinHistorial.map((p) => p.id) } },
+        select: { packageId: true },
+      })
+    ).map((h) => h.packageId)
+  );
+  for (const pkg of entregadosSinHistorial) {
+    if (!idsConHistorialEntregado.has(pkg.id)) {
+      resultado.push({
+        tipo: 'ENTREGADO_SIN_HISTORIAL',
+        descripcion: 'El paquete tiene status=ENTREGADO pero no existe ninguna fila de PackageHistory con estado ENTREGADO.',
+        codigo: pkg.code,
+        fecha: pkg.entregaAt ? pkg.entregaAt.toISOString() : null,
+        operador: null,
+        monto: null,
+        accionRecomendada: 'Revisar si el estado se modificó manualmente fuera de entregarPaquete()/entregaExcepcional(); no corregir automáticamente.',
+      });
+    }
+  }
+
+  for (const p of pagosNegativosInvalidos) {
+    resultado.push({
+      tipo: 'PAGO_INVALIDO',
+      descripcion: `Movimiento de tipo cobro con monto ${p.monto} (debería ser siempre positivo).`,
+      codigo: p.package.code,
+      fecha: p.createdAt.toISOString(),
+      operador: p.user?.nombre ?? 'Sistema',
+      monto: p.monto,
+      accionRecomendada: 'Revisar manualmente este movimiento; un COBRO_ENTREGA o ANTICIPO nunca debería registrarse en 0 o negativo.',
+    });
+  }
+
+  return resultado;
+}

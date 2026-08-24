@@ -491,8 +491,123 @@ export function AuditoriaTab({ moneda }: { moneda: string }) {
               )}
             </CardContent>
           </Card>
+
+          <InconsistenciasGlobales moneda={moneda} />
         </>
       )}
     </div>
+  );
+}
+
+interface Inconsistencia {
+  tipo: string;
+  descripcion: string;
+  codigo: string;
+  fecha: string | null;
+  operador: string | null;
+  monto: number | null;
+  accionRecomendada: string;
+}
+
+const TIPO_INCONSISTENCIA_LABEL: Record<string, string> = {
+  ENTREGADO_SIN_PAGO: 'Entregado sin pago',
+  MULTIPLES_COBRO_ENTREGA: 'Múltiples cobros de entrega',
+  AJUSTE_SIN_COBRO_ORIGINAL: 'Ajuste sin cobro original',
+  MONTO_PAGADO_DESINCRONIZADO: 'Monto pagado desincronizado',
+  EXCEPCIONAL_SIN_MOTIVO: 'Excepcional sin motivo',
+  ENTREGADO_SIN_HISTORIAL: 'Entregado sin historial',
+  PAGO_INVALIDO: 'Pago inválido',
+};
+
+/**
+ * A diferencia del resto de esta pantalla (todo scoped a un rango de
+ * fechas), esto escanea TODA la base — son problemas de integridad de
+ * datos, no de un periodo puntual. Se carga solo al abrir el panel: es la
+ * seccion mas cara de calcular (recorre todo Package/Pago/PackageHistory).
+ */
+function InconsistenciasGlobales({ moneda }: { moneda: string }) {
+  const [abierto, setAbierto] = React.useState(false);
+  const [cargando, setCargando] = React.useState(false);
+  const [items, setItems] = React.useState<Inconsistencia[] | null>(null);
+
+  async function alAbrir() {
+    const siguiente = !abierto;
+    setAbierto(siguiente);
+    if (siguiente && !items) {
+      setCargando(true);
+      try {
+        const res = await fetch('/api/finanzas/inconsistencias');
+        const data = await res.json();
+        setItems(res.ok ? data.inconsistencias : []);
+      } finally {
+        setCargando(false);
+      }
+    }
+  }
+
+  return (
+    <Card className={items && items.length > 0 ? 'border-amber-300 dark:border-amber-700' : undefined}>
+      <button type="button" onClick={alAbrir} className="flex w-full items-center justify-between px-4 py-3 text-left">
+        <span className="flex items-center gap-2 text-sm font-medium text-ink dark:text-gray-100">
+          {items && items.length > 0 ? (
+            <AlertTriangle className="h-4 w-4 text-amber-600 dark:text-amber-400" />
+          ) : (
+            <CheckCircle2 className="h-4 w-4 text-emerald-600 dark:text-emerald-400" />
+          )}
+          Inconsistencias de integridad (toda la base, no solo este período){items ? ` — ${items.length}` : ''}
+        </span>
+        {abierto ? <ChevronUp className="h-4 w-4 text-gray-400" /> : <ChevronDown className="h-4 w-4 text-gray-400" />}
+      </button>
+      {abierto && (
+        <CardContent className="pt-0">
+          {cargando || !items ? (
+            <div className="flex items-center justify-center py-8 text-gray-400 dark:text-gray-500">
+              <Loader2 className="h-5 w-5 animate-spin" />
+            </div>
+          ) : items.length === 0 ? (
+            <p className="py-6 text-center text-sm text-gray-400 dark:text-gray-500">
+              No se detectó ninguna de las inconsistencias verificadas (entregado sin pago, cobros duplicados, ajuste sin cobro original, montoPagado
+              desincronizado del ledger, excepcional sin motivo, entregado sin historial, pago inválido).
+            </p>
+          ) : (
+            <div className="scrollbar-thin overflow-x-auto rounded-lg border border-amber-200 dark:border-amber-800">
+              <table className="w-full min-w-[820px] text-left text-sm">
+                <thead>
+                  <tr className="bg-amber-50 dark:bg-amber-500/10">
+                    <th className="px-3 py-2 text-xs font-semibold text-amber-700 dark:text-amber-400">Tipo</th>
+                    <th className="px-3 py-2 text-xs font-semibold text-amber-700 dark:text-amber-400">Código</th>
+                    <th className="px-3 py-2 text-xs font-semibold text-amber-700 dark:text-amber-400">Descripción</th>
+                    <th className="px-3 py-2 text-xs font-semibold text-amber-700 dark:text-amber-400">Fecha</th>
+                    <th className="px-3 py-2 text-xs font-semibold text-amber-700 dark:text-amber-400">Operador</th>
+                    <th className="px-3 py-2 text-xs font-semibold text-amber-700 dark:text-amber-400">Acción recomendada</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-amber-100 dark:divide-amber-900/40">
+                  {items.map((it, i) => (
+                    <tr key={i}>
+                      <td className="whitespace-nowrap px-3 py-2 text-xs font-semibold text-ink dark:text-gray-100">
+                        {TIPO_INCONSISTENCIA_LABEL[it.tipo] ?? it.tipo}
+                      </td>
+                      <td className="whitespace-nowrap px-3 py-2 font-mono text-xs text-ink dark:text-gray-100">{it.codigo}</td>
+                      <td className="max-w-[260px] px-3 py-2 text-xs text-ink-soft dark:text-gray-400">
+                        {it.descripcion}
+                        {it.monto !== null && (
+                          <span className="ml-1 font-semibold text-ink dark:text-gray-100">
+                            ({moneda} {it.monto.toFixed(2)})
+                          </span>
+                        )}
+                      </td>
+                      <td className="whitespace-nowrap px-3 py-2 text-xs text-gray-400 dark:text-gray-500">{fmtFechaHora(it.fecha)}</td>
+                      <td className="whitespace-nowrap px-3 py-2 text-xs text-ink-soft dark:text-gray-400">{it.operador ?? '—'}</td>
+                      <td className="max-w-[260px] px-3 py-2 text-xs text-gray-400 dark:text-gray-500">{it.accionRecomendada}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </CardContent>
+      )}
+    </Card>
   );
 }
