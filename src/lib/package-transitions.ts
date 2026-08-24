@@ -95,40 +95,50 @@ export type TipoPago = 'ANTICIPO' | 'COBRO_ENTREGA' | 'AJUSTE';
  * su fecha real (ver especificacion, "Importacion con fechas"). El resto
  * de los llamadores (Recepcion, Entrega, correcciones) nunca la pasan:
  * para ellos el movimiento ocurre genuinamente ahora.
+ *
+ * Vuelve a leer el paquete DENTRO de la transaccion interactiva (mismo
+ * criterio que corregirCobroAbsoluto(), ver comentario ahi) en vez de
+ * confiar en el "pkg" que el llamador leyo hace un rato: con SQLite en
+ * connection_limit=1 eso serializa dos registrarPago() casi simultaneos
+ * sobre el mismo paquete, asi que el segundo siempre calcula su delta
+ * sobre el montoPagado YA actualizado por el primero. Sin esto, dos
+ * cobros de Bs2 casi simultaneos podian escribir cada uno "montoNuevo =
+ * montoAnterior(obsoleto) + 2" y el segundo pisaba el resultado del
+ * primero — las dos filas de Pago quedaban igual (el ledger nunca se
+ * pierde), pero Package.montoPagado terminaba en Bs2 en vez de Bs4.
  */
 export async function registrarPago(pkg: Package, tipo: TipoPago, montoDelta: number, userId: string | null, motivo?: string, fecha?: Date): Promise<Package> {
   const [company, feriados] = await Promise.all([getCompanyConfig(), getHolidaySet()]);
-  const costoActual = calcularCosto(
-    pkg.ingresoAt,
-    fechaReferencia(pkg),
-    { tarifaBase: company.tarifaBase, diasIncluidos: company.diasIncluidos, costoAdicionalDia: company.costoAdicionalDia },
-    feriados,
-    pkg.tarifaBaseOverride,
-    pkg.diasIncluidosOverride
-  ).total;
 
-  const montoAnterior = pkg.montoPagado;
-  const montoNuevo = Math.round((montoAnterior + montoDelta) * 100) / 100;
-  const estadoPago: PaymentStatus = montoNuevo <= 0 ? 'PENDIENTE' : montoNuevo >= costoActual ? 'PAGADO' : 'PARCIAL';
+  const actualizado = await prisma.$transaction(async (tx) => {
+    const actual = await tx.package.findUniqueOrThrow({ where: { id: pkg.id } });
 
-  // Nota: la forma "array" de $transaction (a diferencia de la forma con
-  // callback de arriba) no acepta maxWait/timeout en esta version de
-  // Prisma — no hace falta: al ser un solo round-trip batched, no sufre
-  // la misma contencion bajo rafagas que una transaccion interactiva mas
-  // larga.
-  const [actualizado] = await prisma.$transaction([
-    prisma.package.update({ where: { id: pkg.id }, data: { montoPagado: montoNuevo, estadoPago } }),
-    prisma.pago.create({
-      data: { packageId: pkg.id, tipo, monto: montoDelta, montoAnterior, montoNuevo, motivo: motivo || null, userId, ...(fecha ? { createdAt: fecha } : {}) },
-    }),
-  ]);
+    const costoActual = calcularCosto(
+      actual.ingresoAt,
+      fechaReferencia(actual),
+      { tarifaBase: company.tarifaBase, diasIncluidos: company.diasIncluidos, costoAdicionalDia: company.costoAdicionalDia },
+      feriados,
+      actual.tarifaBaseOverride,
+      actual.diasIncluidosOverride
+    ).total;
+
+    const montoAnterior = actual.montoPagado;
+    const montoNuevo = Math.round((montoAnterior + montoDelta) * 100) / 100;
+    const estadoPago: PaymentStatus = montoNuevo <= 0 ? 'PENDIENTE' : montoNuevo >= costoActual ? 'PAGADO' : 'PARCIAL';
+
+    const nuevo = await tx.package.update({ where: { id: actual.id }, data: { montoPagado: montoNuevo, estadoPago } });
+    await tx.pago.create({
+      data: { packageId: actual.id, tipo, monto: montoDelta, montoAnterior, montoNuevo, motivo: motivo || null, userId, ...(fecha ? { createdAt: fecha } : {}) },
+    });
+    return nuevo;
+  }, TRANSACTION_OPTS);
 
   await registrarAuditoria({
     userId: userId ?? undefined,
     accion: `PAGO_${tipo}`,
     modulo: 'finanzas',
-    valorAnterior: { code: pkg.code, montoPagado: montoAnterior },
-    valorNuevo: { code: pkg.code, montoPagado: montoNuevo, motivo: motivo || undefined },
+    valorAnterior: { code: pkg.code, montoPagado: pkg.montoPagado },
+    valorNuevo: { code: pkg.code, montoPagado: actualizado.montoPagado, motivo: motivo || undefined },
   });
 
   return actualizado;

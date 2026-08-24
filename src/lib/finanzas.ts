@@ -5,7 +5,7 @@
 // dinero cobrado: la suma de los movimientos en Pago (anticipos, cobros
 // en entrega y ajustes) que efectivamente ocurrieron en el periodo. Es la
 // fuente de verdad para "cuanto dinero entro" y para el cierre de caja.
-import { prisma } from '@/lib/prisma';
+import { prisma, TRANSACTION_OPTS } from '@/lib/prisma';
 import { registrarPago } from '@/lib/package-transitions';
 import { registrarAuditoria } from '@/lib/auditoria';
 import { getCompanyConfig } from '@/lib/config';
@@ -153,25 +153,6 @@ export async function listarCierresCaja(): Promise<CierreCajaDTO[]> {
   return cierres.map(toCierreCajaDTO);
 }
 
-/** Congela ingresos/gastos/resultado neto del periodo [fechaInicio, fechaFin) en una fila que ya no se puede alterar silenciosamente (ver especificación, "Cierre de caja"). */
-export async function realizarCierreCaja(fechaInicio: Date, fechaFin: Date, userId: string): Promise<CierreCajaDTO> {
-  const resumen = await getResumenFinanciero({ desde: fechaInicio, hasta: fechaFin });
-  const cierre = await prisma.cierreCaja.create({
-    data: {
-      fechaInicio,
-      fechaFin,
-      ingresos: resumen.ingresos,
-      gastos: resumen.gastos,
-      ajustes: resumen.ajustes,
-      resultadoNeto: resumen.resultadoNeto,
-      paquetesCobrados: resumen.paquetesCobrados,
-      userId,
-    },
-    include: { user: { select: { nombre: true } } },
-  });
-  return toCierreCajaDTO(cierre);
-}
-
 // ---------------------------------------------------------------------
 // Ciclo de caja: ABIERTA / CERRADA
 // ---------------------------------------------------------------------
@@ -189,20 +170,33 @@ export interface EstadoCajaDTO {
   resumen: ResumenFinanciero;
 }
 
+/**
+ * find-then-create envuelto en una transaccion interactiva: con SQLite en
+ * connection_limit=1 (ver .env.example) esto es lo que realmente impide
+ * dos CajaSesion abiertas simultaneas — la transaccion ocupa la unica
+ * conexion durante todo el find+create, asi que una segunda llamada
+ * concurrente no puede ni empezar su propio find hasta que esta termine
+ * (mismo criterio ya usado en corregirCobroAbsoluto, ver
+ * package-transitions.ts). Sin la transaccion, dos requests casi
+ * simultaneas podian intercalar sus find (ninguno ve la sesion del otro
+ * todavia) y terminar creando dos sesiones abiertas a la vez.
+ */
 async function crearSesionSiNoHay(userId: string | null): Promise<{ id: string; abiertaAt: Date; abiertoPor: { nombre: string } | null }> {
-  const abierta = await prisma.cajaSesion.findFirst({
-    where: { cerradaAt: null },
-    orderBy: { abiertaAt: 'desc' },
-    include: { abiertaPor: { select: { nombre: true } } },
-  });
-  if (abierta) {
-    return { id: abierta.id, abiertaAt: abierta.abiertaAt, abiertoPor: abierta.abiertaPor };
-  }
-  const nueva = await prisma.cajaSesion.create({
-    data: { abiertaPorId: userId },
-    include: { abiertaPor: { select: { nombre: true } } },
-  });
-  return { id: nueva.id, abiertaAt: nueva.abiertaAt, abiertoPor: nueva.abiertaPor };
+  return prisma.$transaction(async (tx) => {
+    const abierta = await tx.cajaSesion.findFirst({
+      where: { cerradaAt: null },
+      orderBy: { abiertaAt: 'desc' },
+      include: { abiertaPor: { select: { nombre: true } } },
+    });
+    if (abierta) {
+      return { id: abierta.id, abiertaAt: abierta.abiertaAt, abiertoPor: abierta.abiertaPor };
+    }
+    const nueva = await tx.cajaSesion.create({
+      data: { abiertaPorId: userId },
+      include: { abiertaPor: { select: { nombre: true } } },
+    });
+    return { id: nueva.id, abiertaAt: nueva.abiertaAt, abiertoPor: nueva.abiertaPor };
+  }, TRANSACTION_OPTS);
 }
 
 /** Estado actual de caja: siempre "abierta" desde el punto de vista del llamador — si no habia ninguna sesion, esta funcion crea una transparente. Nunca lanza, nunca bloquea. */
@@ -217,12 +211,14 @@ export async function getEstadoCajaActual(): Promise<EstadoCajaDTO> {
   };
 }
 
-/** "Abrir caja" explicito: idempotente — si ya hay una sesion abierta, la devuelve tal cual (nunca crea una segunda). */
+/** "Abrir caja" explicito: idempotente — si ya hay una sesion abierta, la devuelve tal cual (nunca crea una segunda). Misma proteccion transaccional que crearSesionSiNoHay(), ver comentario ahi. */
 export async function abrirCajaSesion(userId: string): Promise<EstadoCajaDTO> {
-  const yaAbierta = await prisma.cajaSesion.findFirst({ where: { cerradaAt: null } });
-  if (!yaAbierta) {
-    await prisma.cajaSesion.create({ data: { abiertaPorId: userId } });
-  }
+  await prisma.$transaction(async (tx) => {
+    const yaAbierta = await tx.cajaSesion.findFirst({ where: { cerradaAt: null } });
+    if (!yaAbierta) {
+      await tx.cajaSesion.create({ data: { abiertaPorId: userId } });
+    }
+  }, TRANSACTION_OPTS);
   return getEstadoCajaActual();
 }
 
@@ -233,9 +229,11 @@ export interface CerrarCajaOpts {
 
 /**
  * Cierra la sesion de caja actualmente abierta (congela el periodo
- * [abiertaAt, ahora) en un CierreCaja, igual criterio que
- * realizarCierreCaja) y abre la siguiente de inmediato — la caja nunca
- * queda en un limbo "cerrada para siempre" esperando una accion manual.
+ * [abiertaAt, ahora) en un CierreCaja) y abre la siguiente de inmediato —
+ * la caja nunca queda en un limbo "cerrada para siempre" esperando una
+ * accion manual. Es la UNICA forma de crear un CierreCaja: no existe (ni
+ * debe volver a existir) una via que cree uno sobre un rango arbitrario
+ * sin pasar por una CajaSesion real (ver auditoria del modulo de Caja).
  * userId=null identifica un cierre disparado por el sistema (cierre
  * automatico o la reapertura que sigue a cualquier cierre).
  */
