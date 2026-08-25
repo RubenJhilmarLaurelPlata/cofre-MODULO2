@@ -25,7 +25,9 @@ const bodySchema = z.object({
     .max(4)
     .regex(/^[A-Z]+$/, 'La inicial solo puede tener letras'),
   descripcion: z.string().trim().min(1, 'La descripción es requerida').max(120),
-  tarifaBaseOverride: z.number().min(0).max(1_000_000).nullable().optional(),
+  // Entero, mismo criterio que tarifaBase en tarifas/route.ts: el costo
+  // nunca debe generar centavos.
+  tarifaBaseOverride: z.number().int().min(0).max(1_000_000).nullable().optional(),
 });
 
 export async function POST(req: Request) {

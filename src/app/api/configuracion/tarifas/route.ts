@@ -28,9 +28,13 @@ export async function GET() {
 }
 
 const bodySchema = z.object({
-  tarifaBase: z.number().min(0).max(1_000_000),
+  // Enteros: la especificacion es explicita en que el costo por dia
+  // nunca genera centavos ni se prorratea (ver pricing.ts:calcularCosto,
+  // que suma estos valores directamente sin dividir nada) — permitir un
+  // valor fraccionario aqui filtraria centavos a cada paquete calculado.
+  tarifaBase: z.number().int().min(0).max(1_000_000),
   diasIncluidos: z.number().int().min(0).max(365),
-  costoAdicionalDia: z.number().min(0).max(1_000_000),
+  costoAdicionalDia: z.number().int().min(0).max(1_000_000),
   // Lista separada por comas de montos rapidos en Recepcion, ej "2,3,5,7".
   montosPagoRapido: z
     .string()

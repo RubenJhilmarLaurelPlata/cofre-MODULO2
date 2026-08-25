@@ -73,11 +73,26 @@ export function RecepcionClient({ moneda, tarifaBase, montosRapidos, series, ing
   // escaneos legitimos de codigos distintos o del mismo codigo mas tarde.
   const ultimoRegistradoRef = React.useRef<{ code: string; at: number } | null>(null);
 
-  // Cliente/foto/pago/recoge (opcionales): se mantienen entre escaneos
-  // para que varios paquetes de la misma persona no obliguen a
-  // reescribir los datos — ver ClientePagoPanel/QuienRecogePanel. La foto
-  // y la descripcion se limpian despues de cada registro exitoso porque
-  // son especificas de cada paquete fisico.
+  // Cliente/recoge (opcionales): se mantienen entre escaneos para que
+  // varios paquetes de la misma persona no obliguen a reescribir los
+  // datos — ver ClientePagoPanel/QuienRecogePanel. La foto y la
+  // descripcion se limpian despues de cada registro exitoso porque son
+  // especificas de cada paquete fisico.
+  //
+  // "pago" es la EXCEPCION deliberada: hasta esta version se mantenia
+  // igual que cliente/recoge (para no reescribir "Pagado Bs5" en varios
+  // paquetes del mismo cliente), pero eso significaba que si el operador
+  // olvidaba resetearlo antes de escanear el paquete de OTRO cliente que
+  // no pago, ese paquete quedaba marcado PAGADO sin que nadie hubiera
+  // pagado — riesgo financiero real, confirmado como regla de negocio
+  // explicita: cada paquete nuevo SIEMPRE empieza "Por pagar" con la
+  // tarifa base, nunca hereda el estado del anterior. Si el mismo cliente
+  // trae varios paquetes pagados juntos, el operador vuelve a marcar
+  // "Pagado" en cada uno — la comodidad de no reescribirlo ya no
+  // justifica el riesgo de heredarlo por error. Ver registrar(), donde se
+  // resetea a PAGO_VACIO apenas se acepta cada escaneo (igual momento en
+  // que se limpia "valor", nunca despues de esperar la respuesta del
+  // servidor).
   const [cliente, setCliente] = React.useState<ClienteForm>(CLIENTE_VACIO);
   const [clienteId, setClienteId] = React.useState<string | null>(null);
   const [recoge, setRecoge] = React.useState<RecogeForm>(RECOGE_VACIO);
@@ -178,6 +193,13 @@ export function RecepcionClient({ moneda, tarifaBase, montosRapidos, series, ing
       enLoteActivo: loteActivo,
       snapshot: { clienteId, cliente, foto, descripcion, recoge, pago },
     });
+
+    // Reset inmediato (no espera la respuesta del servidor, igual criterio
+    // que "setValor('')" arriba): el paquete que se acaba de aceptar ya
+    // guardo su propia condicion de pago en "snapshot" para su llamada a
+    // la API, asi que resetear el estado EN VIVO aqui no le cambia nada a
+    // el — solo evita que el SIGUIENTE escaneo la herede por accidente.
+    setPago(PAGO_VACIO);
   }
 
   async function procesarUno({ code, snapshot, enLoteActivo }: EscaneoEncolado) {
