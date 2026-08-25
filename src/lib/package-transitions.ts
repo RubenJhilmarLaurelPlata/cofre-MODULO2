@@ -10,7 +10,8 @@ import { getCompanyConfig, getHolidaySet } from '@/lib/config';
 import { calcularCosto } from '@/lib/pricing';
 import { fechaReferencia } from '@/lib/package-detail';
 import type { Package } from '@prisma/client';
-import type { PackageStatus, PaymentStatus } from '@/types';
+import type { PackageStatus, PaymentStatus, MotivoEntregaExcepcional } from '@/types';
+import { MOTIVO_ENTREGA_EXCEPCIONAL_LABEL } from '@/types';
 
 export class TransicionInvalidaError extends Error {
   constructor(message: string) {
@@ -307,7 +308,10 @@ export class SerieNoConfiguradaError extends Error {
 export interface EntregaExcepcionalOpts {
   // Obligatorio: por que este codigo se entrega sin haber pasado por
   // Recepcion (ver comentario de entregaExcepcional() mas abajo).
-  motivoExcepcional: string;
+  motivoExcepcional: MotivoEntregaExcepcional;
+  // Obligatorio solo cuando motivoExcepcional==='OTRO' (validado en la
+  // ruta) — el detalle libre que las 3 opciones fijas no cubren.
+  motivoDetalle?: string;
   destinatario?: string;
   destinatarioTelefono?: string;
   destinatarioObservaciones?: string;
@@ -353,6 +357,10 @@ export async function entregaExcepcional(code: string, userId: string, branchId:
   }
 
   const now = new Date();
+  const motivoTexto =
+    opts.motivoExcepcional === 'OTRO' && opts.motivoDetalle?.trim()
+      ? `Otro: ${opts.motivoDetalle.trim()}`
+      : MOTIVO_ENTREGA_EXCEPCIONAL_LABEL[opts.motivoExcepcional];
 
   const pkg = await prisma.$transaction(async (tx) => {
     const nuevo = await tx.package.create({
@@ -374,10 +382,10 @@ export async function entregaExcepcional(code: string, userId: string, branchId:
       },
     });
     await tx.packageHistory.create({
-      data: { packageId: nuevo.id, estado: 'EN_PAQUETERIA', fecha: now, userId, nota: `Recepción omitida (entrega excepcional): ${opts.motivoExcepcional}` },
+      data: { packageId: nuevo.id, estado: 'EN_PAQUETERIA', fecha: now, userId, nota: `Recepción omitida (entrega excepcional): ${motivoTexto}` },
     });
     await tx.packageHistory.create({
-      data: { packageId: nuevo.id, estado: 'ENTREGADO', fecha: now, userId, nota: `Entrega excepcional: paquete no figuraba como recibido — ${opts.motivoExcepcional}` },
+      data: { packageId: nuevo.id, estado: 'ENTREGADO', fecha: now, userId, nota: `Entrega excepcional: paquete no figuraba como recibido — ${motivoTexto}` },
     });
     return nuevo;
   }, TRANSACTION_OPTS);
@@ -386,11 +394,36 @@ export async function entregaExcepcional(code: string, userId: string, branchId:
     userId,
     accion: 'ENTREGA_EXCEPCIONAL',
     modulo: 'entrega',
-    valorNuevo: { code: pkg.code, status: pkg.status, motivoExcepcional: opts.motivoExcepcional },
+    valorNuevo: { code: pkg.code, status: pkg.status, motivoExcepcional: opts.motivoExcepcional, motivoTexto },
   });
 
-  if (opts.montoCobrado !== undefined && opts.montoCobrado !== 0) {
-    return registrarPago(pkg, 'COBRO_ENTREGA', opts.montoCobrado, userId, opts.motivoCobro);
+  // Una entrega excepcional SIGUE SIENDO UNA ENTREGA: el paquete se
+  // llevo, así que corresponde cobrar, igual que en una entrega normal.
+  // Si el operador especifico un monto explicito (incluido Bs0, una
+  // decision deliberada de no cobrar), se respeta tal cual. Si no
+  // especifico nada, se cobra automaticamente la tarifa que le
+  // corresponde a este paquete en este momento — nunca se entrega
+  // "gratis" por omision. Con ingresoAt=entregaAt=ahora (0 dias
+  // transcurridos), esto es exactamente la tarifa base (o su override de
+  // serie), sin dias extra.
+  if (opts.montoCobrado !== undefined) {
+    if (opts.montoCobrado !== 0) {
+      return registrarPago(pkg, 'COBRO_ENTREGA', opts.montoCobrado, userId, opts.motivoCobro);
+    }
+    return pkg;
+  }
+
+  const [company, feriados] = await Promise.all([getCompanyConfig(), getHolidaySet()]);
+  const costoActual = calcularCosto(
+    pkg.ingresoAt,
+    fechaReferencia(pkg),
+    { tarifaBase: company.tarifaBase, diasIncluidos: company.diasIncluidos, costoAdicionalDia: company.costoAdicionalDia },
+    feriados,
+    pkg.tarifaBaseOverride,
+    pkg.diasIncluidosOverride
+  ).total;
+  if (costoActual > 0) {
+    return registrarPago(pkg, 'COBRO_ENTREGA', costoActual, userId, opts.motivoCobro);
   }
   return pkg;
 }

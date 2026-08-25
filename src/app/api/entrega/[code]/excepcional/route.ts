@@ -13,22 +13,29 @@ import { prisma } from '@/lib/prisma';
 import { canonicalizarSeparadores } from '@/lib/codigo';
 import { entregaExcepcional, TransicionInvalidaError, SerieNoConfiguradaError } from '@/lib/package-transitions';
 import { getPackageDetail } from '@/lib/package-detail';
-import type { Role } from '@/types';
+import { MOTIVOS_ENTREGA_EXCEPCIONAL, type Role } from '@/types';
 
 const ROLES_PERMITIDOS: Role[] = ['ADMIN', 'ADMIN_CAJA'];
 
-const bodySchema = z.object({
-  // Obligatorio: sin esto, no queda ninguna justificacion de por que se
-  // omitio Recepcion para este paquete (ver especificacion, "Entregas
-  // excepcionales" — nunca se inventa, siempre se pide).
-  motivoExcepcional: z.string().trim().min(1, 'El motivo de la excepción es obligatorio').max(300),
-  destinatario: z.string().max(120).optional(),
-  destinatarioTelefono: z.string().max(30).optional(),
-  destinatarioObservaciones: z.string().max(500).optional(),
-  observaciones: z.string().max(500).optional(),
-  montoCobrado: z.number().finite().optional(),
-  motivoCobro: z.string().max(200).optional(),
-});
+const bodySchema = z
+  .object({
+    // Opciones estructuradas, no texto libre (ver especificacion, "Motivo
+    // de entrega excepcional" — el motivo es trazabilidad de por que se
+    // omitio Recepcion, nunca una decision sobre si corresponde cobrar).
+    motivoExcepcional: z.enum(MOTIVOS_ENTREGA_EXCEPCIONAL, { errorMap: () => ({ message: 'Selecciona un motivo válido.' }) }),
+    // Solo obligatorio cuando motivoExcepcional==='OTRO' (validado abajo).
+    motivoDetalle: z.string().trim().max(300).optional(),
+    destinatario: z.string().max(120).optional(),
+    destinatarioTelefono: z.string().max(30).optional(),
+    destinatarioObservaciones: z.string().max(500).optional(),
+    observaciones: z.string().max(500).optional(),
+    montoCobrado: z.number().finite().optional(),
+    motivoCobro: z.string().max(200).optional(),
+  })
+  .refine((v) => v.motivoExcepcional !== 'OTRO' || !!v.motivoDetalle?.trim(), {
+    message: 'Escribe el detalle del motivo cuando seleccionas "Otro".',
+    path: ['motivoDetalle'],
+  });
 
 export async function POST(req: Request, { params }: { params: { code: string } }) {
   const session = await getSession();

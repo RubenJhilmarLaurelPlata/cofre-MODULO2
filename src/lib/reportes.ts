@@ -253,13 +253,37 @@ export async function getReporteFinanciero(filtros: FiltrosReporte): Promise<Rep
   const [company, feriados] = await reglasYFeriados();
   const reglas = { tarifaBase: company.tarifaBase, diasIncluidos: company.diasIncluidos, costoAdicionalDia: company.costoAdicionalDia };
 
-  const where: Prisma.PackageWhereInput = { ...filtrosComunesPaquete(filtros), ingresoAt: { gte, lt } };
-  const [paquetes, resumen] = await Promise.all([
+  const comunes = filtrosComunesPaquete(filtros);
+  // "entregados"/"denegados" se calculan por su PROPIO evento (entregaAt/
+  // denegadoAt), NUNCA derivados de un conjunto filtrado por ingresoAt —
+  // ese era exactamente el bug ya corregido en getReportePaquetes()
+  // (ver commit c503336): un paquete ingresado ayer y entregado hoy debe
+  // contar aqui como entregado hoy, aunque su ingreso no caiga en el
+  // rango consultado. Este reporte (Financiero) tenia el MISMO defecto en
+  // una funcion separada, sin tocar por aquel fix — confirmado que
+  // "Paquetes entregados" podia mostrar un numero muy distinto al de
+  // "Total entregados (en el periodo)" de getReportePaquetes() por esta
+  // misma razon.
+  const [entregados, denegados, activos, resumen] = await Promise.all([
     prisma.package.findMany({
-      where,
+      where: { ...comunes, entregaAt: { gte, lt } },
       include: { registradoPor: { select: { nombre: true } } },
-      orderBy: { ingresoAt: 'desc' },
+      orderBy: { entregaAt: 'desc' },
       take: 2000,
+    }),
+    prisma.package.findMany({
+      where: { ...comunes, denegadoAt: { gte, lt } },
+      select: { id: true },
+    }),
+    // A diferencia de entregados/denegados, "activos" SI se mantiene
+    // acotado por ingresoAt en el periodo — es la base real de "Pendiente
+    // por cobrar (de lo recibido en el periodo)" mas abajo, una pregunta
+    // deliberadamente distinta a "cuanto hay en total ahora mismo"
+    // (eso ya lo responde Dashboard/getReportePaquetes con su propio
+    // "estado actual"): esta es "de lo que entro en esta ventana, cuanto
+    // sigue sin entregar".
+    prisma.package.findMany({
+      where: { ...comunes, ingresoAt: { gte, lt }, status: { in: ['EN_PAQUETERIA', 'EN_DEPOSITO', 'PENDIENTE_BAJAR'] } },
     }),
     // "Cobrado" real del periodo: SIEMPRE getResumenFinanciero (el libro de
     // Pago), la misma fuente exacta que usan Dashboard y Finanzas — nunca
@@ -273,10 +297,6 @@ export async function getReporteFinanciero(filtros: FiltrosReporte): Promise<Rep
     // del pago).
     getResumenFinanciero({ desde: gte, hasta: lt }),
   ]);
-
-  const entregados = paquetes.filter((p) => p.status === 'ENTREGADO');
-  const activos = paquetes.filter((p) => ['EN_PAQUETERIA', 'EN_DEPOSITO', 'PENDIENTE_BAJAR'].includes(p.status));
-  const denegados = paquetes.filter((p) => p.status === 'DENEGADO');
 
   const cobrado = resumen.ingresos;
   // "Pendiente"/"potencial" son deliberadamente distintos de "cobrado":
@@ -334,9 +354,9 @@ export async function getReporteFinanciero(filtros: FiltrosReporte): Promise<Rep
       { label: 'Resultado neto', value: `${company.moneda} ${resumen.resultadoNeto.toFixed(2)}` },
       { label: 'Paquetes cobrados (con algún pago)', value: String(resumen.paquetesCobrados) },
       { label: 'Pendiente por cobrar (de lo recibido en el período)', value: `${company.moneda} ${pendiente.toFixed(2)}` },
-      { label: 'Paquetes entregados', value: String(entregados.length) },
-      { label: 'Paquetes activos (pendientes)', value: String(activos.length) },
-      { label: 'Paquetes denegados', value: String(denegados.length) },
+      { label: 'Paquetes entregados (en el período)', value: String(entregados.length) },
+      { label: 'Paquetes activos (ingresados en el período, aún sin entregar)', value: String(activos.length) },
+      { label: 'Paquetes denegados (en el período)', value: String(denegados.length) },
     ],
     serie: { titulo: 'Cobrado por día', nombreValor: 'Cobrado', puntos },
     tablas: [

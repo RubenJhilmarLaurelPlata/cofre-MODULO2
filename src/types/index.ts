@@ -16,6 +16,23 @@ export type PackageStatus = (typeof PACKAGE_STATUSES)[number];
 export const PAYMENT_STATUSES = ['PENDIENTE', 'PARCIAL', 'PAGADO'] as const;
 export type PaymentStatus = (typeof PAYMENT_STATUSES)[number];
 
+// Motivo de una entrega excepcional (ver entregaExcepcional() en
+// src/lib/package-transitions.ts): opciones estructuradas, no texto
+// libre — el motivo es trazabilidad de por que se omitio Recepcion,
+// nunca una decision sobre si corresponde cobrar. "OTRO" es la unica que
+// admite un detalle libre adicional. Aqui (no en package-transitions.ts,
+// que usa Prisma) porque tanto el frontend ('use client') como el
+// backend necesitan el mismo conjunto de valores.
+export const MOTIVOS_ENTREGA_EXCEPCIONAL = ['NO_REGISTRADO_AL_INGRESAR', 'ERROR_DE_REGISTRO', 'AUTORIZACION_ADMINISTRATIVA', 'OTRO'] as const;
+export type MotivoEntregaExcepcional = (typeof MOTIVOS_ENTREGA_EXCEPCIONAL)[number];
+
+export const MOTIVO_ENTREGA_EXCEPCIONAL_LABEL: Record<MotivoEntregaExcepcional, string> = {
+  NO_REGISTRADO_AL_INGRESAR: 'No se registró al ingresar',
+  ERROR_DE_REGISTRO: 'Error de registro',
+  AUTORIZACION_ADMINISTRATIVA: 'Autorización administrativa',
+  OTRO: 'Otro',
+};
+
 /** Lo que guardamos dentro del JWT y devolvemos como "sesion" en el servidor. */
 export interface SessionUser {
   id: string;
