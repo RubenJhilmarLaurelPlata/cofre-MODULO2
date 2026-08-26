@@ -9,7 +9,7 @@ import { normalizarCodigo } from '@/lib/codigo';
 import { getCompanyConfig, getHolidaySet } from '@/lib/config';
 import { calcularCosto } from '@/lib/pricing';
 import { fechaReferencia } from '@/lib/package-detail';
-import type { Package } from '@prisma/client';
+import type { Package, Prisma } from '@prisma/client';
 import type { PackageStatus, PaymentStatus, MotivoEntregaExcepcional } from '@/types';
 import { MOTIVO_ENTREGA_EXCEPCIONAL_LABEL } from '@/types';
 
@@ -80,6 +80,34 @@ async function transicionar(
 export type TipoPago = 'ANTICIPO' | 'COBRO_ENTREGA' | 'AJUSTE';
 
 /**
+ * Nucleo compartido de "aplicar un movimiento de dinero", usado DENTRO de
+ * una transaccion ya abierta por el llamador (registrarPago() abre la
+ * suya propia; entregaExcepcional() la reutiliza dentro de la MISMA
+ * transaccion que crea el paquete — ver comentario ahi de por que esto
+ * tiene que ser atomico). Nunca se exporta: solo existe para no duplicar
+ * esta logica en los dos lugares que la necesitan.
+ */
+async function aplicarPagoEnTx(
+  tx: Prisma.TransactionClient,
+  packageId: string,
+  montoAnterior: number,
+  montoDelta: number,
+  costoActual: number,
+  tipo: TipoPago,
+  userId: string | null,
+  motivo?: string,
+  fecha?: Date
+): Promise<Package> {
+  const montoNuevo = Math.round((montoAnterior + montoDelta) * 100) / 100;
+  const estadoPago: PaymentStatus = montoNuevo <= 0 ? 'PENDIENTE' : montoNuevo >= costoActual ? 'PAGADO' : 'PARCIAL';
+  const actualizado = await tx.package.update({ where: { id: packageId }, data: { montoPagado: montoNuevo, estadoPago } });
+  await tx.pago.create({
+    data: { packageId, tipo, monto: montoDelta, montoAnterior, montoNuevo, motivo: motivo || null, userId, ...(fecha ? { createdAt: fecha } : {}) },
+  });
+  return actualizado;
+}
+
+/**
  * Registra un movimiento de dinero sobre un paquete (anticipo en
  * Recepcion, cobro en Entrega, o ajuste posterior desde Finanzas) sin
  * modificar nunca silenciosamente el acumulado anterior: cada llamada
@@ -123,15 +151,7 @@ export async function registrarPago(pkg: Package, tipo: TipoPago, montoDelta: nu
       actual.diasIncluidosOverride
     ).total;
 
-    const montoAnterior = actual.montoPagado;
-    const montoNuevo = Math.round((montoAnterior + montoDelta) * 100) / 100;
-    const estadoPago: PaymentStatus = montoNuevo <= 0 ? 'PENDIENTE' : montoNuevo >= costoActual ? 'PAGADO' : 'PARCIAL';
-
-    const nuevo = await tx.package.update({ where: { id: actual.id }, data: { montoPagado: montoNuevo, estadoPago } });
-    await tx.pago.create({
-      data: { packageId: actual.id, tipo, monto: montoDelta, montoAnterior, montoNuevo, motivo: motivo || null, userId, ...(fecha ? { createdAt: fecha } : {}) },
-    });
-    return nuevo;
+    return aplicarPagoEnTx(tx, actual.id, actual.montoPagado, montoDelta, costoActual, tipo, userId, motivo, fecha);
   }, TRANSACTION_OPTS);
 
   await registrarAuditoria({
@@ -316,17 +336,37 @@ export interface EntregaExcepcionalOpts {
   destinatarioTelefono?: string;
   destinatarioObservaciones?: string;
   observaciones?: string;
+  // Entero positivo (validado en la ruta): si se omite, se cobra
+  // automaticamente la tarifa vigente. Bs0 NUNCA se acepta por aqui — ver
+  // "exonerado" para la unica via legitima de entregar sin cobrar.
   montoCobrado?: number;
   motivoCobro?: string;
+  // Exoneracion administrativa explicita (Bs0), excluyente con
+  // montoCobrado — validado en la ruta que nunca lleguen los dos juntos,
+  // y que motivoExoneracion venga obligatorio cuando exonerado=true.
+  exonerado?: boolean;
+  motivoExoneracion?: string;
 }
 
 /**
  * "Entrega excepcional": crea el paquete + registra la recepcion omitida
- * + lo entrega, todo en un solo movimiento auditado, para un codigo que
- * NUNCA paso por Recepcion. Solo debe llamarse cuando ya se confirmo que
- * el codigo no existe (si existe, corresponde el flujo normal de
- * entregarPaquete() — esta funcion rechaza explicitamente ese caso, nunca
- * pisa un paquete real).
+ * + lo entrega + registra su cobro (o exoneracion), TODO en una unica
+ * transaccion atomica, para un codigo que NUNCA paso por Recepcion. Solo
+ * debe llamarse cuando ya se confirmo que el codigo no existe (si existe,
+ * corresponde el flujo normal de entregarPaquete() — esta funcion
+ * rechaza explicitamente ese caso, nunca pisa un paquete real).
+ *
+ * Antes, la creacion del paquete y el registro del cobro eran DOS
+ * transacciones separadas (esta funcion hacia su propio $transaction, y
+ * despues llamaba a registrarPago(), que abria OTRA): si la segunda
+ * fallaba por cualquier motivo, el paquete quedaba creado igual —
+ * ENTREGADO + Bs0 + PENDIENTE + sin ningun Pago, indistinguible de un
+ * cobro simplemente olvidado. Ahora ambas cosas ocurren dentro del MISMO
+ * prisma.$transaction: si el registro del pago falla, tampoco queda
+ * creado el Package ni su PackageHistory (rollback completo). Nunca se
+ * llama a registrarPago() desde aqui adentro (abriria una segunda
+ * transaccion anidada) — se usa aplicarPagoEnTx() directamente sobre el
+ * mismo "tx".
  *
  * ingresoAt y entregaAt quedan iguales a "ahora" (no hay una fecha de
  * recepcion real que registrar — el paquete nunca paso por Recepcion).
@@ -338,6 +378,13 @@ export interface EntregaExcepcionalOpts {
  * historial. opts.motivoExcepcional es OBLIGATORIO (validado ya en la
  * ruta) y queda grabado tal cual en la nota del historial — nunca se
  * inventa un motivo generico cuando el operador no dio uno real.
+ *
+ * SIEMPRE se crea una fila de Pago para el cobro/exoneracion (incluso
+ * cuando el monto aplicado es Bs0 por exoneracion, o por una tarifa
+ * configurada en Bs0): desde este fix, un ENTREGADO sin absolutamente
+ * ningun Pago asociado solo puede significar "nunca se registro nada" —
+ * nunca una decision deliberada, que ahora siempre queda como un
+ * movimiento real y auditable en el libro de Pago.
  */
 export async function entregaExcepcional(code: string, userId: string, branchId: string, opts: EntregaExcepcionalOpts): Promise<Package> {
   const codigoNormalizado = normalizarCodigo(code);
@@ -361,6 +408,29 @@ export async function entregaExcepcional(code: string, userId: string, branchId:
     opts.motivoExcepcional === 'OTRO' && opts.motivoDetalle?.trim()
       ? `Otro: ${opts.motivoDetalle.trim()}`
       : MOTIVO_ENTREGA_EXCEPCIONAL_LABEL[opts.motivoExcepcional];
+
+  // Tarifa vigente AHORA MISMO para este paquete: con ingresoAt=entregaAt
+  // (0 dias transcurridos) es siempre la tarifa base o su override de
+  // serie, nunca dias extra — se puede calcular antes de abrir la
+  // transaccion porque solo depende de configuracion/feriados/serie, ya
+  // leidos arriba.
+  const [company, feriados] = await Promise.all([getCompanyConfig(), getHolidaySet()]);
+  const costoActual = calcularCosto(
+    now,
+    now,
+    { tarifaBase: company.tarifaBase, diasIncluidos: company.diasIncluidos, costoAdicionalDia: company.costoAdicionalDia },
+    feriados,
+    serie.tarifaBaseOverride,
+    null
+  ).total;
+
+  // Una entrega excepcional SIGUE SIENDO UNA ENTREGA: siempre corresponde
+  // cobrar, salvo exoneracion administrativa explicita. Bs0 nunca es un
+  // "monto normal" (ver especificacion) — solo llega aqui como
+  // opts.exonerado=true, ya validado en la ruta (permiso + motivo
+  // obligatorio). Sin monto ni exoneracion, se autocobra la tarifa vigente.
+  const montoAplicado = opts.exonerado ? 0 : (opts.montoCobrado ?? costoActual);
+  const motivoMovimiento = opts.exonerado ? `Exoneración de cobro (entrega excepcional): ${opts.motivoExoneracion}` : opts.motivoCobro;
 
   const pkg = await prisma.$transaction(async (tx) => {
     const nuevo = await tx.package.create({
@@ -387,43 +457,23 @@ export async function entregaExcepcional(code: string, userId: string, branchId:
     await tx.packageHistory.create({
       data: { packageId: nuevo.id, estado: 'ENTREGADO', fecha: now, userId, nota: `Entrega excepcional: paquete no figuraba como recibido — ${motivoTexto}` },
     });
-    return nuevo;
+    return aplicarPagoEnTx(tx, nuevo.id, 0, montoAplicado, costoActual, 'COBRO_ENTREGA', userId, motivoMovimiento);
   }, TRANSACTION_OPTS);
 
   await registrarAuditoria({
     userId,
     accion: 'ENTREGA_EXCEPCIONAL',
     modulo: 'entrega',
-    valorNuevo: { code: pkg.code, status: pkg.status, motivoExcepcional: opts.motivoExcepcional, motivoTexto },
+    valorNuevo: { code: pkg.code, status: pkg.status, motivoExcepcional: opts.motivoExcepcional, motivoTexto, montoCobrado: montoAplicado, exonerado: !!opts.exonerado },
   });
-
-  // Una entrega excepcional SIGUE SIENDO UNA ENTREGA: el paquete se
-  // llevo, así que corresponde cobrar, igual que en una entrega normal.
-  // Si el operador especifico un monto explicito (incluido Bs0, una
-  // decision deliberada de no cobrar), se respeta tal cual. Si no
-  // especifico nada, se cobra automaticamente la tarifa que le
-  // corresponde a este paquete en este momento — nunca se entrega
-  // "gratis" por omision. Con ingresoAt=entregaAt=ahora (0 dias
-  // transcurridos), esto es exactamente la tarifa base (o su override de
-  // serie), sin dias extra.
-  if (opts.montoCobrado !== undefined) {
-    if (opts.montoCobrado !== 0) {
-      return registrarPago(pkg, 'COBRO_ENTREGA', opts.montoCobrado, userId, opts.motivoCobro);
-    }
-    return pkg;
+  if (opts.exonerado) {
+    await registrarAuditoria({
+      userId,
+      accion: 'EXONERACION_COBRO',
+      modulo: 'entrega',
+      valorNuevo: { code: pkg.code, motivoExoneracion: opts.motivoExoneracion, tarifaVigente: costoActual },
+    });
   }
 
-  const [company, feriados] = await Promise.all([getCompanyConfig(), getHolidaySet()]);
-  const costoActual = calcularCosto(
-    pkg.ingresoAt,
-    fechaReferencia(pkg),
-    { tarifaBase: company.tarifaBase, diasIncluidos: company.diasIncluidos, costoAdicionalDia: company.costoAdicionalDia },
-    feriados,
-    pkg.tarifaBaseOverride,
-    pkg.diasIncluidosOverride
-  ).total;
-  if (costoActual > 0) {
-    return registrarPago(pkg, 'COBRO_ENTREGA', costoActual, userId, opts.motivoCobro);
-  }
   return pkg;
 }

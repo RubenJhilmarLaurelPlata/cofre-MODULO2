@@ -16,6 +16,15 @@ import { getPackageDetail } from '@/lib/package-detail';
 import { MOTIVOS_ENTREGA_EXCEPCIONAL, type Role } from '@/types';
 
 const ROLES_PERMITIDOS: Role[] = ['ADMIN', 'ADMIN_CAJA'];
+// Exonerar un cobro (Bs0 deliberado) es mas sensible que la entrega
+// excepcional en si — requiere ADMIN, no basta ADMIN_CAJA.
+const ROLES_EXONERACION: Role[] = ['ADMIN'];
+
+// Entero, finito, positivo: nunca centavos, nunca negativo, y NUNCA Bs0
+// por esta via (Bs0 solo entra por "exonerado", mas abajo, con su propio
+// permiso y motivo obligatorio — ver especificacion, "Bs0 no debe poder
+// utilizarse como monto normal").
+const montoCobradoSchema = z.number().int('El monto no puede tener centavos.').finite().positive('El monto debe ser mayor a 0. Para entregar sin cobrar, usa la exoneración administrativa.');
 
 const bodySchema = z
   .object({
@@ -29,12 +38,25 @@ const bodySchema = z
     destinatarioTelefono: z.string().max(30).optional(),
     destinatarioObservaciones: z.string().max(500).optional(),
     observaciones: z.string().max(500).optional(),
-    montoCobrado: z.number().finite().optional(),
+    montoCobrado: montoCobradoSchema.optional(),
     motivoCobro: z.string().max(200).optional(),
+    // Exoneracion administrativa explicita: Bs0 auditado, nunca "dejar el
+    // campo vacío" (eso significa "cobrar automáticamente", ver
+    // entregaExcepcional()). Excluyente con montoCobrado.
+    exonerado: z.boolean().optional(),
+    motivoExoneracion: z.string().trim().max(300).optional(),
   })
   .refine((v) => v.motivoExcepcional !== 'OTRO' || !!v.motivoDetalle?.trim(), {
     message: 'Escribe el detalle del motivo cuando seleccionas "Otro".',
     path: ['motivoDetalle'],
+  })
+  .refine((v) => !v.exonerado || !v.montoCobrado, {
+    message: 'No puedes exonerar el cobro y especificar un monto al mismo tiempo.',
+    path: ['montoCobrado'],
+  })
+  .refine((v) => !v.exonerado || !!v.motivoExoneracion?.trim(), {
+    message: 'La exoneración de cobro requiere un motivo.',
+    path: ['motivoExoneracion'],
   });
 
 export async function POST(req: Request, { params }: { params: { code: string } }) {
@@ -49,6 +71,13 @@ export async function POST(req: Request, { params }: { params: { code: string } 
     return NextResponse.json({ error: parsed.error.issues[0]?.message ?? 'Datos inválidos.' }, { status: 400 });
   }
   const opts = parsed.data;
+
+  // No confiar solo en el HTML/frontend: el permiso de exoneracion se
+  // vuelve a comprobar aqui, en el backend, independientemente de lo que
+  // el cliente haya mostrado u ocultado.
+  if (opts.exonerado && !ROLES_EXONERACION.includes(session.role)) {
+    return NextResponse.json({ error: 'Solo un administrador puede exonerar un cobro.' }, { status: 403 });
+  }
 
   try {
     const company = await getCompanyConfig();

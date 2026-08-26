@@ -73,6 +73,11 @@ interface EntregaClientProps {
   // que no ve ni puede activar "Entrega excepcional".
   puedeEntregaExcepcional: boolean;
   moneda: string;
+  // Tarifa base configurada, para mostrar claramente cuanto se cobrara
+  // automaticamente si se deja vacio el monto en una entrega excepcional
+  // (una serie con tarifa especial puede diferir — esto es la referencia
+  // general, no una promesa exacta para cualquier codigo).
+  tarifaBase: number;
 }
 
 /** Bloque colapsable simple (cerrado por defecto salvo que ya tenga datos), mismo criterio que los paneles opcionales de Recepción — evita que "Quien recoge"/Observaciones alarguen el scroll en móvil antes de llegar a los botones de acción. */
@@ -147,6 +152,7 @@ export function EntregaClient({
   esAdmin,
   puedeEntregaExcepcional,
   moneda,
+  tarifaBase,
 }: EntregaClientProps) {
   const [tab, setTab] = React.useState<'usb' | 'camara' | 'teclado'>('usb');
   // "Entrega excepcional": OFF por defecto (ver seccion 2 de la
@@ -164,6 +170,11 @@ export function EntregaClient({
   const [motivoExcepcionalOpcion, setMotivoExcepcionalOpcion] = React.useState<MotivoEntregaExcepcional | ''>('');
   const [motivoExcepcionalDetalle, setMotivoExcepcionalDetalle] = React.useState('');
   const [montoExcepcionalInput, setMontoExcepcionalInput] = React.useState('');
+  // Exoneracion administrativa (Bs0 auditado): accion separada, nunca
+  // "dejar el monto vacío" — solo visible para esAdmin (ver
+  // especificacion, "Bs0 no debe confundirse con el campo vacío").
+  const [exonerarActivo, setExonerarActivo] = React.useState(false);
+  const [motivoExoneracionInput, setMotivoExoneracionInput] = React.useState('');
   const resolverExcepcionalRef = React.useRef<(() => void) | null>(null);
   const [query, setQuery] = React.useState(codigoInicial ?? '');
   const [paquete, setPaquete] = React.useState<PackageDetailDTO | null>(paqueteInicial ?? null);
@@ -360,6 +371,8 @@ export function EntregaClient({
     setMotivoExcepcionalOpcion('');
     setMotivoExcepcionalDetalle('');
     setMontoExcepcionalInput('');
+    setExonerarActivo(false);
+    setMotivoExoneracionInput('');
     setMensajeError(code ? `No se encontró ningún paquete con el código "${code}".` : null);
     resolverExcepcionalRef.current?.();
     resolverExcepcionalRef.current = null;
@@ -368,20 +381,31 @@ export function EntregaClient({
 
   const motivoExcepcionalValido =
     motivoExcepcionalOpcion !== '' && (motivoExcepcionalOpcion !== 'OTRO' || motivoExcepcionalDetalle.trim() !== '');
+  // Vacío = cobrar automaticamente la tarifa vigente (valido). Si se
+  // escribe algo, debe ser un entero positivo — nunca centavos, nunca
+  // negativo, nunca Bs0 (Bs0 solo existe via la exoneracion aparte).
+  const montoExcepcionalNum = montoExcepcionalInput.trim() === '' ? null : Number(montoExcepcionalInput);
+  const montoExcepcionalValido = montoExcepcionalInput.trim() === '' || (Number.isInteger(montoExcepcionalNum) && (montoExcepcionalNum as number) > 0);
+  const motivoExoneracionValido = motivoExoneracionInput.trim() !== '';
+  const confirmarExcepcionalValido =
+    motivoExcepcionalValido && (exonerarActivo ? motivoExoneracionValido : montoExcepcionalValido);
 
   async function confirmarExcepcional() {
     const code = confirmandoExcepcional;
-    if (!code || registrandoExcepcional || !motivoExcepcionalValido) return;
+    if (!code || registrandoExcepcional || !confirmarExcepcionalValido) return;
     setRegistrandoExcepcional(true);
     try {
-      const montoCobrado = Number(montoExcepcionalInput);
       const res = await fetch(`/api/entrega/${encodeURIComponent(code)}/excepcional`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           motivoExcepcional: motivoExcepcionalOpcion,
           ...(motivoExcepcionalOpcion === 'OTRO' ? { motivoDetalle: motivoExcepcionalDetalle.trim() } : {}),
-          ...(montoExcepcionalInput.trim() && Number.isFinite(montoCobrado) ? { montoCobrado } : {}),
+          ...(exonerarActivo
+            ? { exonerado: true, motivoExoneracion: motivoExoneracionInput.trim() }
+            : montoExcepcionalNum !== null
+              ? { montoCobrado: montoExcepcionalNum }
+              : {}),
         }),
       });
       const data = await res.json();
@@ -409,6 +433,8 @@ export function EntregaClient({
       setMotivoExcepcionalOpcion('');
       setMotivoExcepcionalDetalle('');
       setMontoExcepcionalInput('');
+      setExonerarActivo(false);
+      setMotivoExoneracionInput('');
       resolverExcepcionalRef.current?.();
       resolverExcepcionalRef.current = null;
       focusScanner(inputRef);
@@ -826,26 +852,79 @@ export function EntregaClient({
                   className="w-full rounded-lg border border-amber-300 dark:border-amber-700 bg-white dark:bg-gray-900 px-3 py-2 text-sm text-ink dark:text-gray-100 outline-none focus:border-amber-500 focus:ring-2 focus:ring-amber-200"
                 />
               )}
-              <label className="block text-xs font-semibold text-amber-800 dark:text-amber-300">Monto a cobrar (opcional)</label>
-              <input
-                type="number"
-                min={0}
-                step="0.5"
-                value={montoExcepcionalInput}
-                onChange={(e) => setMontoExcepcionalInput(e.target.value)}
-                placeholder="Dejar vacío para cobrar automáticamente la tarifa que corresponde"
-                className="w-full rounded-lg border border-amber-300 dark:border-amber-700 bg-white dark:bg-gray-900 px-3 py-2 text-sm text-ink dark:text-gray-100 outline-none focus:border-amber-500 focus:ring-2 focus:ring-amber-200"
-              />
-              <p className="text-xs text-amber-700 dark:text-amber-400">
-                Esta entrega SÍ se cobra: si dejas el monto vacío, se cobrará automáticamente la tarifa que le corresponde a este paquete ahora mismo. Escribe Bs0 solo si una autorización administrativa exime el cobro.
-              </p>
+              {!exonerarActivo && (
+                <>
+                  <label className="block text-xs font-semibold text-amber-800 dark:text-amber-300">Monto a cobrar</label>
+                  <input
+                    type="number"
+                    min={1}
+                    step={1}
+                    value={montoExcepcionalInput}
+                    onChange={(e) => setMontoExcepcionalInput(e.target.value)}
+                    placeholder={`Vacío = cobrar automáticamente Bs${tarifaBase}`}
+                    className="w-full rounded-lg border border-amber-300 dark:border-amber-700 bg-white dark:bg-gray-900 px-3 py-2 text-sm text-ink dark:text-gray-100 outline-none focus:border-amber-500 focus:ring-2 focus:ring-amber-200"
+                  />
+                  {!montoExcepcionalValido && (
+                    <p className="text-xs font-medium text-red-600 dark:text-red-400">
+                      El monto debe ser un número entero mayor a 0 (sin centavos). Para entregar sin cobrar, usa &quot;Exonerar cobro&quot; abajo.
+                    </p>
+                  )}
+                  <p className="text-xs text-amber-700 dark:text-amber-400">
+                    Esta entrega SÍ se cobra: si dejas el monto vacío, se cobrará automáticamente <strong>Bs{tarifaBase}</strong> (la tarifa vigente de este paquete ahora mismo).
+                  </p>
+                  {esAdmin && (
+                    <button
+                      type="button"
+                      onClick={() => setExonerarActivo(true)}
+                      className="text-xs font-medium text-amber-800 underline decoration-dotted dark:text-amber-300"
+                    >
+                      Exonerar cobro (solo administrador)
+                    </button>
+                  )}
+                </>
+              )}
+              {exonerarActivo && (
+                <div className="space-y-2 rounded-lg border-2 border-red-300 dark:border-red-700 bg-red-50 dark:bg-red-500/10 p-3">
+                  <p className="text-xs font-bold uppercase tracking-wide text-red-700 dark:text-red-400">
+                    ⚠️ Exoneración de cobro — el paquete se entregará con Bs0
+                  </p>
+                  <label className="block text-xs font-semibold text-red-800 dark:text-red-300">Motivo de la exoneración (obligatorio)</label>
+                  <input
+                    type="text"
+                    value={motivoExoneracionInput}
+                    onChange={(e) => setMotivoExoneracionInput(e.target.value)}
+                    placeholder="Ej: autorizado por gerencia, cliente institucional sin cargo"
+                    maxLength={300}
+                    className="w-full rounded-lg border border-red-300 dark:border-red-700 bg-white dark:bg-gray-900 px-3 py-2 text-sm text-ink dark:text-gray-100 outline-none focus:border-red-500 focus:ring-2 focus:ring-red-200"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setExonerarActivo(false);
+                      setMotivoExoneracionInput('');
+                    }}
+                    className="text-xs font-medium text-red-800 underline decoration-dotted dark:text-red-300"
+                  >
+                    Cancelar exoneración, volver a cobrar normalmente
+                  </button>
+                </div>
+              )}
             </div>
             <div className="mt-3 flex gap-2">
               <Button variant="secondary" size="sm" onClick={cancelarExcepcional} disabled={registrandoExcepcional}>
                 Cancelar
               </Button>
-              <Button size="sm" onClick={confirmarExcepcional} loading={registrandoExcepcional} disabled={!motivoExcepcionalValido}>
-                Confirmar entrega
+              <Button
+                size="sm"
+                variant={exonerarActivo ? 'destructive' : 'primary'}
+                onClick={() => {
+                  if (exonerarActivo && !window.confirm(`¿Confirmas exonerar el cobro de este paquete? Quedará entregado con Bs0 y motivo registrado en auditoría.`)) return;
+                  confirmarExcepcional();
+                }}
+                loading={registrandoExcepcional}
+                disabled={!confirmarExcepcionalValido}
+              >
+                {exonerarActivo ? 'Confirmar exoneración' : 'Confirmar entrega'}
               </Button>
             </div>
           </div>
