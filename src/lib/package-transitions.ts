@@ -84,10 +84,16 @@ export type TipoPago = 'ANTICIPO' | 'COBRO_ENTREGA' | 'AJUSTE';
  * una transaccion ya abierta por el llamador (registrarPago() abre la
  * suya propia; entregaExcepcional() la reutiliza dentro de la MISMA
  * transaccion que crea el paquete — ver comentario ahi de por que esto
- * tiene que ser atomico). Nunca se exporta: solo existe para no duplicar
- * esta logica en los dos lugares que la necesitan.
+ * tiene que ser atomico). Exportada para que crearPaquetesFaltantes() y
+ * crearPaquetesEnDeposito() (src/lib/importacion.ts) puedan aplicar el
+ * mismo patron atomico al crear un paquete historico nuevo con su cobro:
+ * package.create + 2×packageHistory.create + pago, todo en UNA transaccion,
+ * en vez de crear el paquete y despues llamar a registrarPago() por
+ * separado (eso dejaria un ENTREGADO+Bs0+SIN Pago si el segundo paso
+ * fallara — el mismo patron de bug ya confirmado en produccion que motivo
+ * el fix de entregaExcepcional()).
  */
-async function aplicarPagoEnTx(
+export async function aplicarPagoEnTx(
   tx: Prisma.TransactionClient,
   packageId: string,
   montoAnterior: number,

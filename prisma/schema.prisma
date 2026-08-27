@@ -414,7 +414,8 @@ model ImportLog {
   nombreLote        String?
   formato           String // CSV | XLSX
   // Que hizo el administrador con las filas validas de este lote
-  // (Fase 2): SOLO_REGISTRAR | MARCAR_ENTREGADOS | CREAR_Y_ENTREGAR.
+  // (Fase 2): SOLO_REGISTRAR | MARCAR_ENTREGADOS | CREAR_Y_ENTREGAR |
+  // CREAR_EN_DEPOSITO.
   tipoImportacion   String   @default("MARCAR_ENTREGADOS")
   detectados        Int
   validos           Int
@@ -448,7 +449,7 @@ model ImportRow {
   packageId     String?
   monto         Float?
   persona       String?
-  // VALIDO | DUPLICADO | INVALIDO | NO_ENCONTRADO | YA_ENTREGADO | CREADO | ENTREGADO | SOLO_DATOS | ERROR
+  // VALIDO | DUPLICADO | INVALIDO | NO_ENCONTRADO | YA_ENTREGADO | CREADO | ENTREGADO | SOLO_DATOS | EN_DEPOSITO | ERROR
   estado        String
   motivo        String?
 

@@ -7,7 +7,7 @@
 // Nunca escribe nada sin que el administrador confirme el resumen.
 import * as React from 'react';
 import Link from 'next/link';
-import { Upload, FileText, CheckCircle2, XCircle, HelpCircle, Loader2, History, ClipboardList, PackageCheck, PackagePlus, ArrowRight } from 'lucide-react';
+import { Upload, FileText, CheckCircle2, XCircle, HelpCircle, Loader2, History, ClipboardList, PackageCheck, PackagePlus, Archive, Search, AlertTriangle, ArrowRight } from 'lucide-react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
@@ -15,7 +15,12 @@ import { Input, Label } from '@/components/ui/input';
 import { cn } from '@/lib/utils';
 
 type CampoSistema = 'codigo' | 'monto' | 'personaRecoge' | 'celular' | 'cliente' | 'emprendimiento' | 'fecha' | 'hora' | 'fechaRecepcion' | 'observaciones' | 'descripcion';
-type TipoImportacion = 'SOLO_REGISTRAR' | 'MARCAR_ENTREGADOS' | 'CREAR_Y_ENTREGAR';
+type TipoImportacion = 'SOLO_REGISTRAR' | 'MARCAR_ENTREGADOS' | 'CREAR_Y_ENTREGAR' | 'CREAR_EN_DEPOSITO';
+
+interface ImportacionClientProps {
+  /** Tarifa base vigente (Configuración → Tarifas) — solo para mostrar en el preview cuánto se cobrará por defecto a un paquete nuevo sin monto propio; nunca se decide en el cliente. */
+  tarifaBase: number;
+}
 
 const CAMPOS_SISTEMA: Array<{ value: CampoSistema; label: string }> = [
   { value: 'codigo', label: 'Código' },
@@ -46,6 +51,9 @@ interface FilaValidada {
   fechaRecepcionResuelta?: string;
   estado: 'valido' | 'duplicado' | 'invalido' | 'no_encontrado' | 'ya_entregado';
   motivo?: string;
+  montoPagadoExistente?: number;
+  avisoFinanciero?: string;
+  requiereRevisionPago?: boolean;
 }
 
 interface Resumen {
@@ -95,25 +103,38 @@ const ESTADO_INFO: Record<FilaValidada['estado'], { emoji: string; label: string
 };
 
 /** Explica en una frase qué va a pasar con esta fila al confirmar — no solo "por qué" (eso ya lo trae f.motivo para los casos problemáticos), sino la ACCIÓN real que ejecutará el tipo de importación elegido. */
-function explicacionFila(f: FilaValidada, tipo: TipoImportacion): string {
+function explicacionFila(f: FilaValidada, tipo: TipoImportacion, tarifaBase: number): string {
   if (f.motivo) return f.motivo;
   if (f.estado === 'no_encontrado') {
-    return tipo === 'CREAR_Y_ENTREGAR'
-      ? 'Se creará este paquete con estos datos y se marcará como entregado.'
-      : 'No existe todavía — con el tipo de importación elegido no se creará (cambia a "Crear y entregar" si corresponde).';
+    if (tipo === 'CREAR_Y_ENTREGAR') {
+      const monto = f.monto ?? tarifaBase;
+      return `Se creará este paquete con estos datos, se marcará como entregado y se cobrará Bs${monto}.`;
+    }
+    if (tipo === 'CREAR_EN_DEPOSITO') {
+      return f.fechaRecepcionResuelta
+        ? `Se creará este paquete EN DEPÓSITO con fecha de ingreso ${f.fechaRecepcionResuelta}. No genera ningún cobro.`
+        : 'Falta la fecha de recepción de esta fila — obligatoria para importar en depósito.';
+    }
+    return 'No existe todavía — con el tipo de importación elegido no se creará (cambia a "Crear y entregar" o "Importar en depósito" si corresponde).';
   }
-  if (f.estado === 'valido') {
-    return tipo === 'SOLO_REGISTRAR'
-      ? 'Se actualizarán sus datos (nombre, celular, monto) sin cambiar su estado.'
-      : 'Se actualizarán sus datos (nombre, celular, monto) y se marcará como entregado.';
+  if (f.estado === 'valido' || f.estado === 'ya_entregado') {
+    if (tipo === 'CREAR_EN_DEPOSITO') return 'Este código ya existe — el modo "Importar en depósito" solo crea códigos nuevos, no se tocará.';
+    const partes: string[] = [];
+    partes.push('Se completarán nombre/celular si el archivo los trae.');
+    if (f.estado === 'valido' && tipo !== 'SOLO_REGISTRAR') partes.push('Se marcará como entregado.');
+    if (f.avisoFinanciero) partes.push(f.avisoFinanciero);
+    else if (f.requiereRevisionPago) partes.push('Sin pago registrado y sin monto en el archivo: no se generará ningún cobro — revisar manualmente después.');
+    else if (f.monto !== undefined) partes.push(`Se registrará un cobro de Bs${f.monto}.`);
+    return partes.join(' ');
   }
   return '';
 }
 
 const TIPO_LABEL: Record<TipoImportacion, string> = {
-  SOLO_REGISTRAR: 'Solo datos',
+  SOLO_REGISTRAR: 'Solo actualizar datos',
   MARCAR_ENTREGADOS: 'Marcar entregados',
   CREAR_Y_ENTREGAR: 'Crear y entregar',
+  CREAR_EN_DEPOSITO: 'Importar en depósito',
 };
 
 function fmtFechaHora(iso: string): string {
@@ -126,7 +147,7 @@ function fmtBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-export function ImportacionClient() {
+export function ImportacionClient({ tarifaBase }: ImportacionClientProps) {
   const [archivo, setArchivo] = React.useState<File | null>(null);
   const [arrastrando, setArrastrando] = React.useState(false);
   const [encabezados, setEncabezados] = React.useState<EncabezadoDetectado[] | null>(null);
@@ -232,7 +253,16 @@ export function ImportacionClient() {
     return ediciones[f.numeroFila]?.celular ?? f.celular ?? '';
   }
   function montoMostrado(f: FilaValidada): number {
-    return ediciones[f.numeroFila]?.monto ?? f.monto ?? 0;
+    // Para un paquete NUEVO (no_encontrado) sin un monto propio, el
+    // backend cobrará automáticamente la tarifa vigente al confirmar (ver
+    // crearPaquetesFaltantes en src/lib/importacion.ts) — se muestra ese
+    // mismo valor aquí para que el preview nunca diga "Bs0" cuando en
+    // realidad se va a cobrar Bs{tarifaBase}. Para un paquete que YA
+    // EXISTE, en cambio, nunca se sugiere ningún monto por defecto (ver
+    // REGLA 6: la importación no debe inventar un cobro) — se muestra Bs0
+    // hasta que el archivo o una edición traigan uno explícito.
+    const sugerido = f.estado === 'no_encontrado' ? tarifaBase : 0;
+    return ediciones[f.numeroFila]?.monto ?? f.monto ?? sugerido;
   }
 
   function editarFila(numeroFila: number, campo: keyof EdicionFila, valor: string) {
@@ -280,13 +310,40 @@ export function ImportacionClient() {
   const countYaEntregado = resumen?.filas.filter((f) => f.estado === 'ya_entregado').length ?? 0;
   const countNoEncontrado = resumen?.noEncontrados ?? 0;
 
+  // MARCAR_ENTREGADOS y CREAR_Y_ENTREGAR tambien completan nombre/celular
+  // de las filas "ya_entregado" (ver ejecutarImportacion en
+  // src/lib/importacion.ts) — nunca cambian su estado ni su dinero, pero
+  // SÍ se procesan, así que cuentan aquí para que "N fila(s) afectada(s)"
+  // sea real.
   const afectadosPorTipo: Record<TipoImportacion, number> = {
     SOLO_REGISTRAR: countValido + countYaEntregado,
-    MARCAR_ENTREGADOS: countValido,
-    CREAR_Y_ENTREGAR: countValido + countNoEncontrado,
+    MARCAR_ENTREGADOS: countValido + countYaEntregado,
+    CREAR_Y_ENTREGAR: countValido + countNoEncontrado + countYaEntregado,
+    CREAR_EN_DEPOSITO: countNoEncontrado,
   };
 
-  const puedeConfirmar = !!resumen && !!archivo && nombreLote.trim().length > 0 && afectadosPorTipo[tipo] > 0;
+  // Importar en depósito exige una fecha de recepción real (ver REGLA
+  // 11-13): el modo "por_fila" sin ninguna columna mapeada a
+  // "fechaRecepcion" dejaría todas las filas sin fecha resuelta — se
+  // avisa aquí antes de confirmar, aunque el backend es quien realmente
+  // lo exige (ver REGLA 9).
+  const depositoSinFecha = tipo === 'CREAR_EN_DEPOSITO' && (resumen?.filas.filter((f) => f.estado === 'no_encontrado' && !f.fechaRecepcionResuelta).length ?? 0) > 0;
+
+  const puedeConfirmar = !!resumen && !!archivo && nombreLote.trim().length > 0 && afectadosPorTipo[tipo] > 0 && !depositoSinFecha;
+
+  const [busqueda, setBusqueda] = React.useState('');
+  const filasFiltradas = React.useMemo(() => {
+    const filas = resumen?.filas ?? [];
+    const q = busqueda.trim().toLowerCase();
+    if (!q) return filas;
+    return filas.filter((f) => {
+      const codigo = codigoMostrado(f).toLowerCase();
+      const nombre = nombreMostrado(f).toLowerCase();
+      const celular = celularMostrado(f).toLowerCase();
+      return codigo.includes(q) || nombre.includes(q) || celular.includes(q);
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [resumen, busqueda, ediciones]);
 
   async function confirmar() {
     if (!archivo || !puedeConfirmar || procesando) return;
@@ -501,6 +558,13 @@ export function ImportacionClient() {
               <ResumenNumero label="⚫ No se pueden importar" valor={resumen.invalidos} color="text-gray-600 dark:text-gray-400" />
             </div>
             <p className="text-xs text-ink-soft dark:text-gray-400">Esto es lo que ocurrirá al confirmar la importación — revisa antes de continuar.</p>
+            {resumen.filas.some((f) => f.requiereRevisionPago) && (
+              <p className="flex items-center gap-1.5 text-xs text-amber-600 dark:text-amber-400">
+                <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+                {resumen.filas.filter((f) => f.requiereRevisionPago).length} fila(s) ⚠️ existen pero no tienen ningún pago registrado y el archivo no trae un monto — no se generará ningún cobro
+                para esas filas; revísalas manualmente después (ej. desde Finanzas → Corregir cobro).
+              </p>
+            )}
 
             {/* Móvil: tarjetas — 6 columnas en una tabla de 375px de ancho
                 obligaban a achicar el texto hasta hacerlo ilegible o a
@@ -511,8 +575,23 @@ export function ImportacionClient() {
               Puedes corregir Código, Nombre, Celular o Monto de cualquier fila antes de confirmar — no hace falta volver al archivo original.
             </p>
 
+            <div className="relative">
+              <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-gray-300 dark:text-gray-600" />
+              <Input
+                value={busqueda}
+                onChange={(e) => setBusqueda(e.target.value)}
+                placeholder="Buscar por código, nombre o celular…"
+                className="pl-9"
+              />
+              {busqueda && (
+                <p className="mt-1 text-xs text-gray-400 dark:text-gray-500">
+                  {filasFiltradas.length} de {resumen.filas.length} fila(s) coinciden.
+                </p>
+              )}
+            </div>
+
             <div className="max-h-[32rem] space-y-2 overflow-y-auto md:hidden">
-              {resumen.filas.map((f) => (
+              {filasFiltradas.map((f) => (
                 <div key={f.numeroFila} className="space-y-2 rounded-lg border border-gray-100 dark:border-gray-800/60 p-2.5">
                   <div className="flex items-center justify-between gap-2">
                     <Input
@@ -540,6 +619,7 @@ export function ImportacionClient() {
                         min={0}
                         step="0.5"
                         value={montoMostrado(f)}
+                        disabled={f.estado !== 'no_encontrado' && !!f.avisoFinanciero}
                         onChange={(e) => editarFila(f.numeroFila, 'monto', e.target.value)}
                         className="h-8 text-xs"
                       />
@@ -549,9 +629,16 @@ export function ImportacionClient() {
                       {f.fechaRecepcionResuelta && <span>Recepción: {f.fechaRecepcionResuelta}</span>}
                     </div>
                   </div>
-                  {explicacionFila(f, tipo) && <p className="text-xs text-gray-400 dark:text-gray-500">{explicacionFila(f, tipo)}</p>}
+                  {(f.avisoFinanciero || f.requiereRevisionPago) && (
+                    <p className="flex items-start gap-1 text-xs text-amber-600 dark:text-amber-400">
+                      <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                      {f.avisoFinanciero ?? 'Sin pago registrado y sin monto en el archivo — no se generará ningún cobro.'}
+                    </p>
+                  )}
+                  {explicacionFila(f, tipo, tarifaBase) && <p className="text-xs text-gray-400 dark:text-gray-500">{explicacionFila(f, tipo, tarifaBase)}</p>}
                 </div>
               ))}
+              {filasFiltradas.length === 0 && <p className="py-6 text-center text-sm text-gray-400 dark:text-gray-500">Ninguna fila coincide con la búsqueda.</p>}
             </div>
 
             <div className="hidden max-h-[28rem] overflow-y-auto rounded-lg border border-gray-100 dark:border-gray-800/60 md:block">
@@ -569,7 +656,7 @@ export function ImportacionClient() {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-gray-100 dark:divide-gray-800">
-                  {resumen.filas.map((f) => (
+                  {filasFiltradas.map((f) => (
                     <tr key={f.numeroFila}>
                       <td className="px-3 py-1.5 text-gray-400 dark:text-gray-500">{f.numeroFila}</td>
                       <td className="px-2 py-1">
@@ -587,6 +674,7 @@ export function ImportacionClient() {
                           min={0}
                           step="0.5"
                           value={montoMostrado(f)}
+                          disabled={f.estado !== 'no_encontrado' && !!f.avisoFinanciero}
                           onChange={(e) => editarFila(f.numeroFila, 'monto', e.target.value)}
                           className="h-8 w-20 text-xs"
                         />
@@ -596,12 +684,20 @@ export function ImportacionClient() {
                         <Badge variant={ESTADO_INFO[f.estado].variant}>
                           {ESTADO_INFO[f.estado].emoji} {ESTADO_INFO[f.estado].label}
                         </Badge>
+                        {(f.avisoFinanciero || f.requiereRevisionPago) && (
+                          <span title={f.avisoFinanciero ?? 'Sin pago registrado y sin monto en el archivo — no se generará ningún cobro.'}>
+                            <Badge variant="warning" className="ml-1">
+                              ⚠️ Revisar
+                            </Badge>
+                          </span>
+                        )}
                       </td>
-                      <td className="px-3 py-1.5 text-xs text-gray-400 dark:text-gray-500">{explicacionFila(f, tipo) || '—'}</td>
+                      <td className="px-3 py-1.5 text-xs text-gray-400 dark:text-gray-500">{explicacionFila(f, tipo, tarifaBase) || '—'}</td>
                     </tr>
                   ))}
                 </tbody>
               </table>
+              {filasFiltradas.length === 0 && <p className="py-6 text-center text-sm text-gray-400 dark:text-gray-500">Ninguna fila coincide con la búsqueda.</p>}
             </div>
 
             {Object.keys(ediciones).length > 0 && (
@@ -622,11 +718,11 @@ export function ImportacionClient() {
             <CardTitle>5. Tipo de importación</CardTitle>
           </CardHeader>
           <CardContent className="space-y-4">
-            <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
               <TipoCard
                 icon={ClipboardList}
-                titulo="Solo registrar datos"
-                descripcion="Actualiza monto/persona en paquetes que ya existen, sin cambiar su estado."
+                titulo="Solo actualizar datos"
+                descripcion="Completa nombre/celular (y cobra solo si no tiene pago y el archivo trae un monto) en paquetes que ya existen, sin cambiar su estado."
                 cuenta={afectadosPorTipo.SOLO_REGISTRAR}
                 activo={tipo === 'SOLO_REGISTRAR'}
                 onClick={() => setTipo('SOLO_REGISTRAR')}
@@ -634,7 +730,7 @@ export function ImportacionClient() {
               <TipoCard
                 icon={PackageCheck}
                 titulo="Marcar como ENTREGADOS"
-                descripcion="Marca como entregados los paquetes que ya existen en el sistema."
+                descripcion="Marca como entregados los paquetes que ya existen; también completa nombre/celular de los que ya estaban entregados."
                 cuenta={afectadosPorTipo.MARCAR_ENTREGADOS}
                 activo={tipo === 'MARCAR_ENTREGADOS'}
                 onClick={() => setTipo('MARCAR_ENTREGADOS')}
@@ -642,10 +738,18 @@ export function ImportacionClient() {
               <TipoCard
                 icon={PackagePlus}
                 titulo="Crear faltantes y entregar"
-                descripcion="Crea los códigos que nunca pasaron por Recepción y los marca entregados."
+                descripcion="Crea los códigos que nunca pasaron por Recepción, los marca entregados y cobra la tarifa vigente."
                 cuenta={afectadosPorTipo.CREAR_Y_ENTREGAR}
                 activo={tipo === 'CREAR_Y_ENTREGAR'}
                 onClick={() => setTipo('CREAR_Y_ENTREGAR')}
+              />
+              <TipoCard
+                icon={Archive}
+                titulo="Importar en depósito"
+                descripcion="Crea códigos nuevos directamente EN DEPÓSITO con su fecha de ingreso real. No genera ningún cobro."
+                cuenta={afectadosPorTipo.CREAR_EN_DEPOSITO}
+                activo={tipo === 'CREAR_EN_DEPOSITO'}
+                onClick={() => setTipo('CREAR_EN_DEPOSITO')}
               />
             </div>
 
@@ -657,6 +761,12 @@ export function ImportacionClient() {
             {afectadosPorTipo[tipo] === 0 && (
               <p className="flex items-center gap-1.5 text-xs text-amber-600 dark:text-amber-400">
                 <HelpCircle className="h-3.5 w-3.5" /> Este modo no tiene ninguna fila para procesar con el archivo actual.
+              </p>
+            )}
+
+            {depositoSinFecha && (
+              <p className="flex items-center gap-1.5 text-xs text-amber-600 dark:text-amber-400">
+                <AlertTriangle className="h-3.5 w-3.5" /> Vuelve al paso 2 y define la fecha de recepción (ingreso a depósito) — es obligatoria para este modo.
               </p>
             )}
 

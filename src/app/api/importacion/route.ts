@@ -37,7 +37,7 @@ function detectarFormato(nombreArchivo: string): FormatoImportacion | null {
   return null;
 }
 
-const TIPOS_VALIDOS: TipoImportacion[] = ['SOLO_REGISTRAR', 'MARCAR_ENTREGADOS', 'CREAR_Y_ENTREGAR'];
+const TIPOS_VALIDOS: TipoImportacion[] = ['SOLO_REGISTRAR', 'MARCAR_ENTREGADOS', 'CREAR_Y_ENTREGAR', 'CREAR_EN_DEPOSITO'];
 
 export async function POST(req: Request) {
   const session = await getSession();
@@ -164,12 +164,24 @@ export async function POST(req: Request) {
     }
     const tipo = tipoRaw as TipoImportacion;
 
+    // Importar en depósito exige una fecha de ingreso real para cada fila
+    // (ver REGLA 11-13 de la especificación: sin fecha no hay forma de
+    // calcular cuántos días lleva en depósito) — se revalida aquí en el
+    // servidor, nunca se confía en que el frontend haya obligado a
+    // elegirla (ver REGLA 9, "el backend es la autoridad").
+    if (tipo === 'CREAR_EN_DEPOSITO' && !opcionesFecha) {
+      return NextResponse.json(
+        { error: 'Para importar en depósito, selecciona la fecha de recepción de la lista (paso 2) — es obligatoria para calcular los días en depósito.' },
+        { status: 400 }
+      );
+    }
+
     const branchId = session.branchId ?? company.sucursalActualId ?? (await prisma.branch.findFirst({ where: { activo: true } }))?.id;
     if (!branchId) {
       return NextResponse.json({ error: 'No hay ninguna sucursal activa configurada.' }, { status: 400 });
     }
 
-    const resultado = await ejecutarImportacion(resumen, tipo, session.id, branchId);
+    const resultado = await ejecutarImportacion(resumen, tipo, session.id, branchId, company.tarifaBase);
     const importLogId = await registrarImportLog({
       nombreArchivo: file.name,
       nombreLote,

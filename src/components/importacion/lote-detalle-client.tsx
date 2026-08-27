@@ -44,6 +44,7 @@ interface Lote {
 const ESTADO_LABEL: Record<string, { label: string; variant: 'success' | 'warning' | 'danger' | 'neutral' | 'brand' }> = {
   ENTREGADO: { label: 'Entregado', variant: 'success' },
   CREADO: { label: 'Creado', variant: 'brand' },
+  EN_DEPOSITO: { label: 'En depósito', variant: 'brand' },
   SOLO_DATOS: { label: 'Solo datos', variant: 'neutral' },
   YA_ENTREGADO: { label: 'Ya existía', variant: 'neutral' },
   DUPLICADO: { label: 'Duplicado', variant: 'warning' },
