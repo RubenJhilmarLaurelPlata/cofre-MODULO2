@@ -6,7 +6,8 @@
 // de una sola vez — ver src/app/api/importacion/[id]/route.ts).
 import * as React from 'react';
 import Link from 'next/link';
-import { ArrowLeft, Search, Loader2 } from 'lucide-react';
+import { useRouter } from 'next/navigation';
+import { ArrowLeft, Search, Loader2, Trash2 } from 'lucide-react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Input } from '@/components/ui/input';
@@ -39,6 +40,7 @@ interface Lote {
   creadosFaltantes: number;
   usuario: string;
   createdAt: string;
+  puedeEliminarse: boolean;
 }
 
 const ESTADO_LABEL: Record<string, { label: string; variant: 'success' | 'warning' | 'danger' | 'neutral' | 'brand' }> = {
@@ -58,7 +60,10 @@ function fmtFechaHora(iso: string): string {
 }
 
 export function LoteDetalleClient({ loteId }: { loteId: string }) {
+  const router = useRouter();
   const [lote, setLote] = React.useState<Lote | null>(null);
+  const [eliminando, setEliminando] = React.useState(false);
+  const [errorEliminar, setErrorEliminar] = React.useState<string | null>(null);
   const [conteoPorEstado, setConteoPorEstado] = React.useState<Record<string, number>>({});
   const [filas, setFilas] = React.useState<Fila[]>([]);
   const [total, setTotal] = React.useState(0);
@@ -104,6 +109,30 @@ export function LoteDetalleClient({ loteId }: { loteId: string }) {
 
   const totalFilasLote = Object.values(conteoPorEstado).reduce((a, b) => a + b, 0);
 
+  async function eliminarLote() {
+    if (!lote || eliminando) return;
+    const detalleEstado = lote.puedeEliminarse
+      ? 'Ninguno generó movimientos reales en el sistema (todos fueron duplicados, inválidos, no encontrados o con error) — se eliminará únicamente el registro de este intento.'
+      : 'Esta lista ya generó movimientos reales y no puede eliminarse.';
+    if (!window.confirm(`¿Eliminar esta lista?\nEsta lista contiene ${lote.detectados} código(s).\n${detalleEstado}`)) return;
+
+    setEliminando(true);
+    setErrorEliminar(null);
+    try {
+      const res = await fetch(`/api/importacion/${lote.id}`, { method: 'DELETE' });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setErrorEliminar(data.error ?? 'No se pudo eliminar la lista.');
+        return;
+      }
+      router.push('/importacion');
+    } catch {
+      setErrorEliminar('Error de conexión. Intenta de nuevo.');
+    } finally {
+      setEliminando(false);
+    }
+  }
+
   return (
     <div className="space-y-5">
       <Link href="/importacion" className="inline-flex items-center gap-1.5 text-sm text-ink-soft dark:text-gray-400 hover:text-ink dark:hover:text-gray-100">
@@ -116,8 +145,19 @@ export function LoteDetalleClient({ loteId }: { loteId: string }) {
 
       {lote && (
         <Card>
-          <CardHeader>
+          <CardHeader className="flex flex-row items-start justify-between gap-2">
             <CardTitle>{lote.nombreLote ?? lote.nombreArchivo}</CardTitle>
+            <Button
+              size="sm"
+              variant="ghost"
+              title={lote.puedeEliminarse ? 'Eliminar lista' : 'Esta lista ya generó movimientos reales y no puede eliminarse'}
+              disabled={!lote.puedeEliminarse || eliminando}
+              onClick={eliminarLote}
+              className="shrink-0 gap-1.5 text-red-500 hover:bg-red-50 dark:hover:bg-red-500/10"
+            >
+              {eliminando ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Trash2 className="h-3.5 w-3.5" />}
+              Eliminar lista
+            </Button>
           </CardHeader>
           <CardContent className="space-y-1 text-sm text-ink-soft dark:text-gray-400">
             <p>
@@ -126,6 +166,12 @@ export function LoteDetalleClient({ loteId }: { loteId: string }) {
             <p>
               {lote.detectados} registros detectados · {lote.marcadosEntregado} entregados · {lote.creadosFaltantes} creados
             </p>
+            {!lote.puedeEliminarse && (
+              <p className="text-xs text-amber-600 dark:text-amber-400">
+                Esta lista ya generó movimientos reales en el sistema (paquetes creados, entregas o datos actualizados), por eso no puede eliminarse.
+              </p>
+            )}
+            {errorEliminar && <p className="text-xs text-red-600 dark:text-red-400">{errorEliminar}</p>}
           </CardContent>
         </Card>
       )}

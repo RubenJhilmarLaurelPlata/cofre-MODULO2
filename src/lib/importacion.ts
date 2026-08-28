@@ -5,6 +5,7 @@
 // ejecutarImportacion()/registrarImportLog(), y siempre despues de que
 // el administrador confirma un resumen ya validado contra la BD real.
 import ExcelJS from 'exceljs';
+import { Prisma } from '@prisma/client';
 import { prisma, TRANSACTION_OPTS } from '@/lib/prisma';
 import { normalizarCodigo, canonicalizarSeparadores } from '@/lib/codigo';
 import { registrarPago, aplicarPagoEnTx } from '@/lib/package-transitions';
@@ -435,6 +436,26 @@ export function aplicarEdicionesFilas(filas: FilaImportacion[], ediciones?: Edic
       ...(edicion.celular !== undefined ? { celular: edicion.celular } : {}),
     };
   });
+}
+
+/**
+ * Quita del conjunto a procesar las filas que el administrador eliminó en
+ * la previsualización (numeroFila, 1-indexado igual que en el resto del
+ * módulo) — ANTES de validarFilas(), igual criterio que
+ * aplicarEdicionesFilas(): una fila eliminada nunca debe llegar a
+ * validarFilas/ejecutarImportacion/registrarImportLog, así que no genera
+ * ningún ImportRow, no cuenta como duplicado/inválido/lo que sea, no
+ * puede crear Package/Pago/PackageHistory y no afecta Finanzas ni
+ * estadísticas — es exactamente como si esa fila nunca hubiera estado en
+ * el archivo. El frontend ya la retira de lo que muestra, pero esta
+ * función es la que hace que el servidor (no el cliente) sea quien
+ * realmente decide qué se procesa (ver comentario al inicio de
+ * src/app/api/importacion/route.ts).
+ */
+export function aplicarExclusionesFilas(filas: FilaImportacion[], exclusiones?: number[]): FilaImportacion[] {
+  if (!exclusiones || exclusiones.length === 0) return filas;
+  const excluidas = new Set(exclusiones);
+  return filas.filter((f) => !excluidas.has(f.numeroFila));
 }
 
 /**
@@ -1193,4 +1214,109 @@ export async function getLotesPorPackageId(packageIds: string[]): Promise<Record
     }
   }
   return mapa;
+}
+
+// ---------------------------------------------------------------------
+// Eliminar un lote de importación
+// ---------------------------------------------------------------------
+//
+// ImportLog SIEMPRE representa un lote ya APLICADO: la previsualización
+// (accion=previsualizar) nunca escribe nada en la base — validarFilas()
+// es de solo lectura y ejecutarImportacion()/registrarImportLog() solo se
+// llaman despues de "Confirmar importación" (ver POST en
+// src/app/api/importacion/route.ts). Por lo tanto no existe hoy ningun
+// ImportLog "todavia en previsualización" que sea trivial de borrar por
+// definición — la distinción segura no es previsualizado-vs-aplicado,
+// sino si el lote aplicado tuvo o no efecto real sobre Package/Pago/
+// PackageHistory.
+//
+// Esto ya es derivable con la estructura existente, sin ningun campo
+// nuevo: cada ImportRow guarda el estado final de su fila (ver
+// ejecutarImportacion()). Los estados CREADO/ENTREGADO/SOLO_DATOS/
+// EN_DEPOSITO son los unicos que pudieron haber creado o modificado un
+// Package/Pago/PackageHistory real; INVALIDO/DUPLICADO/NO_ENCONTRADO/
+// ERROR nunca tocaron nada. Un lote donde NINGUNA fila quedo en uno de
+// esos 4 estados es, por construccion, un intento que no dejo ningun
+// rastro financiero/operativo — borrar su ImportLog/ImportRow es
+// completamente seguro. Un lote con al menos una fila en esos estados
+// representa historia financiera/operativa real y NUNCA se borra (y
+// ImportRow.packageId no tiene relacion FK hacia Package — aunque se
+// permitiera, borrar el lote jamas podria cascadear hacia Package/Pago/
+// PackageHistory; el riesgo real es perder la trazabilidad de un
+// movimiento real, no un error de integridad referencial).
+export const ESTADOS_CON_EFECTO_REAL = ['CREADO', 'ENTREGADO', 'SOLO_DATOS', 'EN_DEPOSITO'];
+
+export class LoteNoEncontradoError extends Error {
+  constructor(id: string) {
+    super(`No se encontró ninguna importación con el id "${id}".`);
+    this.name = 'LoteNoEncontradoError';
+  }
+}
+
+export class LoteConEfectoRealError extends Error {
+  constructor(public readonly filasConEfecto: number) {
+    super(
+      `Esta lista ya generó movimientos reales en el sistema (${filasConEfecto} registro(s) creó, entregó o actualizó un paquete) y no puede eliminarse. Los registros históricos y financieros deben conservarse.`
+    );
+    this.name = 'LoteConEfectoRealError';
+  }
+}
+
+/** Ids de ImportLog que SÍ pueden eliminarse (cero filas con efecto real) — para marcar el botón en listados sin una consulta por fila. */
+export async function getLotesEliminables(importLogIds: string[]): Promise<Set<string>> {
+  if (importLogIds.length === 0) return new Set();
+  const conEfecto = await prisma.importRow.findMany({
+    where: { importLogId: { in: importLogIds }, estado: { in: ESTADOS_CON_EFECTO_REAL } },
+    select: { importLogId: true },
+    distinct: ['importLogId'],
+  });
+  const idsConEfecto = new Set(conEfecto.map((f) => f.importLogId));
+  return new Set(importLogIds.filter((id) => !idsConEfecto.has(id)));
+}
+
+/**
+ * Elimina un lote de importación completo (ImportLog + sus ImportRow) —
+ * solo si NINGUNA de sus filas tuvo efecto real (ver comentario arriba).
+ * Transaccional: el conteo de filas-con-efecto se vuelve a hacer DENTRO
+ * de la misma transacción justo antes de borrar (no confía en un chequeo
+ * hecho unos milisegundos antes), y si hay aunque sea una, se lanza
+ * LoteConEfectoRealError y Prisma revierte todo — no queda ningún
+ * ImportRow borrado a medias. Nunca toca Package/Pago/PackageHistory.
+ */
+export async function eliminarLoteImportacion(id: string, userId: string): Promise<{ nombreArchivo: string; nombreLote: string | null; detectados: number }> {
+  const log = await prisma.importLog.findUnique({ where: { id } });
+  if (!log) throw new LoteNoEncontradoError(id);
+
+  try {
+    await prisma.$transaction(async (tx) => {
+      const filasConEfecto = await tx.importRow.count({ where: { importLogId: id, estado: { in: ESTADOS_CON_EFECTO_REAL } } });
+      if (filasConEfecto > 0) throw new LoteConEfectoRealError(filasConEfecto);
+      await tx.importRow.deleteMany({ where: { importLogId: id } });
+      await tx.importLog.delete({ where: { id } });
+    }, TRANSACTION_OPTS);
+  } catch (err) {
+    // Carrera entre dos DELETE simultaneos sobre el mismo lote (ver
+    // revision previa a este commit): el "findUnique" de arriba puede
+    // encontrar el lote en ambas solicitudes antes de que cualquiera
+    // entre a su transaccion; la segunda en llegar a "tx.importLog.delete()"
+    // encuentra el registro ya borrado por la primera y Prisma lanza
+    // P2025 ("Record to delete does not exist"). Nunca deja nada a medias
+    // (la transaccion completa de la segunda solicitud se revierte, igual
+    // que cualquier otro error dentro de un $transaction) — solo hace
+    // falta traducir ese P2025 al mismo resultado que ya tiene "el lote
+    // no existe" (404 limpio), en vez de dejarlo caer al 500 generico.
+    if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2025') {
+      throw new LoteNoEncontradoError(id);
+    }
+    throw err;
+  }
+
+  await registrarAuditoria({
+    userId,
+    accion: 'IMPORTACION_LOTE_ELIMINADO',
+    modulo: 'importacion',
+    valorAnterior: { id, nombreArchivo: log.nombreArchivo, nombreLote: log.nombreLote, detectados: log.detectados },
+  });
+
+  return { nombreArchivo: log.nombreArchivo, nombreLote: log.nombreLote, detectados: log.detectados };
 }

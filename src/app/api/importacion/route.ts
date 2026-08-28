@@ -16,6 +16,7 @@ import {
   detectarEncabezados,
   validarFilas,
   aplicarEdicionesFilas,
+  aplicarExclusionesFilas,
   ejecutarImportacion,
   registrarImportLog,
   type FormatoImportacion,
@@ -117,6 +118,24 @@ export async function POST(req: Request) {
         if (Array.isArray(parsed)) filas = aplicarEdicionesFilas(filas, parsed as EdicionFila[]);
       } catch {
         return NextResponse.json({ error: 'Las ediciones enviadas no son válidas.' }, { status: 400 });
+      }
+    }
+
+    // Filas que el administrador quitó de la previsualización antes de
+    // confirmar (botón "Eliminar" por fila) — se descartan ANTES de
+    // validarFilas(), igual criterio que las ediciones de arriba: el
+    // servidor es quien realmente decide qué se procesa, nunca confía en
+    // que el cliente ya las haya omitido del archivo (ver
+    // aplicarExclusionesFilas en src/lib/importacion.ts). Una fila
+    // excluida nunca genera ImportRow, nunca puede crear Package/Pago/
+    // PackageHistory, y no afecta ningún conteo.
+    const exclusionesRaw = formData.get('exclusiones');
+    if (typeof exclusionesRaw === 'string' && exclusionesRaw.trim()) {
+      try {
+        const parsed = JSON.parse(exclusionesRaw);
+        if (Array.isArray(parsed)) filas = aplicarExclusionesFilas(filas, parsed as number[]);
+      } catch {
+        return NextResponse.json({ error: 'Las filas eliminadas enviadas no son válidas.' }, { status: 400 });
       }
     }
 

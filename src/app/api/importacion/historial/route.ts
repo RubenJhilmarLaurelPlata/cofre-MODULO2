@@ -2,6 +2,7 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { getSession } from '@/lib/auth';
+import { getLotesEliminables } from '@/lib/importacion';
 
 export async function GET() {
   const session = await getSession();
@@ -14,6 +15,11 @@ export async function GET() {
     take: 100,
     include: { user: { select: { nombre: true } } },
   });
+
+  // Una sola consulta batched para los hasta 100 lotes de esta página —
+  // ver getLotesEliminables() en src/lib/importacion.ts (nunca una
+  // consulta por fila).
+  const eliminables = await getLotesEliminables(registros.map((r) => r.id));
 
   return NextResponse.json(
     registros.map((r) => ({
@@ -31,6 +37,7 @@ export async function GET() {
       creadosFaltantes: r.creadosFaltantes,
       usuario: r.user?.nombre ?? 'Sistema',
       createdAt: r.createdAt.toISOString(),
+      puedeEliminarse: eliminables.has(r.id),
     }))
   );
 }

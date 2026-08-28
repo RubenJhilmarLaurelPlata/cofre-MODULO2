@@ -7,7 +7,7 @@
 // Nunca escribe nada sin que el administrador confirme el resumen.
 import * as React from 'react';
 import Link from 'next/link';
-import { Upload, FileText, CheckCircle2, XCircle, HelpCircle, Loader2, History, ClipboardList, PackageCheck, PackagePlus, Archive, Search, AlertTriangle, ArrowRight } from 'lucide-react';
+import { Upload, FileText, CheckCircle2, XCircle, HelpCircle, Loader2, History, ClipboardList, PackageCheck, PackagePlus, Archive, Search, AlertTriangle, ArrowRight, Trash2 } from 'lucide-react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
@@ -86,6 +86,10 @@ interface RegistroHistorial {
   creadosFaltantes: number;
   usuario: string;
   createdAt: string;
+  // Ver getLotesEliminables() en src/lib/importacion.ts: solo es true
+  // cuando NINGUNA fila del lote creó/entregó/actualizó un paquete real
+  // — nunca se calcula en el cliente.
+  puedeEliminarse: boolean;
 }
 
 // Antes "no_encontrado" se mostraba con la misma conotacion de problema
@@ -182,6 +186,41 @@ export function ImportacionClient({ tarifaBase }: ImportacionClientProps) {
     cargarHistorial();
   }, [cargarHistorial]);
 
+  // Eliminar lista/lote (ver eliminarLoteImportacion en
+  // src/lib/importacion.ts): "eliminandoLoteId" evita doble click sobre
+  // el mismo lote mientras la solicitud está en curso; "mensajeLote" es
+  // el aviso de éxito/error de la última operación — el servidor es
+  // quien decide si realmente se puede eliminar (h.puedeEliminarse solo
+  // sirve para deshabilitar el botón de antemano, nunca para saltarse la
+  // validación real).
+  const [eliminandoLoteId, setEliminandoLoteId] = React.useState<string | null>(null);
+  const [mensajeLote, setMensajeLote] = React.useState<{ tipo: 'exito' | 'error'; texto: string } | null>(null);
+
+  async function eliminarLote(h: RegistroHistorial) {
+    if (eliminandoLoteId) return;
+    const detalleEstado = h.puedeEliminarse
+      ? 'Ninguno generó movimientos reales en el sistema (todos fueron duplicados, inválidos, no encontrados o con error) — se eliminará únicamente el registro de este intento.'
+      : 'Esta lista ya generó movimientos reales (paquetes creados, entregas o datos actualizados) y no puede eliminarse.';
+    if (!window.confirm(`¿Eliminar esta lista?\nEsta lista contiene ${h.detectados} código(s).\n${detalleEstado}`)) return;
+
+    setEliminandoLoteId(h.id);
+    setMensajeLote(null);
+    try {
+      const res = await fetch(`/api/importacion/${h.id}`, { method: 'DELETE' });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setMensajeLote({ tipo: 'error', texto: data.error ?? 'No se pudo eliminar la lista.' });
+        return;
+      }
+      setHistorial((prev) => prev?.filter((x) => x.id !== h.id) ?? prev);
+      setMensajeLote({ tipo: 'exito', texto: `Lista "${h.nombreLote ?? h.nombreArchivo}" eliminada correctamente.` });
+    } catch {
+      setMensajeLote({ tipo: 'error', texto: 'Error de conexión. Intenta de nuevo.' });
+    } finally {
+      setEliminandoLoteId(null);
+    }
+  }
+
   function reiniciar(file: File | null) {
     setArchivo(file);
     setEncabezados(null);
@@ -191,6 +230,8 @@ export function ImportacionClient({ tarifaBase }: ImportacionClientProps) {
     setResultado(null);
     setError(null);
     setEdiciones({});
+    setFilasEliminadas(new Set());
+    setBusqueda('');
   }
 
   async function elegirArchivo(file: File | null) {
@@ -243,6 +284,24 @@ export function ImportacionClient({ tarifaBase }: ImportacionClientProps) {
   }
   const [ediciones, setEdiciones] = React.useState<Record<number, EdicionFila>>({});
 
+  // Filas quitadas de la previsualización con el botón "Eliminar" (por
+  // numeroFila) — nunca toca la BD por sí solo: solo deja de mostrarse y,
+  // al confirmar, se envía como "exclusiones" para que el SERVIDOR (no
+  // el cliente) las descarte antes de procesar nada (ver
+  // aplicarExclusionesFilas en src/lib/importacion.ts). Se reinicia junto
+  // con el resto del estado de previsualización en reiniciar(): volver a
+  // cargar el archivo original siempre empieza desde cero.
+  const [filasEliminadas, setFilasEliminadas] = React.useState<Set<number>>(new Set());
+
+  function eliminarFilaPreview(numeroFila: number) {
+    if (!window.confirm('¿Eliminar este código de la lista?\nEl código no se importará.')) return;
+    setFilasEliminadas((prev) => {
+      const next = new Set(prev);
+      next.add(numeroFila);
+      return next;
+    });
+  }
+
   function codigoMostrado(f: FilaValidada): string {
     return ediciones[f.numeroFila]?.codigo ?? f.codigoOficial ?? f.codigo;
   }
@@ -278,6 +337,11 @@ export function ImportacionClient({ tarifaBase }: ImportacionClientProps) {
     return JSON.stringify(entradas.map(([numeroFila, v]) => ({ numeroFila: Number(numeroFila), ...v })));
   }
 
+  function exclusiones_a_enviar(): string | null {
+    if (filasEliminadas.size === 0) return null;
+    return JSON.stringify(Array.from(filasEliminadas));
+  }
+
   async function previsualizar() {
     if (!archivo || procesando) return;
     setProcesando('previsualizar');
@@ -291,6 +355,8 @@ export function ImportacionClient({ tarifaBase }: ImportacionClientProps) {
       if (modoFechaRecepcion === 'unica') formData.append('fechaRecepcionUnica', fechaRecepcionUnica);
       const edicionesJson = ediciones_a_enviar();
       if (edicionesJson) formData.append('ediciones', edicionesJson);
+      const exclusionesJson = exclusiones_a_enviar();
+      if (exclusionesJson) formData.append('exclusiones', exclusionesJson);
       const res = await fetch('/api/importacion', { method: 'POST', body: formData });
       const data = await res.json();
       if (!res.ok) {
@@ -306,9 +372,17 @@ export function ImportacionClient({ tarifaBase }: ImportacionClientProps) {
     }
   }
 
-  const countValido = resumen?.filas.filter((f) => f.estado === 'valido').length ?? 0;
-  const countYaEntregado = resumen?.filas.filter((f) => f.estado === 'ya_entregado').length ?? 0;
-  const countNoEncontrado = resumen?.noEncontrados ?? 0;
+  // Filas que realmente se enviarán al confirmar: el resumen completo
+  // menos las que el administrador quitó con "Eliminar" — todos los
+  // conteos/validaciones de más abajo (afectadosPorTipo, puedeConfirmar,
+  // depositoSinFecha) se calculan sobre ESTE conjunto, nunca sobre
+  // resumen.filas directamente, para que la UI nunca prometa procesar una
+  // fila que ya no va a enviarse.
+  const filasActivas = React.useMemo(() => (resumen?.filas ?? []).filter((f) => !filasEliminadas.has(f.numeroFila)), [resumen, filasEliminadas]);
+
+  const countValido = filasActivas.filter((f) => f.estado === 'valido').length;
+  const countYaEntregado = filasActivas.filter((f) => f.estado === 'ya_entregado').length;
+  const countNoEncontrado = filasActivas.filter((f) => f.estado === 'no_encontrado').length;
 
   // MARCAR_ENTREGADOS y CREAR_Y_ENTREGAR tambien completan nombre/celular
   // de las filas "ya_entregado" (ver ejecutarImportacion en
@@ -327,23 +401,22 @@ export function ImportacionClient({ tarifaBase }: ImportacionClientProps) {
   // "fechaRecepcion" dejaría todas las filas sin fecha resuelta — se
   // avisa aquí antes de confirmar, aunque el backend es quien realmente
   // lo exige (ver REGLA 9).
-  const depositoSinFecha = tipo === 'CREAR_EN_DEPOSITO' && (resumen?.filas.filter((f) => f.estado === 'no_encontrado' && !f.fechaRecepcionResuelta).length ?? 0) > 0;
+  const depositoSinFecha = tipo === 'CREAR_EN_DEPOSITO' && filasActivas.filter((f) => f.estado === 'no_encontrado' && !f.fechaRecepcionResuelta).length > 0;
 
   const puedeConfirmar = !!resumen && !!archivo && nombreLote.trim().length > 0 && afectadosPorTipo[tipo] > 0 && !depositoSinFecha;
 
   const [busqueda, setBusqueda] = React.useState('');
   const filasFiltradas = React.useMemo(() => {
-    const filas = resumen?.filas ?? [];
     const q = busqueda.trim().toLowerCase();
-    if (!q) return filas;
-    return filas.filter((f) => {
+    if (!q) return filasActivas;
+    return filasActivas.filter((f) => {
       const codigo = codigoMostrado(f).toLowerCase();
       const nombre = nombreMostrado(f).toLowerCase();
       const celular = celularMostrado(f).toLowerCase();
       return codigo.includes(q) || nombre.includes(q) || celular.includes(q);
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [resumen, busqueda, ediciones]);
+  }, [filasActivas, busqueda, ediciones]);
 
   async function confirmar() {
     if (!archivo || !puedeConfirmar || procesando) return;
@@ -360,6 +433,8 @@ export function ImportacionClient({ tarifaBase }: ImportacionClientProps) {
       if (modoFechaRecepcion === 'unica') formData.append('fechaRecepcionUnica', fechaRecepcionUnica);
       const edicionesJson = ediciones_a_enviar();
       if (edicionesJson) formData.append('ediciones', edicionesJson);
+      const exclusionesJson = exclusiones_a_enviar();
+      if (exclusionesJson) formData.append('exclusiones', exclusionesJson);
       const res = await fetch('/api/importacion', { method: 'POST', body: formData });
       const data = await res.json();
       if (!res.ok) {
@@ -558,10 +633,18 @@ export function ImportacionClient({ tarifaBase }: ImportacionClientProps) {
               <ResumenNumero label="⚫ No se pueden importar" valor={resumen.invalidos} color="text-gray-600 dark:text-gray-400" />
             </div>
             <p className="text-xs text-ink-soft dark:text-gray-400">Esto es lo que ocurrirá al confirmar la importación — revisa antes de continuar.</p>
-            {resumen.filas.some((f) => f.requiereRevisionPago) && (
+            <p className="text-sm font-medium text-ink dark:text-gray-100">
+              {filasActivas.length} registro{filasActivas.length === 1 ? '' : 's'} para importar
+              {filasEliminadas.size > 0 && (
+                <span className="ml-1 font-normal text-gray-400 dark:text-gray-500">
+                  ({filasEliminadas.size} eliminado{filasEliminadas.size === 1 ? '' : 's'} de la lista, de {resumen.detectados} originales)
+                </span>
+              )}
+            </p>
+            {filasActivas.some((f) => f.requiereRevisionPago) && (
               <p className="flex items-center gap-1.5 text-xs text-amber-600 dark:text-amber-400">
                 <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
-                {resumen.filas.filter((f) => f.requiereRevisionPago).length} fila(s) ⚠️ existen pero no tienen ningún pago registrado y el archivo no trae un monto — no se generará ningún cobro
+                {filasActivas.filter((f) => f.requiereRevisionPago).length} fila(s) ⚠️ existen pero no tienen ningún pago registrado y el archivo no trae un monto — no se generará ningún cobro
                 para esas filas; revísalas manualmente después (ej. desde Finanzas → Corregir cobro).
               </p>
             )}
@@ -597,11 +680,23 @@ export function ImportacionClient({ tarifaBase }: ImportacionClientProps) {
                     <Input
                       value={codigoMostrado(f)}
                       onChange={(e) => editarFila(f.numeroFila, 'codigo', e.target.value)}
-                      className="h-8 w-36 font-mono text-xs"
+                      className="h-8 w-32 font-mono text-xs"
                     />
-                    <Badge variant={ESTADO_INFO[f.estado].variant}>
-                      {ESTADO_INFO[f.estado].emoji} {ESTADO_INFO[f.estado].label}
-                    </Badge>
+                    <div className="flex items-center gap-1">
+                      <Badge variant={ESTADO_INFO[f.estado].variant}>
+                        {ESTADO_INFO[f.estado].emoji} {ESTADO_INFO[f.estado].label}
+                      </Badge>
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        title="Eliminar de la lista"
+                        aria-label="Eliminar de la lista"
+                        onClick={() => eliminarFilaPreview(f.numeroFila)}
+                        className="h-8 w-8 shrink-0 p-0 text-red-500 hover:bg-red-50 dark:hover:bg-red-500/10"
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </Button>
+                    </div>
                   </div>
                   <div className="grid grid-cols-2 gap-2">
                     <div>
@@ -653,6 +748,7 @@ export function ImportacionClient({ tarifaBase }: ImportacionClientProps) {
                     <th className="px-3 py-2 font-medium">Recepción</th>
                     <th className="px-3 py-2 font-medium">Estado</th>
                     <th className="px-3 py-2 font-medium">Detalle</th>
+                    <th className="px-3 py-2 font-medium" />
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-gray-100 dark:divide-gray-800">
@@ -693,6 +789,18 @@ export function ImportacionClient({ tarifaBase }: ImportacionClientProps) {
                         )}
                       </td>
                       <td className="px-3 py-1.5 text-xs text-gray-400 dark:text-gray-500">{explicacionFila(f, tipo, tarifaBase) || '—'}</td>
+                      <td className="px-2 py-1.5">
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          title="Eliminar de la lista"
+                          aria-label="Eliminar de la lista"
+                          onClick={() => eliminarFilaPreview(f.numeroFila)}
+                          className="h-8 w-8 p-0 text-red-500 hover:bg-red-50 dark:hover:bg-red-500/10"
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                        </Button>
+                      </td>
                     </tr>
                   ))}
                 </tbody>
@@ -801,6 +909,19 @@ export function ImportacionClient({ tarifaBase }: ImportacionClientProps) {
           </CardTitle>
         </CardHeader>
         <CardContent>
+          {mensajeLote && (
+            <div
+              className={cn(
+                'mb-3 flex items-center gap-2 rounded-xl border p-3 text-sm',
+                mensajeLote.tipo === 'exito'
+                  ? 'border-emerald-200 dark:border-emerald-900/50 bg-emerald-50 dark:bg-emerald-500/10 text-emerald-700 dark:text-emerald-400'
+                  : 'border-red-200 dark:border-red-900/50 bg-red-50 dark:bg-red-500/10 text-red-700 dark:text-red-400'
+              )}
+            >
+              {mensajeLote.tipo === 'exito' ? <CheckCircle2 className="h-4 w-4 shrink-0" /> : <XCircle className="h-4 w-4 shrink-0" />}
+              {mensajeLote.texto}
+            </div>
+          )}
           {historial === null ? (
             <div className="flex items-center justify-center py-8 text-gray-400 dark:text-gray-500">
               <Loader2 className="h-5 w-5 animate-spin" />
@@ -817,9 +938,24 @@ export function ImportacionClient({ tarifaBase }: ImportacionClientProps) {
                     href={`/importacion/${h.id}`}
                     className="block rounded-xl border border-gray-100 dark:border-gray-800/60 p-3 active:bg-gray-50 dark:active:bg-gray-800/40"
                   >
-                    <div className="flex items-center justify-between">
-                      <p className="font-medium text-ink dark:text-gray-100">{h.nombreLote ?? h.nombreArchivo}</p>
+                    <div className="flex items-center justify-between gap-2">
+                      <p className="min-w-0 flex-1 truncate font-medium text-ink dark:text-gray-100">{h.nombreLote ?? h.nombreArchivo}</p>
                       <Badge variant="neutral">{TIPO_LABEL[h.tipoImportacion]}</Badge>
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        title={h.puedeEliminarse ? 'Eliminar lista' : 'Esta lista ya generó movimientos reales y no puede eliminarse'}
+                        aria-label="Eliminar lista"
+                        disabled={!h.puedeEliminarse || eliminandoLoteId === h.id}
+                        onClick={(e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          eliminarLote(h);
+                        }}
+                        className="h-8 w-8 shrink-0 p-0 text-red-500 hover:bg-red-50 dark:hover:bg-red-500/10"
+                      >
+                        {eliminandoLoteId === h.id ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Trash2 className="h-3.5 w-3.5" />}
+                      </Button>
                     </div>
                     <p className="mt-1 text-xs text-gray-400 dark:text-gray-500">
                       {fmtFechaHora(h.createdAt)} · {h.usuario}
@@ -846,6 +982,7 @@ export function ImportacionClient({ tarifaBase }: ImportacionClientProps) {
                       <th className="pb-2 text-right font-medium">Creados</th>
                       <th className="pb-2 font-medium">Usuario</th>
                       <th className="pb-2 font-medium" />
+                      <th className="pb-2 font-medium" />
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-gray-100 dark:divide-gray-800">
@@ -865,6 +1002,19 @@ export function ImportacionClient({ tarifaBase }: ImportacionClientProps) {
                           <Link href={`/importacion/${h.id}`} className="text-xs font-semibold text-brand-600 dark:text-brand-400 hover:underline">
                             Ver detalle
                           </Link>
+                        </td>
+                        <td className="py-2 text-right">
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            title={h.puedeEliminarse ? 'Eliminar lista' : 'Esta lista ya generó movimientos reales y no puede eliminarse'}
+                            aria-label="Eliminar lista"
+                            disabled={!h.puedeEliminarse || eliminandoLoteId === h.id}
+                            onClick={() => eliminarLote(h)}
+                            className="h-8 w-8 p-0 text-red-500 hover:bg-red-50 dark:hover:bg-red-500/10"
+                          >
+                            {eliminandoLoteId === h.id ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Trash2 className="h-3.5 w-3.5" />}
+                          </Button>
                         </td>
                       </tr>
                     ))}

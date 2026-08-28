@@ -7,6 +7,7 @@
 import { NextResponse, type NextRequest } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { getSession } from '@/lib/auth';
+import { eliminarLoteImportacion, LoteNoEncontradoError, LoteConEfectoRealError, ESTADOS_CON_EFECTO_REAL } from '@/lib/importacion';
 
 const TAMANO_PAGINA = 100;
 
@@ -72,9 +73,36 @@ export async function GET(req: NextRequest, { params }: { params: { id: string }
       createdAt: log.createdAt.toISOString(),
     },
     conteoPorEstado: Object.fromEntries(conteoPorEstado.map((c) => [c.estado, c._count.estado])),
+    // Derivado del mismo conteoPorEstado que ya se calculó arriba (sin
+    // consulta extra): si ninguna fila del lote quedó en un estado con
+    // efecto real, es seguro ofrecer "Eliminar lista" — ver comentario de
+    // eliminarLoteImportacion() en src/lib/importacion.ts.
+    puedeEliminarse: !conteoPorEstado.some((c) => ESTADOS_CON_EFECTO_REAL.includes(c.estado)),
     filas,
     total,
     pagina,
     totalPaginas: Math.max(1, Math.ceil(total / TAMANO_PAGINA)),
   });
+}
+
+/** Elimina un lote completo — solo si ninguna de sus filas tuvo efecto real (ver eliminarLoteImportacion en src/lib/importacion.ts). Transaccional; nunca toca Package/Pago/PackageHistory. */
+export async function DELETE(_req: Request, { params }: { params: { id: string } }) {
+  const session = await getSession();
+  if (!session || session.role !== 'ADMIN') {
+    return NextResponse.json({ error: 'No tienes permiso para esta acción' }, { status: 403 });
+  }
+
+  try {
+    const eliminado = await eliminarLoteImportacion(params.id, session.id);
+    return NextResponse.json({ ok: true, ...eliminado });
+  } catch (err) {
+    if (err instanceof LoteNoEncontradoError) {
+      return NextResponse.json({ error: err.message }, { status: 404 });
+    }
+    if (err instanceof LoteConEfectoRealError) {
+      return NextResponse.json({ error: err.message }, { status: 409 });
+    }
+    console.error('Error eliminando lote de importación:', err);
+    return NextResponse.json({ error: 'Ocurrió un error al eliminar la lista.' }, { status: 500 });
+  }
 }
