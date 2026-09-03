@@ -8,6 +8,7 @@
     "start": "next start",
     "lint": "next lint",
     "typecheck": "tsc --noEmit",
+    "test": "vitest run",
     "prisma:generate": "prisma generate",
     "prisma:push": "prisma db push",
     "prisma:studio": "prisma studio",
@@ -46,6 +47,7 @@
     "prisma": "5.19.1",
     "tailwindcss": "3.4.10",
     "tsx": "^4.23.8",
-    "typescript": "5.6.2"
+    "typescript": "5.6.2",
+    "vitest": "^2.1.9"
   }
 }

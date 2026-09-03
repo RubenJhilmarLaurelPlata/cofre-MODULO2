@@ -64,18 +64,19 @@ model User {
   createdAt        DateTime  @default(now())
   updatedAt        DateTime  @updatedAt
 
-  paquetesRegistrados Package[]        @relation("PackageRegistradoPor")
-  historialAcciones   PackageHistory[]
-  lotesGenerados      LabelBatch[]
-  reportesGenerados   ReportLog[]
-  auditorias          AuditLog[]
-  respaldos           Backup[]
-  pagosRegistrados    Pago[]
-  gastosRegistrados   Gasto[]
-  cierresCaja         CierreCaja[]
-  importaciones       ImportLog[]
-  cajasAbiertas       CajaSesion[] @relation("CajaAbiertaPor")
-  cajasCerradas       CajaSesion[] @relation("CajaCerradaPor")
+  paquetesRegistrados     Package[]        @relation("PackageRegistradoPor")
+  historialAcciones       PackageHistory[]
+  lotesGenerados          LabelBatch[]
+  reportesGenerados       ReportLog[]
+  auditorias              AuditLog[]
+  respaldos               Backup[]
+  pagosRegistrados        Pago[]
+  gastosRegistrados       Gasto[]
+  cierresCaja             CierreCaja[]
+  importaciones           ImportLog[]
+  importacionesRevertidas ImportLog[]      @relation("ImportLogRevertidoPor")
+  cajasAbiertas           CajaSesion[]     @relation("CajaAbiertaPor")
+  cajasCerradas           CajaSesion[]     @relation("CajaCerradaPor")
 
   @@index([role])
   @@index([branchId])
@@ -197,22 +198,22 @@ model PackageSeries {
 }
 
 model GeneratedCode {
-  code           String        @id
-  inicial        String
-  serie          PackageSeries @relation(fields: [inicial], references: [inicial])
-  fechaGenerado  String
-  usado          Boolean       @default(false)
+  code                  String        @id
+  inicial               String
+  serie                 PackageSeries @relation(fields: [inicial], references: [inicial])
+  fechaGenerado         String
+  usado                 Boolean       @default(false)
   // Cuantas veces se reimprimio este codigo (pestaña Reimprimir/Historial
   // del Modulo 5), para el Reporte de Etiquetas del Modulo 6.
-  vecesReimpreso Int           @default(0)
-  createdAt      DateTime      @default(now())
+  vecesReimpreso        Int           @default(0)
+  createdAt             DateTime      @default(now())
   // Tarifa base propia de ESTE codigo (Paso B: Codigos personalizados),
   // distinta de "serie.tarifaBaseOverride". Permite que una misma
   // inicial/serie conviva con generaciones a montos distintos (ej. dos
   // lotes "Q16" generados en momentos distintos con tarifas diferentes).
   // Si es null, Recepcion usa la tarifa de la serie o la tarifa base
   // general de la empresa, igual que hasta ahora.
-  tarifaOverride Float?
+  tarifaOverride        Float?
   // Dias incluidos propios de ESTE codigo (Fase 4B: "Nuevo lote" desde
   // Recepcion), mismo criterio que tarifaOverride — si es null, se usa
   // company.diasIncluidos como siempre.
@@ -255,7 +256,7 @@ model LabelBatch {
   primerConsecutivo Int
   ultimoConsecutivo Int
 
-  observaciones String @default("")
+  observaciones String  @default("")
   // Nombre amigable opcional (Fase 4B: "Nuevo lote" desde Recepcion, ej.
   // "Fajas"), distinto de "observaciones" (texto autogenerado). Null para
   // lotes creados desde Etiquetas (su flujo no cambia, no lo usa).
@@ -302,7 +303,7 @@ model Package {
   entregaAt   DateTime?
   denegadoAt  DateTime?
 
-  tarifaBaseOverride Float?
+  tarifaBaseOverride    Float?
   // Dias incluidos propios de este paquete (Fase 4B), copiado desde
   // GeneratedCode.diasIncluidosOverride al momento del escaneo cuando el
   // codigo viene de un lote con duracion propia (ej. "Q16, 10 dias"). Si
@@ -429,7 +430,20 @@ model ImportLog {
   user              User?    @relation(fields: [userId], references: [id])
   createdAt         DateTime @default(now())
 
-  rows ImportRow[]
+  // Reversion administrativa (distinta de eliminarLoteImportacion, que
+  // solo borra lotes SIN efecto real): un lote revertido conserva su
+  // ImportLog/ImportRow para siempre como rastro de auditoria ("esto se
+  // importo y despues se revirtio"), a diferencia de eliminarLoteImportacion
+  // que borra el registro completo porque nunca tuvo ningun efecto que
+  // recordar. Null = nunca revertido. Ver revertirLoteImportacion() en
+  // src/lib/importacion.ts.
+  revertidoAt    DateTime?
+  revertidoPorId String?
+  revertidoPor   User?     @relation("ImportLogRevertidoPor", fields: [revertidoPorId], references: [id])
+
+  rows      ImportRow[]
+  pagos     Pago[]
+  historial PackageHistory[]
 
   @@index([createdAt])
 }
@@ -486,11 +500,23 @@ model Pago {
   userId String?
   user   User?   @relation(fields: [userId], references: [id])
 
+  // Que importacion administrativa (si alguna) genero este movimiento —
+  // null para cualquier pago normal (Recepcion/Entrega/Finanzas), nunca se
+  // llena a mano. Existe UNICAMENTE para que revertirLoteImportacion()
+  // pueda encontrar con exactitud, y sin ambiguedad, que Pago debe
+  // deshacer al revertir un lote — antes de este campo no habia forma de
+  // distinguir un Pago generado por una importacion de uno genuino sobre
+  // el mismo paquete (ver auditoria de Fase 2: "Muy importante: eliminacion
+  // / reversion de importaciones").
+  importLogId String?
+  importLog   ImportLog? @relation(fields: [importLogId], references: [id])
+
   createdAt DateTime @default(now())
 
   @@index([packageId])
   @@index([tipo])
   @@index([createdAt])
+  @@index([importLogId])
 }
 
 // ---------------------------------------------------------------------
@@ -579,9 +605,17 @@ model PackageHistory {
   user      User?    @relation(fields: [userId], references: [id])
   nota      String?
 
+  // Mismo criterio que Pago.importLogId (ver ese comentario): que
+  // importacion administrativa (si alguna) escribio esta fila de
+  // historial, para que revertirLoteImportacion() pueda ubicar con
+  // exactitud la transicion de estado que debe deshacer.
+  importLogId String?
+  importLog   ImportLog? @relation(fields: [importLogId], references: [id])
+
   @@index([packageId])
   @@index([fecha])
   @@index([userId])
+  @@index([importLogId])
 }
 
 // ---------------------------------------------------------------------

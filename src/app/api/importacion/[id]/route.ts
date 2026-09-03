@@ -71,6 +71,7 @@ export async function GET(req: NextRequest, { params }: { params: { id: string }
       creadosFaltantes: log.creadosFaltantes,
       usuario: log.user?.nombre ?? 'Sistema',
       createdAt: log.createdAt.toISOString(),
+      revertidoAt: log.revertidoAt ? log.revertidoAt.toISOString() : null,
     },
     conteoPorEstado: Object.fromEntries(conteoPorEstado.map((c) => [c.estado, c._count.estado])),
     // Derivado del mismo conteoPorEstado que ya se calculó arriba (sin
@@ -78,6 +79,7 @@ export async function GET(req: NextRequest, { params }: { params: { id: string }
     // efecto real, es seguro ofrecer "Eliminar lista" — ver comentario de
     // eliminarLoteImportacion() en src/lib/importacion.ts.
     puedeEliminarse: !conteoPorEstado.some((c) => ESTADOS_CON_EFECTO_REAL.includes(c.estado)),
+    puedeRevertirse: conteoPorEstado.some((c) => ESTADOS_CON_EFECTO_REAL.includes(c.estado)) && !log.revertidoAt,
     filas,
     total,
     pagina,

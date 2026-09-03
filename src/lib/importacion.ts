@@ -2,17 +2,19 @@
 // Importacion masiva de codigos (Fase 2): registrar datos, marcar como
 // ENTREGADO, o crear+marcar codigos que nunca pasaron por Recepcion.
 // Nunca escribe nada durante el parseo/validacion — eso solo ocurre en
-// ejecutarImportacion()/registrarImportLog(), y siempre despues de que
-// el administrador confirma un resumen ya validado contra la BD real.
+// ejecutarImportacion()/crearImportLogInicial()/finalizarImportLog(), y
+// siempre despues de que el administrador confirma un resumen ya validado
+// contra la BD real.
 import ExcelJS from 'exceljs';
-import { Prisma } from '@prisma/client';
+import { Prisma, type PackageSeries } from '@prisma/client';
 import { prisma, TRANSACTION_OPTS } from '@/lib/prisma';
 import { normalizarCodigo, canonicalizarSeparadores } from '@/lib/codigo';
-import { registrarPago, aplicarPagoEnTx } from '@/lib/package-transitions';
-import { registrarAuditoria } from '@/lib/auditoria';
+import { registrarPagoEnTx, aplicarPagoEnTx } from '@/lib/package-transitions';
+import { registrarAuditoria, type RegistrarAuditoriaParams } from '@/lib/auditoria';
 import { getCompanyConfig, getHolidaySet } from '@/lib/config';
 import { calcularCosto } from '@/lib/pricing';
 import { fechaReferencia } from '@/lib/package-detail';
+import type { PaymentStatus } from '@/types';
 
 export type FormatoImportacion = 'CSV' | 'XLSX' | 'TXT';
 
@@ -578,20 +580,233 @@ function parseFechaHora(fecha?: string, hora?: string): Date | null {
   return Number.isNaN(d.getTime()) ? null : d;
 }
 
-// Procesamiento en bloques (no 10.000 filas de una vez ni todas en
-// paralelo sin control): cada fila dentro de un bloque es atomica en si
-// misma (su propia transaccion/registrarPago), y se resuelve con
-// Promise.allSettled para que una fila con error nunca tumbe a las demas
-// del mismo bloque. Los bloques solo limitan cuantas operaciones estan
-// en vuelo al mismo tiempo — la seguridad de escritura concurrente ya la
-// da connection_limit=1 + WAL (ver src/lib/prisma.ts, Fase 1), la misma
-// proteccion ya validada con escaneos realmente simultaneos.
-const TAMANO_BLOQUE = 250;
+/**
+ * Fecha operativa de ENTREGA para una fila, con la prioridad correcta
+ * (causa raíz del bug de fechas confirmado en auditoría — "Finanzas
+ * registraba el cobro con la fecha de HOY en vez de la fecha operativa
+ * elegida"):
+ *
+ *   1. Columna explícita "Fecha de entrega" (fila.fecha/fila.hora) del
+ *      archivo, si el administrador la mapeó — permite importar un
+ *      archivo donde recepción y entrega ocurrieron en fechas distintas.
+ *   2. Si no hay columna de entrega propia, la fecha operativa que el
+ *      administrador seleccionó para toda la lista (fila.fechaRecepcionResuelta,
+ *      ver OpcionesFechaRecepcion) — el caso normal de "esta lista entera
+ *      corresponde a un día histórico", que es exactamente lo que pide la
+ *      especificación: la fecha elegida en el paso 2 de Importación es la
+ *      fecha operativa de TODO el evento (recepción Y entrega), no solo de
+ *      un campo aislado.
+ *   3. Solo si ninguna de las dos está presente (el administrador no
+ *      seleccionó ninguna fecha y el archivo tampoco trae una), "ahora" —
+ *      mismo comportamiento de siempre para una importación sin fechas
+ *      históricas.
+ *
+ * ANTES esta función no existía: cada llamador hacía
+ * `parseFechaHora(fila.fecha, fila.hora) ?? new Date()` directo, saltando
+ * el paso 2 por completo — así es como un import con fecha única
+ * 27/08/2026 pero sin columna de "fecha de entrega" en el Excel terminaba
+ * con entregaAt/Pago.createdAt en la fecha REAL de ejecución (hoy) en vez
+ * de la fecha operativa elegida.
+ */
+function fechaOperativaFallback(fila: Pick<FilaValidada, 'fecha' | 'hora' | 'fechaRecepcionResuelta'>): Date {
+  return parseFechaHora(fila.fecha, fila.hora) ?? (fila.fechaRecepcionResuelta ? new Date(`${fila.fechaRecepcionResuelta}T00:00:00`) : new Date());
+}
+
+/** Info de progreso de UNA fila ya procesada (ok o con error), para que el llamador (la ruta HTTP) pueda reportarlo en vivo por SSE — ver src/lib/importacion-jobs.ts. */
+export interface ProgresoFila {
+  numeroFila: number;
+  codigo: string;
+  accion: string;
+}
+export type OnProgreso = (info: ProgresoFila, huboError: boolean) => void;
+
+// ---------------------------------------------------------------------
+// Arquitectura de escritura masiva (bloques + SAVEPOINT)
+// ---------------------------------------------------------------------
+//
+// Antes (hasta la version anterior de este archivo): cada fila abria su
+// PROPIA transaccion fisica (`prisma.$transaction`, con su propio
+// BEGIN/COMMIT/fsync — ver TRANSACTION_OPTS en src/lib/prisma.ts), y las
+// filas de un mismo bloque se lanzaban con `Promise.allSettled` +
+// `bloque.map(...)`, es decir, hasta 250 transacciones/round-trips
+// intentando avanzar EN PARALELO sobre la unica conexion que permite
+// `connection_limit=1`. En un import de 1.999 filas eso son hasta 1.999
+// transacciones fisicas y hasta 250 escrituras "simultaneas" compitiendo
+// por una conexion que solo puede atender una a la vez — la causa real
+// del riesgo de SQLITE_BUSY/504 en produccion con archivos grandes.
+//
+// Ahora: cada BLOQUE de ~200 filas es UNA sola transaccion fisica
+// (un solo BEGIN/COMMIT/fsync para las 200), y las filas dentro del
+// bloque se procesan de forma estrictamente SECUENCIAL (nunca paralela)
+// usando SAVEPOINT/RELEASE/ROLLBACK TO (ver conSavepoint() mas abajo)
+// para que una fila con error revierta UNICAMENTE sus propios cambios,
+// sin afectar a las demas filas ya confirmadas del mismo bloque ni forzar
+// una transaccion fisica por fila. Para 1.999 filas esto son ~10
+// transacciones fisicas en vez de ~1.999, sin perder el aislamiento por
+// fila que ya se probo necesario (una fila mala no debe tumbar al resto).
+//
+// Verificado con una prueba real y aislada contra SQLite (ver commit):
+// SAVEPOINT/ROLLBACK TO SAVEPOINT dentro de una transaccion interactiva
+// de Prisma 5.19.1 revierte solo la fila fallida y deja la transaccion
+// perfectamente utilizable para las filas siguientes; y NUNCA debe
+// llamarse al cliente `prisma` de nivel superior (ej. registrarAuditoria)
+// desde DENTRO de esa transaccion — con connection_limit=1 eso se cuelga
+// para siempre (la unica conexion ya esta tomada). Por eso cada funcion
+// de escritura junta las auditorias pendientes durante el bloque y las
+// ejecuta recien DESPUES de que la transaccion del bloque hizo commit.
+const TAMANO_BLOQUE = 200;
+
+// Limite de tiempo para la transaccion fisica de UN bloque completo (no
+// de una fila). Con SAVEPOINT en vez de COMMIT por fila, el costo de
+// fsync solo se paga una vez por bloque (no por fila) — 200 filas con
+// unas pocas escrituras cada una tardan, en la practica, un orden de
+// magnitud menos que esto; el margen es deliberadamente generoso para
+// tolerar un disco/CPU cargado sin ocultar un problema real (ver
+// benchmark real reportado al final del cambio) — nunca se subio a algo
+// como 5 minutos solo para evitar ver un timeout.
+const TIMEOUT_BLOQUE_MS = 30_000;
 
 function enBloques<T>(items: T[], tamano: number): T[][] {
   const bloques: T[][] = [];
   for (let i = 0; i < items.length; i += tamano) bloques.push(items.slice(i, i + tamano));
   return bloques;
+}
+
+/**
+ * Ejecuta fn() dentro de un SAVEPOINT propio de esta fila, dentro de una
+ * transaccion de bloque ya abierta (tx). Si fn() falla, revierte SOLO los
+ * cambios de esta fila (ROLLBACK TO SAVEPOINT) sin afectar las demas
+ * filas ya confirmadas (RELEASE) del mismo bloque, y relanza el error
+ * original para que el llamador lo registre como el error de esta fila
+ * puntual — igual comportamiento observable que antes (una fila con error
+ * no tumba a las demas), solo que ahora sin pagar una transaccion fisica
+ * por fila.
+ *
+ * "indice" es siempre un numero generado internamente (la posicion de la
+ * fila dentro del bloque, 0..bloque.length-1) — el nombre del SAVEPOINT
+ * se arma a partir de ese numero, NUNCA de un dato proveniente del
+ * archivo/usuario (codigo, nombre, etc.), para que sea imposible
+ * interpolar algo controlado por el archivo importado dentro del SQL.
+ */
+async function conSavepoint<T>(tx: Prisma.TransactionClient, indice: number, fn: () => Promise<T>): Promise<T> {
+  const nombre = `sp_${indice}`;
+  await tx.$executeRawUnsafe(`SAVEPOINT ${nombre}`);
+  try {
+    const valor = await fn();
+    await tx.$executeRawUnsafe(`RELEASE SAVEPOINT ${nombre}`);
+    return valor;
+  } catch (err) {
+    await tx.$executeRawUnsafe(`ROLLBACK TO SAVEPOINT ${nombre}`);
+    await tx.$executeRawUnsafe(`RELEASE SAVEPOINT ${nombre}`);
+    throw err;
+  }
+}
+
+interface ResultadoFilaBloque<T> {
+  numeroFila: number;
+  ok: boolean;
+  valor?: T;
+  error?: unknown;
+}
+
+/**
+ * Orquestador comun de la arquitectura de bloques: agrupa "filas" en
+ * bloques de TAMANO_BLOQUE, abre UNA transaccion fisica por bloque, y
+ * dentro de ella procesa cada fila secuencialmente envuelta en su propio
+ * SAVEPOINT (conSavepoint). Usado por las 4 funciones de escritura masiva
+ * (confirmarImportacion, crearPaquetesFaltantes, crearPaquetesEnDeposito,
+ * registrarSoloDatos) para que las 4 compartan EXACTAMENTE la misma
+ * mecanica de transaccion/aislamiento — la logica de negocio de cada una
+ * (que campos escribe, que financiero aplica) vive entera en
+ * "procesarFila", nunca aqui.
+ *
+ * "auditoriasPendientes" (out param): cada fila puede devolver, junto a su
+ * valor, una funcion `auditoria` opcional (ej. cuando registro un cobro) —
+ * esas funciones se acumulan aqui y el llamador las ejecuta DESPUES de
+ * cada bloque (nunca dentro del bloque, ver comentario de conSavepoint /
+ * registrarPagoEnTx sobre por que eso se colgaria).
+ */
+/**
+ * "onProgreso" (opcional): se dispara UNA VEZ por fila, justo despues de
+ * resolverla (ok o error) — nunca desde dentro del SAVEPOINT (evita que un
+ * callback lento retrase el commit del bloque) y nunca en paralelo (la
+ * arquitectura sigue siendo estrictamente secuencial dentro de cada
+ * bloque). "accionFila" convierte la fila en el texto que ve el
+ * administrador en vivo (ej. "Creando paquete...") — cada funcion de
+ * escritura masiva pasa la suya propia porque cada una hace algo distinto.
+ */
+async function procesarEnBloques<F extends { numeroFila: number; codigo: string }, T extends { auditoria?: () => Promise<void> }>(
+  filas: F[],
+  procesarFila: (tx: Prisma.TransactionClient, fila: F) => Promise<T>,
+  opts?: { onProgreso?: OnProgreso; accionFila?: (fila: F) => string }
+): Promise<ResultadoFilaBloque<T>[]> {
+  const resultados: ResultadoFilaBloque<T>[] = [];
+
+  for (const bloque of enBloques(filas, TAMANO_BLOQUE)) {
+    const resultadosBloque: ResultadoFilaBloque<T>[] = [];
+
+    await prisma.$transaction(async (tx) => {
+      for (let i = 0; i < bloque.length; i++) {
+        const fila = bloque[i]!;
+        try {
+          const valor = await conSavepoint(tx, i, () => procesarFila(tx, fila));
+          resultadosBloque.push({ numeroFila: fila.numeroFila, ok: true, valor });
+        } catch (error) {
+          resultadosBloque.push({ numeroFila: fila.numeroFila, ok: false, error });
+        }
+      }
+    }, { maxWait: TRANSACTION_OPTS.maxWait, timeout: TIMEOUT_BLOQUE_MS });
+
+    // Las auditorias de este bloque recien se disparan aqui, con la
+    // transaccion ya confirmada (commit) — nunca desde adentro.
+    for (const r of resultadosBloque) {
+      if (r.ok && r.valor?.auditoria) await r.valor.auditoria();
+    }
+
+    if (opts?.onProgreso) {
+      for (let i = 0; i < bloque.length; i++) {
+        const fila = bloque[i]!;
+        const r = resultadosBloque[i]!;
+        opts.onProgreso({ numeroFila: fila.numeroFila, codigo: fila.codigo, accion: opts.accionFila?.(fila) ?? 'Procesando...' }, !r.ok);
+      }
+    }
+
+    resultados.push(...resultadosBloque);
+  }
+
+  return resultados;
+}
+
+/**
+ * Resuelve (o crea) la PackageSeries de cada inicial DISTINTA presente en
+ * las filas que van a crear un paquete nuevo — UNA SOLA VEZ para todo el
+ * lote, antes de procesar ninguna fila. Antes, crearPaquetesFaltantes()/
+ * crearPaquetesEnDeposito() hacian un `packageSeries.upsert()` POR FILA
+ * (hasta 1.999 upserts identicos para el mismo puñado real de iniciales
+ * distintas en un archivo tipico). Secuencial a proposito (no
+ * concurrente): son pocas iniciales incluso en archivos grandes, y evita
+ * dos upsert simultaneos sobre la misma fila de PackageSeries. El
+ * resultado final en la base es identico a hacerlo por fila (upsert es
+ * idempotente e independiente del orden).
+ */
+async function resolverSeriesUnaVez(filas: FilaValidada[]): Promise<Map<string, PackageSeries>> {
+  const iniciales = new Set<string>();
+  for (const fila of filas) {
+    const code = canonicalizarSeparadores(fila.codigo.trim()).toUpperCase();
+    const inicial = code.match(/^[A-Z]+/)?.[0];
+    if (inicial) iniciales.add(inicial);
+  }
+
+  const cache = new Map<string, PackageSeries>();
+  for (const inicial of iniciales) {
+    const serie = await prisma.packageSeries.upsert({
+      where: { inicial },
+      update: {},
+      create: { inicial, descripcion: `Serie ${inicial} (creada por importación)`, correlativo: 0 },
+    });
+    cache.set(inicial, serie);
+  }
+  return cache;
 }
 
 export interface ResultadoConfirmacion {
@@ -600,69 +815,98 @@ export interface ResultadoConfirmacion {
   errores: Array<{ fila: number; motivo: string }>;
 }
 
+interface ResultadoFilaConfirmacion {
+  entregado: boolean;
+  auditoria?: () => Promise<void>;
+}
+
 /** Marca como ENTREGADO cada fila "valido" de una validacion ya hecha. Nunca crea paquetes que no existen (ver crearPaquetesFaltantes). */
-export async function confirmarImportacion(filas: FilaValidada[], userId: string): Promise<ResultadoConfirmacion> {
+export async function confirmarImportacion(
+  filas: FilaValidada[],
+  userId: string,
+  opts?: { importLogId?: string; onProgreso?: OnProgreso }
+): Promise<ResultadoConfirmacion> {
   const aProcesar = filas.filter((f) => f.estado === 'valido' && f.packageId);
   let marcadosEntregado = 0;
   const errores: Array<{ fila: number; motivo: string }> = [];
 
-  for (const bloque of enBloques(aProcesar, TAMANO_BLOQUE)) {
-    const resultados = await Promise.allSettled(
-      bloque.map(async (fila) => {
-        const pkg = await prisma.package.findUnique({ where: { id: fila.packageId! } });
-        if (!pkg || pkg.status === 'ENTREGADO' || pkg.status === 'DENEGADO') return false; // cambio de estado mientras tanto: se salta, no se rompe el resto
+  // Cargados una sola vez para todo el lote — ver mismo criterio en
+  // crearPaquetesFaltantes(). Necesario aqui porque registrarPagoEnTx()
+  // (a diferencia de registrarPago()) no los vuelve a consultar el mismo.
+  const [company, feriados] = await Promise.all([getCompanyConfig(), getHolidaySet()]);
+  const reglas = { tarifaBase: company.tarifaBase, diasIncluidos: company.diasIncluidos, costoAdicionalDia: company.costoAdicionalDia };
 
-        const entregaAt = parseFechaHora(fila.fecha, fila.hora) ?? new Date();
+  const resultados = await procesarEnBloques<FilaValidada, ResultadoFilaConfirmacion>(
+    aProcesar,
+    async (tx, fila) => {
+      const pkg = await tx.package.findUnique({ where: { id: fila.packageId! } });
+      if (!pkg || pkg.status === 'ENTREGADO' || pkg.status === 'DENEGADO') return { entregado: false }; // cambio de estado mientras tanto: se salta, no se rompe el resto
 
-        const actualizado = await prisma.$transaction(async (tx) => {
-          const res = await tx.package.updateMany({
-            where: { id: pkg.id, status: pkg.status },
-            data: {
-              status: 'ENTREGADO',
-              entregaAt,
-              // Origen estructurado (Fase 2): nunca debe parecer una
-              // entrega hecha con el lector.
-              origenEntrega: 'IMPORTACION',
-              ...(fila.personaRecoge ? { destinatario: fila.personaRecoge } : {}),
-              ...(fila.celular ? { destinatarioTelefono: fila.celular } : {}),
-            },
-          });
-          if (res.count === 0) return null;
-          await tx.packageHistory.create({ data: { packageId: pkg.id, estado: 'ENTREGADO', fecha: entregaAt, userId, nota: 'Importación administrativa' } });
-          return tx.package.findUniqueOrThrow({ where: { id: pkg.id } });
-        }, TRANSACTION_OPTS);
-        if (!actualizado) return false;
+      // Fecha operativa de entrega — ver fechaOperativaFallback(): respeta
+      // la fecha elegida en el paso 2 de Importación (fechaRecepcionResuelta)
+      // cuando el archivo no trae una columna de "fecha de entrega" propia
+      // para esta fila. Antes caía directo a "ahora", que es la causa raíz
+      // confirmada en auditoría del bug "Finanzas cobra hoy en vez del día
+      // seleccionado".
+      const entregaAt = fechaOperativaFallback(fila);
 
-        // Seguridad financiera (REGLA 5/6): "pkg" se releyo de la BD justo
-        // arriba, asi que "pkg.montoPagado" es el valor real al momento de
-        // procesar esta fila (no el de la previsualizacion, que pudo haber
-        // quedado desactualizado). Si el paquete YA tenia algun pago
-        // (ej. un anticipo cargado en Recepcion), la importacion NUNCA
-        // agrega otro movimiento — evita duplicar/inflar un cobro sobre un
-        // paquete que ya traia su propio dinero real. Solo se cobra cuando
-        // no habia ningun pago Y el archivo trajo un monto EXPLICITO para
-        // esta fila (fila.monto !== undefined) — nunca una tarifa asumida
-        // (ver validarFilas(): esta funcion ya no rellena fila.monto con
-        // ningun valor por defecto).
-        if (pkg.montoPagado <= 0 && fila.monto !== undefined && fila.monto > 0) {
-          // "entregaAt" (no "ahora"): si el archivo trae fecha, el cobro
-          // debe quedar contabilizado en Finanzas ese dia — nunca hoy (ver
-          // especificacion, "Importacion con fechas").
-          await registrarPago(actualizado, 'COBRO_ENTREGA', fila.monto, userId, 'Importación administrativa', entregaAt);
-        }
-        return true;
-      })
-    );
+      const res = await tx.package.updateMany({
+        where: { id: pkg.id, status: pkg.status },
+        data: {
+          status: 'ENTREGADO',
+          entregaAt,
+          // Origen estructurado (Fase 2): nunca debe parecer una
+          // entrega hecha con el lector.
+          origenEntrega: 'IMPORTACION',
+          ...(fila.personaRecoge ? { destinatario: fila.personaRecoge } : {}),
+          ...(fila.celular ? { destinatarioTelefono: fila.celular } : {}),
+        },
+      });
+      if (res.count === 0) return { entregado: false };
+      await tx.packageHistory.create({
+        data: { packageId: pkg.id, estado: 'ENTREGADO', fecha: entregaAt, userId, nota: 'Importación administrativa', importLogId: opts?.importLogId ?? null },
+      });
 
-    resultados.forEach((r, i) => {
-      const fila = bloque[i]!;
-      if (r.status === 'fulfilled') {
-        if (r.value) marcadosEntregado++;
-      } else {
-        errores.push({ fila: fila.numeroFila, motivo: r.reason instanceof Error ? r.reason.message : 'Error desconocido' });
+      // Seguridad financiera (REGLA 5/6): "pkg" se releyo justo arriba,
+      // dentro de este mismo SAVEPOINT, asi que "pkg.montoPagado" es el
+      // valor real al momento de procesar esta fila (no el de la
+      // previsualizacion, que pudo haber quedado desactualizada). Si el
+      // paquete YA tenia algun pago (ej. un anticipo cargado en Recepcion),
+      // la importacion NUNCA agrega otro movimiento — evita duplicar/inflar
+      // un cobro sobre un paquete que ya traia su propio dinero real. Solo
+      // se cobra cuando no habia ningun pago Y el archivo trajo un monto
+      // EXPLICITO para esta fila (fila.monto !== undefined) — nunca una
+      // tarifa asumida (ver validarFilas(): esta funcion ya no rellena
+      // fila.monto con ningun valor por defecto).
+      if (pkg.montoPagado <= 0 && fila.monto !== undefined && fila.monto > 0) {
+        // "entregaAt" (no "ahora"): si el archivo trae fecha, el cobro debe
+        // quedar contabilizado en Finanzas ese dia — nunca hoy (ver
+        // especificacion, "Importacion con fechas").
+        const actualizado = await registrarPagoEnTx(tx, pkg, 'COBRO_ENTREGA', fila.monto, userId, reglas, feriados, 'Importación administrativa', entregaAt, opts?.importLogId);
+        return {
+          entregado: true,
+          auditoria: () =>
+            registrarAuditoria({
+              userId: userId ?? undefined,
+              accion: 'PAGO_COBRO_ENTREGA',
+              modulo: 'finanzas',
+              valorAnterior: { code: pkg.code, montoPagado: pkg.montoPagado },
+              valorNuevo: { code: pkg.code, montoPagado: actualizado.montoPagado, motivo: 'Importación administrativa' },
+            } satisfies RegistrarAuditoriaParams),
+        };
       }
-    });
-  }
+      return { entregado: true };
+    },
+    { onProgreso: opts?.onProgreso, accionFila: () => 'Marcando entregado...' }
+  );
+
+  resultados.forEach((r) => {
+    if (r.ok) {
+      if (r.valor?.entregado) marcadosEntregado++;
+    } else {
+      errores.push({ fila: r.numeroFila, motivo: r.error instanceof Error ? r.error.message : 'Error desconocido' });
+    }
+  });
 
   return { marcadosEntregado, yaEntregados: filas.filter((f) => f.estado === 'ya_entregado').length, errores };
 }
@@ -691,7 +935,19 @@ export interface ResultadoCreacionFaltantes {
  * Una entrega historica nueva SIGUE SIENDO UNA ENTREGA: por defecto se
  * cobra la tarifa vigente, igual que cualquier otra entrega del sistema.
  */
-export async function crearPaquetesFaltantes(filas: FilaValidada[], userId: string, branchId: string, montoDefault: number): Promise<ResultadoCreacionFaltantes> {
+interface ResultadoFilaCreacion {
+  packageId: string;
+  code: string;
+  auditoria?: () => Promise<void>;
+}
+
+export async function crearPaquetesFaltantes(
+  filas: FilaValidada[],
+  userId: string,
+  branchId: string,
+  montoDefault: number,
+  opts?: { importLogId?: string; onProgreso?: OnProgreso }
+): Promise<ResultadoCreacionFaltantes> {
   const faltantes = filas.filter((f) => f.estado === 'no_encontrado');
   let creados = 0;
   const errores: Array<{ fila: number; motivo: string }> = [];
@@ -701,114 +957,110 @@ export async function crearPaquetesFaltantes(filas: FilaValidada[], userId: stri
   // fila, y es lo que aplicarPagoEnTx() necesita para calcular el costo
   // vigente de cada paquete nuevo dentro de su propia transaccion.
   const [company, feriados] = await Promise.all([getCompanyConfig(), getHolidaySet()]);
+  // Resuelto UNA VEZ para todo el lote (ver resolverSeriesUnaVez) — antes
+  // era un upsert por fila, aunque compartieran la misma inicial.
+  const seriesCache = await resolverSeriesUnaVez(faltantes);
 
-  for (const bloque of enBloques(faltantes, TAMANO_BLOQUE)) {
-    const resultados = await Promise.allSettled(
-      bloque.map(async (fila) => {
-        // canonicalizarSeparadores() antes de guardar: si la celda del
-        // Excel trae "M19A/29" (u otro separador equivalente, ver
-        // src/lib/codigo.ts), el paquete debe quedar creado como
-        // "M19A-29" — el formato canonico — nunca con el separador tal
-        // cual vino del archivo.
-        const code = canonicalizarSeparadores(fila.codigo.trim()).toUpperCase();
-        const codigoNormalizado = normalizarCodigo(code);
-        const inicial = code.match(/^[A-Z]+/)?.[0];
-        if (!inicial) throw new Error('Código sin inicial reconocible.');
+  const resultados = await procesarEnBloques<FilaValidada, ResultadoFilaCreacion>(
+    faltantes,
+    async (tx, fila) => {
+      // canonicalizarSeparadores() antes de guardar: si la celda del Excel
+      // trae "M19A/29" (u otro separador equivalente, ver src/lib/codigo.ts),
+      // el paquete debe quedar creado como "M19A-29" — el formato canonico —
+      // nunca con el separador tal cual vino del archivo.
+      const code = canonicalizarSeparadores(fila.codigo.trim()).toUpperCase();
+      const codigoNormalizado = normalizarCodigo(code);
+      const inicial = code.match(/^[A-Z]+/)?.[0];
+      if (!inicial) throw new Error('Código sin inicial reconocible.');
 
-        // Si la serie nunca se registro (ej. un lote historico que jamas
-        // paso por "Codigos personalizados"), se crea aqui con el mismo
-        // patron de upsert que ya usa generarCodigosPersonalizados (ver
-        // src/lib/etiquetas.ts) — asi la importacion no queda bloqueada
-        // por una serie que nadie configuro a mano todavia.
-        const serie = await prisma.packageSeries.upsert({
-          where: { inicial },
-          update: {},
-          create: { inicial, descripcion: `Serie ${inicial} (creada por importación)`, correlativo: 0 },
-        });
+      const serie = seriesCache.get(inicial);
+      if (!serie) throw new Error('Código sin inicial reconocible.');
 
-        const entregaAt = parseFechaHora(fila.fecha, fila.hora) ?? new Date();
-        // Fecha de recepcion (concepto nuevo, ver validarFilas): si la
-        // fila trae una resuelta (fecha unica del archivo, o interpretada
-        // de su propia columna), esa es la fecha REAL de ingreso — nunca
-        // mas forzada a ser igual a la fecha de entrega. Si no se
-        // configuro ninguna, se mantiene el comportamiento de siempre
-        // (ingresoAt = entregaAt).
-        const ingresoAt = fila.fechaRecepcionResuelta ? new Date(`${fila.fechaRecepcionResuelta}T00:00:00`) : entregaAt;
+      // Fecha operativa de entrega — ver fechaOperativaFallback(): un
+      // paquete creado por "Crear faltantes y entregar" es, por
+      // definición, un evento histórico completo (recepción + entrega el
+      // mismo día que indica la importación); si el archivo no trae una
+      // columna de "fecha de entrega" propia, usa la fecha operativa
+      // elegida en el paso 2 en vez de "ahora" (causa raíz del bug de
+      // fechas — ver auditoría).
+      const entregaAt = fechaOperativaFallback(fila);
+      // Fecha de recepcion (concepto nuevo, ver validarFilas): si la fila
+      // trae una resuelta (fecha unica del archivo, o interpretada de su
+      // propia columna), esa es la fecha REAL de ingreso — nunca mas
+      // forzada a ser igual a la fecha de entrega. Si no se configuro
+      // ninguna, se mantiene el comportamiento de siempre (ingresoAt =
+      // entregaAt).
+      const ingresoAt = fila.fechaRecepcionResuelta ? new Date(`${fila.fechaRecepcionResuelta}T00:00:00`) : entregaAt;
 
-        let cliente = null;
-        if (fila.cliente || fila.emprendimiento) {
-          cliente = await prisma.cliente.create({ data: { nombre: fila.cliente || null, emprendimiento: fila.emprendimiento || null } });
-        }
-
-        // Monto a cobrar: explicito del archivo/edicion si vino, si no la
-        // tarifa por defecto — nunca undefined para un paquete NUEVO (ver
-        // REGLA 4: una entrega historica nueva siempre debe impactar
-        // Finanzas, con su fecha historica).
-        const montoAplicado = fila.monto ?? montoDefault;
-
-        // TODO atomico en UNA sola transaccion (package.create + 2×
-        // packageHistory + pago): antes el pago se registraba con una
-        // llamada a registrarPago() DESPUES de que esta transaccion ya
-        // habia confirmado (commit) — si esa segunda llamada fallaba por
-        // cualquier motivo, quedaba un paquete ENTREGADO+Bs0+SIN Pago,
-        // exactamente el patron de bug ya confirmado en produccion para
-        // entregaExcepcional() (ver ese comentario en
-        // src/lib/package-transitions.ts) y ahora corregido aqui de la
-        // misma forma: si algo falla, ROLLBACK completo, no queda ningun
-        // registro parcial.
-        const nuevo = await prisma.$transaction(async (tx) => {
-          const pkg = await tx.package.create({
-            data: {
-              code,
-              codigoNormalizado,
-              inicial,
-              branchId,
-              status: 'ENTREGADO',
-              ingresoAt,
-              entregaAt,
-              origenEntrega: 'IMPORTACION',
-              tarifaBaseOverride: serie.tarifaBaseOverride,
-              registradoPorId: userId,
-              clienteId: cliente?.id ?? null,
-              destinatario: fila.personaRecoge || null,
-              destinatarioTelefono: fila.celular || null,
-              observaciones: fila.observaciones || '',
-              descripcion: fila.descripcion || null,
-            },
-          });
-          await tx.packageHistory.create({ data: { packageId: pkg.id, estado: 'EN_PAQUETERIA', fecha: ingresoAt, userId, nota: 'Importación administrativa (registro faltante)' } });
-          await tx.packageHistory.create({ data: { packageId: pkg.id, estado: 'ENTREGADO', fecha: entregaAt, userId, nota: 'Importación administrativa (registro faltante)' } });
-          if (montoAplicado > 0) {
-            const costoActual = calcularCosto(
-              pkg.ingresoAt,
-              fechaReferencia(pkg),
-              { tarifaBase: company.tarifaBase, diasIncluidos: company.diasIncluidos, costoAdicionalDia: company.costoAdicionalDia },
-              feriados,
-              pkg.tarifaBaseOverride,
-              pkg.diasIncluidosOverride
-            ).total;
-            // "entregaAt" (no "ahora"): si el archivo trae fecha, el cobro
-            // debe quedar contabilizado en Finanzas ese dia — nunca hoy
-            // (ver especificacion, "Importacion con fechas").
-            await aplicarPagoEnTx(tx, pkg.id, 0, montoAplicado, costoActual, 'COBRO_ENTREGA', userId, 'Importación administrativa (registro faltante)', entregaAt);
-          }
-          return pkg;
-        }, TRANSACTION_OPTS);
-
-        return { packageId: nuevo.id, code: nuevo.code };
-      })
-    );
-
-    resultados.forEach((r, i) => {
-      const fila = bloque[i]!;
-      if (r.status === 'fulfilled') {
-        creados++;
-        codigosCreados.push({ fila: fila.numeroFila, packageId: r.value.packageId, code: r.value.code });
-      } else {
-        errores.push({ fila: fila.numeroFila, motivo: r.reason instanceof Error ? r.reason.message : 'Error desconocido' });
+      let cliente = null;
+      if (fila.cliente || fila.emprendimiento) {
+        cliente = await tx.cliente.create({ data: { nombre: fila.cliente || null, emprendimiento: fila.emprendimiento || null } });
       }
-    });
-  }
+
+      // Monto a cobrar: explicito del archivo/edicion si vino, si no la
+      // tarifa por defecto — nunca undefined para un paquete NUEVO (ver
+      // REGLA 4: una entrega historica nueva siempre debe impactar
+      // Finanzas, con su fecha historica).
+      const montoAplicado = fila.monto ?? montoDefault;
+
+      // Atomico dentro de este SAVEPOINT (package.create + 2×packageHistory
+      // + pago): si algo falla, ROLLBACK TO revierte unicamente esta fila —
+      // nunca queda un paquete ENTREGADO+Bs0+SIN Pago (mismo patron de bug
+      // ya corregido para entregaExcepcional(), ver ese comentario en
+      // src/lib/package-transitions.ts).
+      const pkg = await tx.package.create({
+        data: {
+          code,
+          codigoNormalizado,
+          inicial,
+          branchId,
+          status: 'ENTREGADO',
+          ingresoAt,
+          entregaAt,
+          origenEntrega: 'IMPORTACION',
+          tarifaBaseOverride: serie.tarifaBaseOverride,
+          registradoPorId: userId,
+          clienteId: cliente?.id ?? null,
+          destinatario: fila.personaRecoge || null,
+          destinatarioTelefono: fila.celular || null,
+          observaciones: fila.observaciones || '',
+          descripcion: fila.descripcion || null,
+        },
+      });
+      await tx.packageHistory.create({
+        data: { packageId: pkg.id, estado: 'EN_PAQUETERIA', fecha: ingresoAt, userId, nota: 'Importación administrativa (registro faltante)', importLogId: opts?.importLogId ?? null },
+      });
+      await tx.packageHistory.create({
+        data: { packageId: pkg.id, estado: 'ENTREGADO', fecha: entregaAt, userId, nota: 'Importación administrativa (registro faltante)', importLogId: opts?.importLogId ?? null },
+      });
+      if (montoAplicado > 0) {
+        const costoActual = calcularCosto(
+          pkg.ingresoAt,
+          fechaReferencia(pkg),
+          { tarifaBase: company.tarifaBase, diasIncluidos: company.diasIncluidos, costoAdicionalDia: company.costoAdicionalDia },
+          feriados,
+          pkg.tarifaBaseOverride,
+          pkg.diasIncluidosOverride
+        ).total;
+        // "entregaAt" (no "ahora"): si el archivo trae fecha, el cobro debe
+        // quedar contabilizado en Finanzas ese dia — nunca hoy (ver
+        // especificacion, "Importacion con fechas").
+        await aplicarPagoEnTx(tx, pkg.id, 0, montoAplicado, costoActual, 'COBRO_ENTREGA', userId, 'Importación administrativa (registro faltante)', entregaAt, opts?.importLogId);
+      }
+
+      return { packageId: pkg.id, code: pkg.code };
+    },
+    { onProgreso: opts?.onProgreso, accionFila: () => 'Creando paquete...' }
+  );
+
+  resultados.forEach((r) => {
+    if (r.ok && r.valor) {
+      creados++;
+      codigosCreados.push({ fila: r.numeroFila, packageId: r.valor.packageId, code: r.valor.code });
+    } else if (!r.ok) {
+      errores.push({ fila: r.numeroFila, motivo: r.error instanceof Error ? r.error.message : 'Error desconocido' });
+    }
+  });
 
   return { creados, errores, codigosCreados };
 }
@@ -837,77 +1089,76 @@ export async function crearPaquetesFaltantes(filas: FilaValidada[], userId: stri
  *   se asume "hoy" en silencio para un paquete que se está importando
  *   como histórico.
  */
-export async function crearPaquetesEnDeposito(filas: FilaValidada[], userId: string, branchId: string): Promise<ResultadoCreacionFaltantes> {
+export async function crearPaquetesEnDeposito(
+  filas: FilaValidada[],
+  userId: string,
+  branchId: string,
+  opts?: { importLogId?: string; onProgreso?: OnProgreso }
+): Promise<ResultadoCreacionFaltantes> {
   const faltantes = filas.filter((f) => f.estado === 'no_encontrado');
   let creados = 0;
   const errores: Array<{ fila: number; motivo: string }> = [];
   const codigosCreados: Array<{ fila: number; packageId: string; code: string }> = [];
+  const seriesCache = await resolverSeriesUnaVez(faltantes);
 
-  for (const bloque of enBloques(faltantes, TAMANO_BLOQUE)) {
-    const resultados = await Promise.allSettled(
-      bloque.map(async (fila) => {
-        if (!fila.fechaRecepcionResuelta) {
-          throw new Error('Falta la fecha de recepción (fecha de ingreso a depósito) para esta fila.');
-        }
-
-        const code = canonicalizarSeparadores(fila.codigo.trim()).toUpperCase();
-        const codigoNormalizado = normalizarCodigo(code);
-        const inicial = code.match(/^[A-Z]+/)?.[0];
-        if (!inicial) throw new Error('Código sin inicial reconocible.');
-
-        const serie = await prisma.packageSeries.upsert({
-          where: { inicial },
-          update: {},
-          create: { inicial, descripcion: `Serie ${inicial} (creada por importación)`, correlativo: 0 },
-        });
-
-        const ingresoAt = new Date(`${fila.fechaRecepcionResuelta}T00:00:00`);
-
-        let cliente = null;
-        if (fila.cliente || fila.emprendimiento) {
-          cliente = await prisma.cliente.create({ data: { nombre: fila.cliente || null, emprendimiento: fila.emprendimiento || null } });
-        }
-
-        const nuevo = await prisma.$transaction(async (tx) => {
-          const pkg = await tx.package.create({
-            data: {
-              code,
-              codigoNormalizado,
-              inicial,
-              branchId,
-              status: 'EN_DEPOSITO',
-              ingresoAt,
-              depositoAt: ingresoAt,
-              origenEntrega: 'IMPORTACION',
-              tarifaBaseOverride: serie.tarifaBaseOverride,
-              registradoPorId: userId,
-              clienteId: cliente?.id ?? null,
-              destinatario: fila.personaRecoge || null,
-              destinatarioTelefono: fila.celular || null,
-              observaciones: fila.observaciones || '',
-              descripcion: fila.descripcion || null,
-            },
-          });
-          await tx.packageHistory.create({
-            data: { packageId: pkg.id, estado: 'EN_DEPOSITO', fecha: ingresoAt, userId, nota: 'Importación administrativa (depósito histórico)' },
-          });
-          return pkg;
-        }, TRANSACTION_OPTS);
-
-        return { packageId: nuevo.id, code: nuevo.code };
-      })
-    );
-
-    resultados.forEach((r, i) => {
-      const fila = bloque[i]!;
-      if (r.status === 'fulfilled') {
-        creados++;
-        codigosCreados.push({ fila: fila.numeroFila, packageId: r.value.packageId, code: r.value.code });
-      } else {
-        errores.push({ fila: fila.numeroFila, motivo: r.reason instanceof Error ? r.reason.message : 'Error desconocido' });
+  const resultados = await procesarEnBloques<FilaValidada, { packageId: string; code: string; auditoria?: () => Promise<void> }>(
+    faltantes,
+    async (tx, fila) => {
+      if (!fila.fechaRecepcionResuelta) {
+        throw new Error('Falta la fecha de recepción (fecha de ingreso a depósito) para esta fila.');
       }
-    });
-  }
+
+      const code = canonicalizarSeparadores(fila.codigo.trim()).toUpperCase();
+      const codigoNormalizado = normalizarCodigo(code);
+      const inicial = code.match(/^[A-Z]+/)?.[0];
+      if (!inicial) throw new Error('Código sin inicial reconocible.');
+
+      const serie = seriesCache.get(inicial);
+      if (!serie) throw new Error('Código sin inicial reconocible.');
+
+      const ingresoAt = new Date(`${fila.fechaRecepcionResuelta}T00:00:00`);
+
+      let cliente = null;
+      if (fila.cliente || fila.emprendimiento) {
+        cliente = await tx.cliente.create({ data: { nombre: fila.cliente || null, emprendimiento: fila.emprendimiento || null } });
+      }
+
+      const pkg = await tx.package.create({
+        data: {
+          code,
+          codigoNormalizado,
+          inicial,
+          branchId,
+          status: 'EN_DEPOSITO',
+          ingresoAt,
+          depositoAt: ingresoAt,
+          origenEntrega: 'IMPORTACION',
+          tarifaBaseOverride: serie.tarifaBaseOverride,
+          registradoPorId: userId,
+          clienteId: cliente?.id ?? null,
+          destinatario: fila.personaRecoge || null,
+          destinatarioTelefono: fila.celular || null,
+          observaciones: fila.observaciones || '',
+          descripcion: fila.descripcion || null,
+        },
+      });
+      await tx.packageHistory.create({
+        data: { packageId: pkg.id, estado: 'EN_DEPOSITO', fecha: ingresoAt, userId, nota: 'Importación administrativa (depósito histórico)', importLogId: opts?.importLogId ?? null },
+      });
+
+      return { packageId: pkg.id, code: pkg.code };
+    },
+    { onProgreso: opts?.onProgreso, accionFila: () => 'Creando en depósito...' }
+  );
+
+  resultados.forEach((r) => {
+    if (r.ok && r.valor) {
+      creados++;
+      codigosCreados.push({ fila: r.numeroFila, packageId: r.valor.packageId, code: r.valor.code });
+    } else if (!r.ok) {
+      errores.push({ fila: r.numeroFila, motivo: r.error instanceof Error ? r.error.message : 'Error desconocido' });
+    }
+  });
 
   return { creados, errores, codigosCreados };
 }
@@ -934,42 +1185,87 @@ export interface ResultadoSoloDatos {
  * puntual — nunca una tarifa asumida por defecto (fila.monto ya no se
  * rellena en validarFilas(), ver ese comentario).
  */
-export async function registrarSoloDatos(filas: FilaValidada[], userId: string): Promise<ResultadoSoloDatos> {
+export async function registrarSoloDatos(
+  filas: FilaValidada[],
+  userId: string,
+  opts?: { importLogId?: string; onProgreso?: OnProgreso }
+): Promise<ResultadoSoloDatos> {
   const aProcesar = filas.filter((f) => (f.estado === 'valido' || f.estado === 'ya_entregado') && f.packageId);
   let actualizados = 0;
   const errores: Array<{ fila: number; motivo: string }> = [];
 
-  for (const bloque of enBloques(aProcesar, TAMANO_BLOQUE)) {
-    const resultados = await Promise.allSettled(
-      bloque.map(async (fila) => {
-        const pkg = await prisma.package.findUnique({ where: { id: fila.packageId! } });
-        if (!pkg) throw new Error('El paquete ya no existe.');
-        if (pkg.status === 'DENEGADO') throw new Error('Este paquete está DENEGADO; no puede modificarse por importación.');
+  // Cargados una sola vez para todo el lote — ver mismo criterio en
+  // crearPaquetesFaltantes()/confirmarImportacion().
+  const [company, feriados] = await Promise.all([getCompanyConfig(), getHolidaySet()]);
+  const reglas = { tarifaBase: company.tarifaBase, diasIncluidos: company.diasIncluidos, costoAdicionalDia: company.costoAdicionalDia };
 
-        if (fila.personaRecoge || fila.celular) {
-          await prisma.package.update({
-            where: { id: pkg.id },
-            data: {
-              ...(fila.personaRecoge ? { destinatario: fila.personaRecoge } : {}),
-              ...(fila.celular ? { destinatarioTelefono: fila.celular } : {}),
-            },
-          });
-        }
-        if (pkg.montoPagado <= 0 && fila.monto !== undefined && fila.monto > 0) {
-          await registrarPago(pkg, 'AJUSTE', fila.monto, userId, 'Importación administrativa (solo datos)');
-        }
-      })
-    );
-    resultados.forEach((r, i) => {
-      const fila = bloque[i]!;
-      if (r.status === 'fulfilled') actualizados++;
-      else errores.push({ fila: fila.numeroFila, motivo: r.reason instanceof Error ? r.reason.message : 'Error desconocido' });
-    });
-  }
+  const resultados = await procesarEnBloques<FilaValidada, { auditoria?: () => Promise<void> }>(
+    aProcesar,
+    async (tx, fila) => {
+      const pkg = await tx.package.findUnique({ where: { id: fila.packageId! } });
+      if (!pkg) throw new Error('El paquete ya no existe.');
+      if (pkg.status === 'DENEGADO') throw new Error('Este paquete está DENEGADO; no puede modificarse por importación.');
+
+      if (fila.personaRecoge || fila.celular) {
+        await tx.package.update({
+          where: { id: pkg.id },
+          data: {
+            ...(fila.personaRecoge ? { destinatario: fila.personaRecoge } : {}),
+            ...(fila.celular ? { destinatarioTelefono: fila.celular } : {}),
+          },
+        });
+      }
+      if (pkg.montoPagado <= 0 && fila.monto !== undefined && fila.monto > 0) {
+        // Misma fecha operativa que el resto del lote (ver
+        // fechaOperativaFallback): antes esta llamada no pasaba ninguna
+        // fecha, así que el ajuste siempre quedaba fechado "ahora" en vez
+        // del día que el administrador seleccionó para toda la lista.
+        const fechaMovimiento = fechaOperativaFallback(fila);
+        const actualizado = await registrarPagoEnTx(tx, pkg, 'AJUSTE', fila.monto, userId, reglas, feriados, 'Importación administrativa (solo datos)', fechaMovimiento, opts?.importLogId);
+        return {
+          auditoria: () =>
+            registrarAuditoria({
+              userId: userId ?? undefined,
+              accion: 'PAGO_AJUSTE',
+              modulo: 'finanzas',
+              valorAnterior: { code: pkg.code, montoPagado: pkg.montoPagado },
+              valorNuevo: { code: pkg.code, montoPagado: actualizado.montoPagado, motivo: 'Importación administrativa (solo datos)' },
+            } satisfies RegistrarAuditoriaParams),
+        };
+      }
+      return {};
+    },
+    { onProgreso: opts?.onProgreso, accionFila: () => 'Actualizando datos...' }
+  );
+
+  resultados.forEach((r) => {
+    if (r.ok) actualizados++;
+    else errores.push({ fila: r.numeroFila, motivo: r.error instanceof Error ? r.error.message : 'Error desconocido' });
+  });
+
   return { actualizados, errores };
 }
 
 export type TipoImportacion = 'SOLO_REGISTRAR' | 'MARCAR_ENTREGADOS' | 'CREAR_Y_ENTREGAR' | 'CREAR_EN_DEPOSITO';
+
+/**
+ * Cuántas filas va a tocar realmente ejecutarImportacion() para este tipo
+ * — el "total" real del progreso (ver src/lib/importacion-jobs.ts), no
+ * simplemente resumen.detectados (que incluye inválidos/duplicados que
+ * ningún modo procesa nunca). Misma clasificación que usa
+ * ejecutarImportacion() internamente; se calcula aparte, ANTES de arrancar
+ * el procesamiento, porque el job de progreso necesita saber el total
+ * desde el primer momento.
+ */
+export function contarFilasAProcesar(resumen: ResumenValidacion, tipo: TipoImportacion): number {
+  const validoConPkg = resumen.filas.filter((f) => f.estado === 'valido' && f.packageId).length;
+  const yaEntregadoConPkg = resumen.filas.filter((f) => f.estado === 'ya_entregado' && f.packageId).length;
+  const noEncontrado = resumen.filas.filter((f) => f.estado === 'no_encontrado').length;
+  if (tipo === 'SOLO_REGISTRAR') return validoConPkg + yaEntregadoConPkg;
+  if (tipo === 'CREAR_EN_DEPOSITO') return noEncontrado;
+  if (tipo === 'CREAR_Y_ENTREGAR') return validoConPkg + yaEntregadoConPkg + noEncontrado;
+  return validoConPkg + yaEntregadoConPkg; // MARCAR_ENTREGADOS
+}
 
 export interface FilaResultado {
   numeroFila: number;
@@ -1020,7 +1316,8 @@ export async function ejecutarImportacion(
   tipo: TipoImportacion,
   userId: string,
   branchId: string,
-  montoDefault: number
+  montoDefault: number,
+  opts?: { importLogId?: string; onProgreso?: OnProgreso }
 ): Promise<ResultadoImportacion> {
   const porFila = new Map<number, FilaResultado>();
   resumen.filas.forEach((f) => {
@@ -1043,7 +1340,7 @@ export async function ejecutarImportacion(
   let actualizados = 0;
 
   if (tipo === 'SOLO_REGISTRAR') {
-    const r = await registrarSoloDatos(resumen.filas, userId);
+    const r = await registrarSoloDatos(resumen.filas, userId, opts);
     actualizados = r.actualizados;
     resumen.filas
       .filter((f) => (f.estado === 'valido' || f.estado === 'ya_entregado') && f.packageId)
@@ -1054,7 +1351,7 @@ export async function ejecutarImportacion(
         if (err) row.motivo = err.motivo;
       });
   } else if (tipo === 'CREAR_EN_DEPOSITO') {
-    const rd = await crearPaquetesEnDeposito(resumen.filas, userId, branchId);
+    const rd = await crearPaquetesEnDeposito(resumen.filas, userId, branchId, opts);
     creados = rd.creados;
     resumen.filas
       .filter((f) => f.estado === 'no_encontrado')
@@ -1072,7 +1369,7 @@ export async function ejecutarImportacion(
       }
     });
   } else {
-    const r = await confirmarImportacion(resumen.filas, userId);
+    const r = await confirmarImportacion(resumen.filas, userId, opts);
     entregados += r.marcadosEntregado;
     resumen.filas
       .filter((f) => f.estado === 'valido' && f.packageId)
@@ -1087,7 +1384,7 @@ export async function ejecutarImportacion(
     // por sí solo, dejaría intactas — ver comentario de la función.
     const yaEntregadas = resumen.filas.filter((f) => f.estado === 'ya_entregado' && f.packageId);
     if (yaEntregadas.length > 0) {
-      const rd = await registrarSoloDatos(yaEntregadas, userId);
+      const rd = await registrarSoloDatos(yaEntregadas, userId, opts);
       actualizados += rd.actualizados;
       yaEntregadas.forEach((f) => {
         const err = rd.errores.find((e) => e.fila === f.numeroFila);
@@ -1098,7 +1395,7 @@ export async function ejecutarImportacion(
     }
 
     if (tipo === 'CREAR_Y_ENTREGAR') {
-      const rf = await crearPaquetesFaltantes(resumen.filas, userId, branchId, montoDefault);
+      const rf = await crearPaquetesFaltantes(resumen.filas, userId, branchId, montoDefault, opts);
       creados = rf.creados;
       entregados += rf.creados; // un registro creado por importacion queda ENTREGADO directamente
       resumen.filas
@@ -1128,12 +1425,34 @@ export async function ejecutarImportacion(
   return { tipo, entregados, creados, actualizados, conError, filas };
 }
 
-export async function registrarImportLog(params: {
+// ---------------------------------------------------------------------
+// Registro del lote (dos fases)
+// ---------------------------------------------------------------------
+//
+// ANTES: registrarImportLog() creaba el ImportLog DESPUES de que
+// ejecutarImportacion() ya habia procesado todo el archivo — asi que
+// durante el procesamiento (confirmarImportacion/crearPaquetesFaltantes/
+// etc.) todavia no existia ningun id de ImportLog para pasarle a los Pago/
+// PackageHistory que se iban creando, y por eso Pago.importLogId/
+// PackageHistory.importLogId no se podian completar (necesarios para que
+// revertirLoteImportacion() sepa, sin ambiguedad, que movimiento vino de
+// que importacion — ver auditoria, "Muy importante: eliminacion/reversion
+// de importaciones").
+//
+// AHORA: crearImportLogInicial() crea el ImportLog PRIMERO (con los
+// conteos que validarFilas() ya conoce de antemano — detectados/validos/
+// duplicados/invalidos/noEncontrados no cambian durante la ejecucion), la
+// ruta le pasa ese id a ejecutarImportacion() para que cada escritura real
+// quede marcada con el, y recien al final finalizarImportLog() completa
+// los conteos que solo se conocen despues de procesar (marcadosEntregado/
+// creadosFaltantes/detalleErrores) y crea los ImportRow — mismo contenido
+// final que antes, solo que en dos pasos en vez de uno.
+export async function crearImportLogInicial(params: {
   nombreArchivo: string;
   nombreLote?: string;
   formato: FormatoImportacion;
   resumen: ResumenValidacion;
-  resultado: ResultadoImportacion;
+  tipo: TipoImportacion;
   userId: string;
 }): Promise<string> {
   const log = await prisma.importLog.create({
@@ -1141,25 +1460,47 @@ export async function registrarImportLog(params: {
       nombreArchivo: params.nombreArchivo,
       nombreLote: params.nombreLote || null,
       formato: params.formato,
-      tipoImportacion: params.resultado.tipo,
+      tipoImportacion: params.tipo,
       detectados: params.resumen.detectados,
       validos: params.resumen.validos,
       duplicados: params.resumen.duplicados,
       invalidos: params.resumen.invalidos,
-      marcadosEntregado: params.resultado.entregados,
       noEncontrados: params.resumen.noEncontrados,
+      userId: params.userId,
+    },
+  });
+  return log.id;
+}
+
+export async function finalizarImportLog(params: {
+  importLogId: string;
+  nombreArchivo: string;
+  nombreLote?: string;
+  resumen: ResumenValidacion;
+  resultado: ResultadoImportacion;
+  userId: string;
+}): Promise<void> {
+  await prisma.importLog.update({
+    where: { id: params.importLogId },
+    data: {
+      marcadosEntregado: params.resultado.entregados,
       creadosFaltantes: params.resultado.creados,
       detalleErrores: params.resultado.conError
         ? JSON.stringify(params.resultado.filas.filter((f) => f.estado === 'ERROR').map((f) => ({ fila: f.numeroFila, motivo: f.motivo })))
         : null,
-      userId: params.userId,
     },
   });
 
-  if (params.resultado.filas.length > 0) {
+  // Trocear en bloques de ~500: createMany ya es una sola operacion bulk
+  // (nunca una insercion por fila), esto es solo una medida defensiva para
+  // archivos muy grandes (5.000-10.000+ filas), donde una unica llamada
+  // podria acercarse al limite de parametros SQL de SQLite. No cambia
+  // ningun dato almacenado — mismos valores, mismas filas.
+  for (const bloqueFilas of enBloques(params.resultado.filas, 500)) {
+    if (bloqueFilas.length === 0) continue;
     await prisma.importRow.createMany({
-      data: params.resultado.filas.map((f) => ({
-        importLogId: log.id,
+      data: bloqueFilas.map((f) => ({
+        importLogId: params.importLogId,
         numeroFila: f.numeroFila,
         codigo: f.codigo,
         codigoOficial: f.codigoOficial,
@@ -1189,8 +1530,6 @@ export async function registrarImportLog(params: {
       actualizados: params.resultado.actualizados,
     },
   });
-
-  return log.id;
 }
 
 /**
@@ -1319,4 +1658,307 @@ export async function eliminarLoteImportacion(id: string, userId: string): Promi
   });
 
   return { nombreArchivo: log.nombreArchivo, nombreLote: log.nombreLote, detectados: log.detectados };
+}
+
+// ---------------------------------------------------------------------
+// Revertir un lote de importación (deshace efectos reales)
+// ---------------------------------------------------------------------
+//
+// Distinto de eliminarLoteImportacion() de arriba (que solo borra lotes
+// SIN NINGÚN efecto real): esto es para el caso contrario — un lote que
+// SÍ creó/entregó/actualizó paquetes reales (típicamente una prueba mal
+// configurada) y que el administrador quiere deshacer explícitamente. El
+// ImportLog/ImportRow NUNCA se borran aquí (quedan como el rastro de "esto
+// se importó y luego se revirtió", vía revertidoAt/revertidoPorId) —
+// borrarlos perdería la auditoría de que la reversión ocurrió.
+//
+// Solo es posible con exactitud gracias a Pago.importLogId/
+// PackageHistory.importLogId (ver schema.prisma): antes de esos campos no
+// había forma de distinguir, mirando un Pago o un PackageHistory
+// cualquiera, si lo generó ESTA importación puntual — la auditoría de Fase
+// 1 documentó esto como un límite real de datos, no una omisión de
+// código, y la migración aditiva lo resuelve.
+//
+// SEGURIDAD ("nunca inventar una restauración" — ver especificación,
+// sección 8): cada fila con efecto real solo se revierte si el paquete NO
+// fue tocado por nada más después de esta importación (mismo status que
+// dejó, mismo origenEntrega, ningún Pago/PackageHistory ajeno posterior).
+// Si algo cambió después, la fila queda en "noReversibles" con el motivo
+// — nunca se fuerza una reversión que podría perder un dato real. Y para
+// SOLO_DATOS, el nombre/celular sobrescrito NUNCA se restaura (no existe
+// ningún registro del valor anterior en este esquema): solo se revierte el
+// dinero (si lo hubo), y esto se declara explícitamente en el resultado
+// (actualizacionesNoRevertidas) para que el administrador lo sepa antes de
+// confirmar.
+
+export class LoteYaRevertidoError extends Error {
+  constructor(id: string) {
+    super(`La importación "${id}" ya fue revertida anteriormente.`);
+    this.name = 'LoteYaRevertidoError';
+  }
+}
+
+export class LoteSinEfectoParaRevertirError extends Error {
+  constructor() {
+    super('Esta lista no generó ningún movimiento real — usa "Eliminar lista" en vez de "Revertir".');
+    this.name = 'LoteSinEfectoParaRevertirError';
+  }
+}
+
+export interface FilaNoReversible {
+  codigo: string;
+  motivo: string;
+}
+
+export interface ResultadoReversion {
+  paquetesEliminados: number;
+  entregasRevertidas: number;
+  pagosRevertidos: number;
+  // SOLO_DATOS cuyo nombre/celular sobrescrito NO pudo restaurarse (nunca
+  // se guardó el valor anterior) — su eventual Pago SÍ se revierte si lo
+  // hubo; esto solo cuenta las filas, para que el admin sepa que ese texto
+  // quedó como estaba tras la importación.
+  actualizacionesNoRevertidas: number;
+  noReversibles: FilaNoReversible[];
+}
+
+/**
+ * Vista previa de qué haría revertirLoteImportacion() SIN escribir nada —
+ * usada por la ruta para armar el diálogo de confirmación fuerte que pide
+ * la especificación ("¿Revertir importación...? Esto eliminará/revertirá:
+ * X paquetes creados, X entregas, X movimientos financieros...").
+ */
+export async function previsualizarReversion(id: string): Promise<ResultadoReversion & { yaRevertido: boolean }> {
+  const log = await prisma.importLog.findUnique({ where: { id } });
+  if (!log) throw new LoteNoEncontradoError(id);
+  const plan = await planificarReversion(id);
+  return {
+    paquetesEliminados: plan.paraEliminar.length,
+    entregasRevertidas: plan.paraRevertirEntrega.length,
+    pagosRevertidos: plan.paraRevertirEntrega.filter((p) => p.pagoId).length + plan.paraRevertirSoloDatos.filter((p) => p.pagoId).length,
+    actualizacionesNoRevertidas: plan.paraRevertirSoloDatos.length,
+    noReversibles: plan.noReversibles,
+    yaRevertido: !!log.revertidoAt,
+  };
+}
+
+interface PlanEliminar {
+  packageId: string;
+}
+interface PlanEntrega {
+  packageId: string;
+  estadoAnterior: string;
+  pagoId?: string;
+}
+interface PlanSoloDatos {
+  packageId: string;
+  pagoId?: string;
+}
+
+/**
+ * Fase de SOLO LECTURA: decide, para cada fila con efecto real de este
+ * lote, si es segura de revertir — nunca escribe nada. Carga
+ * paquetes/historial/pagos en 3 consultas batched (nunca una por fila,
+ * mismo criterio N+1 que el resto del módulo) para los packageId
+ * involucrados, sin importar cuántas filas tenga el lote.
+ */
+async function planificarReversion(importLogId: string): Promise<{
+  paraEliminar: PlanEliminar[];
+  paraRevertirEntrega: PlanEntrega[];
+  paraRevertirSoloDatos: PlanSoloDatos[];
+  noReversibles: FilaNoReversible[];
+}> {
+  const filas = await prisma.importRow.findMany({
+    where: { importLogId, estado: { in: ESTADOS_CON_EFECTO_REAL } },
+    select: { codigo: true, codigoOficial: true, packageId: true, estado: true },
+  });
+
+  const packageIds = Array.from(new Set(filas.map((f) => f.packageId).filter((x): x is string => !!x)));
+  const [paquetes, historiales, pagos] = await Promise.all([
+    packageIds.length ? prisma.package.findMany({ where: { id: { in: packageIds } } }) : Promise.resolve([]),
+    packageIds.length ? prisma.packageHistory.findMany({ where: { packageId: { in: packageIds } }, orderBy: { fecha: 'asc' } }) : Promise.resolve([]),
+    packageIds.length ? prisma.pago.findMany({ where: { packageId: { in: packageIds } }, orderBy: { createdAt: 'asc' } }) : Promise.resolve([]),
+  ]);
+  const paquetePorId = new Map(paquetes.map((p) => [p.id, p]));
+  const historialPorPaquete = new Map<string, typeof historiales>();
+  for (const h of historiales) historialPorPaquete.set(h.packageId, [...(historialPorPaquete.get(h.packageId) ?? []), h]);
+  const pagosPorPaquete = new Map<string, typeof pagos>();
+  for (const p of pagos) pagosPorPaquete.set(p.packageId, [...(pagosPorPaquete.get(p.packageId) ?? []), p]);
+
+  const paraEliminar: PlanEliminar[] = [];
+  const paraRevertirEntrega: PlanEntrega[] = [];
+  const paraRevertirSoloDatos: PlanSoloDatos[] = [];
+  const noReversibles: FilaNoReversible[] = [];
+
+  for (const fila of filas) {
+    const codigoMostrado = fila.codigoOficial ?? fila.codigo;
+    if (!fila.packageId) {
+      noReversibles.push({ codigo: codigoMostrado, motivo: 'No quedó vinculado a ningún paquete.' });
+      continue;
+    }
+    const pkg = paquetePorId.get(fila.packageId);
+    if (!pkg) {
+      noReversibles.push({ codigo: codigoMostrado, motivo: 'El paquete ya no existe.' });
+      continue;
+    }
+    const historialPkg = historialPorPaquete.get(pkg.id) ?? [];
+    const pagosPkg = pagosPorPaquete.get(pkg.id) ?? [];
+    const pagoAjeno = pagosPkg.some((p) => p.importLogId !== importLogId);
+    const pagoDeEsteLote = pagosPkg.find((p) => p.importLogId === importLogId);
+
+    if (fila.estado === 'CREADO' || fila.estado === 'EN_DEPOSITO') {
+      const estadoEsperado = fila.estado === 'CREADO' ? 'ENTREGADO' : 'EN_DEPOSITO';
+      const historialAjeno = historialPkg.some((h) => h.importLogId !== importLogId);
+      if (pkg.status !== estadoEsperado || pkg.origenEntrega !== 'IMPORTACION' || historialAjeno || pagoAjeno) {
+        noReversibles.push({ codigo: pkg.code, motivo: 'El paquete fue modificado después de esta importación; eliminarlo perdería esos cambios.' });
+        continue;
+      }
+      paraEliminar.push({ packageId: pkg.id });
+    } else if (fila.estado === 'ENTREGADO') {
+      if (pkg.status !== 'ENTREGADO' || pkg.origenEntrega !== 'IMPORTACION' || pagoAjeno) {
+        noReversibles.push({ codigo: pkg.code, motivo: 'El paquete fue modificado después de esta importación (otro cobro, reingreso o corrección posterior).' });
+        continue;
+      }
+      const ultimo = historialPkg[historialPkg.length - 1];
+      if (!ultimo || ultimo.importLogId !== importLogId) {
+        noReversibles.push({ codigo: pkg.code, motivo: 'El historial del paquete cambió después de esta importación.' });
+        continue;
+      }
+      const previo = historialPkg[historialPkg.length - 2];
+      if (!previo) {
+        noReversibles.push({ codigo: pkg.code, motivo: 'No se pudo determinar a qué estado anterior debería volver.' });
+        continue;
+      }
+      paraRevertirEntrega.push({ packageId: pkg.id, estadoAnterior: previo.estado, pagoId: pagoDeEsteLote?.id });
+    } else if (fila.estado === 'SOLO_DATOS') {
+      if (pagoAjeno && pagoDeEsteLote) {
+        // Hay un pago de este lote Y otro ajeno posterior sobre el mismo
+        // paquete: revertir a ciegas el de este lote podría descuadrar el
+        // acumulado si el pago ajeno ya asumía este aplicado. Más seguro:
+        // no tocar el dinero de este paquete (el texto tampoco se toca,
+        // igual que cualquier SOLO_DATOS).
+        noReversibles.push({ codigo: pkg.code, motivo: 'El paquete recibió otro cobro/ajuste después de esta importación; su pago no se revertirá.' });
+        continue;
+      }
+      paraRevertirSoloDatos.push({ packageId: pkg.id, pagoId: pagoDeEsteLote?.id });
+    }
+  }
+
+  return { paraEliminar, paraRevertirEntrega, paraRevertirSoloDatos, noReversibles };
+}
+
+/**
+ * Revierte un lote de importación completo: elimina los paquetes que creó
+ * (si nada los tocó después), repone el estado anterior de los paquetes
+ * que solo marcó como entregados, y revierte el dinero (Pago) que generó —
+ * todo dentro de UNA transacción (si algo falla a mitad de camino, Prisma
+ * revierte todo; nunca queda el sistema parcialmente revertido, tal como
+ * exige la especificación). El ImportLog/ImportRow nunca se borran: el
+ * lote queda marcado revertidoAt/revertidoPorId, visible para siempre en
+ * el historial como "revertido".
+ */
+export async function revertirLoteImportacion(id: string, userId: string): Promise<ResultadoReversion> {
+  const log = await prisma.importLog.findUnique({ where: { id } });
+  if (!log) throw new LoteNoEncontradoError(id);
+  if (log.revertidoAt) throw new LoteYaRevertidoError(id);
+
+  const plan = await planificarReversion(id);
+  const totalConEfecto = plan.paraEliminar.length + plan.paraRevertirEntrega.length + plan.paraRevertirSoloDatos.length;
+  if (totalConEfecto === 0 && plan.noReversibles.length === 0) throw new LoteSinEfectoParaRevertirError();
+
+  const [company, feriados] = await Promise.all([getCompanyConfig(), getHolidaySet()]);
+  const reglas = { tarifaBase: company.tarifaBase, diasIncluidos: company.diasIncluidos, costoAdicionalDia: company.costoAdicionalDia };
+
+  const resultado: ResultadoReversion = {
+    paquetesEliminados: 0,
+    entregasRevertidas: 0,
+    pagosRevertidos: 0,
+    actualizacionesNoRevertidas: 0,
+    noReversibles: plan.noReversibles,
+  };
+
+  // El timeout escala con la cantidad de filas a revertir (mismo criterio
+  // que TIMEOUT_BLOQUE_MS en la importación) pero acotado: una reversión
+  // es una operación administrativa infrecuente sobre un lote típicamente
+  // acotado (limpieza de pruebas), así que se prioriza atomicidad total
+  // (una sola transacción, sin SAVEPOINT por fila) por sobre el mismo
+  // particionado en bloques que usa la importación masiva.
+  const timeoutMs = Math.min(180_000, Math.max(TRANSACTION_OPTS.timeout, totalConEfecto * 100));
+
+  await prisma.$transaction(
+    async (tx) => {
+      for (const p of plan.paraEliminar) {
+        await tx.package.delete({ where: { id: p.packageId } }); // cascada: Pago + PackageHistory de este paquete
+        resultado.paquetesEliminados++;
+      }
+
+      for (const p of plan.paraRevertirEntrega) {
+        await tx.package.update({ where: { id: p.packageId }, data: { status: p.estadoAnterior, entregaAt: null, origenEntrega: null } });
+        await tx.packageHistory.create({
+          data: { packageId: p.packageId, estado: p.estadoAnterior, fecha: new Date(), userId, nota: `Importación "${log.nombreLote ?? log.nombreArchivo}" revertida por un administrador.` },
+        });
+        if (p.pagoId) {
+          const pago = await tx.pago.findUniqueOrThrow({ where: { id: p.pagoId } });
+          const montoRevertido = pago.montoAnterior ?? 0;
+          const pkgActual = await tx.package.findUniqueOrThrow({ where: { id: p.packageId } });
+          const costoActual = calcularCosto(
+            pkgActual.ingresoAt,
+            fechaReferencia(pkgActual),
+            reglas,
+            feriados,
+            pkgActual.tarifaBaseOverride,
+            pkgActual.diasIncluidosOverride
+          ).total;
+          const estadoPago: PaymentStatus = montoRevertido <= 0 ? 'PENDIENTE' : montoRevertido >= costoActual ? 'PAGADO' : 'PARCIAL';
+          await tx.package.update({ where: { id: p.packageId }, data: { montoPagado: montoRevertido, estadoPago } });
+          await tx.pago.delete({ where: { id: p.pagoId } });
+          resultado.pagosRevertidos++;
+        }
+        resultado.entregasRevertidas++;
+      }
+
+      for (const p of plan.paraRevertirSoloDatos) {
+        if (p.pagoId) {
+          const pago = await tx.pago.findUniqueOrThrow({ where: { id: p.pagoId } });
+          const montoRevertido = pago.montoAnterior ?? 0;
+          const pkgActual = await tx.package.findUniqueOrThrow({ where: { id: p.packageId } });
+          const costoActual = calcularCosto(
+            pkgActual.ingresoAt,
+            fechaReferencia(pkgActual),
+            reglas,
+            feriados,
+            pkgActual.tarifaBaseOverride,
+            pkgActual.diasIncluidosOverride
+          ).total;
+          const estadoPago: PaymentStatus = montoRevertido <= 0 ? 'PENDIENTE' : montoRevertido >= costoActual ? 'PAGADO' : 'PARCIAL';
+          await tx.package.update({ where: { id: p.packageId }, data: { montoPagado: montoRevertido, estadoPago } });
+          await tx.pago.delete({ where: { id: p.pagoId } });
+          resultado.pagosRevertidos++;
+        }
+        // El nombre/celular sobrescrito por SOLO_DATOS nunca se restaura —
+        // ver comentario de cabecera de esta sección ("nunca inventar una
+        // restauración"): no existe ningún registro del valor anterior.
+        resultado.actualizacionesNoRevertidas++;
+      }
+
+      await tx.importLog.update({ where: { id }, data: { revertidoAt: new Date(), revertidoPorId: userId } });
+    },
+    { maxWait: TRANSACTION_OPTS.maxWait, timeout: timeoutMs }
+  );
+
+  await registrarAuditoria({
+    userId,
+    accion: 'IMPORTACION_LOTE_REVERTIDO',
+    modulo: 'importacion',
+    valorAnterior: { id, nombreArchivo: log.nombreArchivo, nombreLote: log.nombreLote },
+    valorNuevo: {
+      paquetesEliminados: resultado.paquetesEliminados,
+      entregasRevertidas: resultado.entregasRevertidas,
+      pagosRevertidos: resultado.pagosRevertidos,
+      actualizacionesNoRevertidas: resultado.actualizacionesNoRevertidas,
+      noReversibles: resultado.noReversibles.length,
+    },
+  });
+
+  return resultado;
 }

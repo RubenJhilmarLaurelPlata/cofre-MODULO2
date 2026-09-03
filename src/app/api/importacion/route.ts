@@ -5,10 +5,10 @@
 // servidor — nunca confia en un resumen que haya vuelto del cliente,
 // para que nadie pueda alterar la validacion antes de confirmar.
 import { NextResponse } from 'next/server';
+import { randomUUID } from 'crypto';
 import { prisma } from '@/lib/prisma';
 import { getSession } from '@/lib/auth';
 import { getCompanyConfig } from '@/lib/config';
-import { extraerContextoRequest } from '@/lib/auditoria';
 import {
   parseCSV,
   parseTXT,
@@ -18,14 +18,24 @@ import {
   aplicarEdicionesFilas,
   aplicarExclusionesFilas,
   ejecutarImportacion,
-  registrarImportLog,
+  crearImportLogInicial,
+  finalizarImportLog,
+  contarFilasAProcesar,
   type FormatoImportacion,
   type FilaImportacion,
   type CampoSistema,
   type TipoImportacion,
   type OpcionesFechaRecepcion,
   type EdicionFila,
+  type OnProgreso,
 } from '@/lib/importacion';
+import { crearJob, actualizarProgresoJob, completarJob, marcarErrorJob } from '@/lib/importacion-jobs';
+
+// Node runtime explícito (no Edge): la importación usa Prisma, transacciones
+// interactivas y un job en memoria que debe sobrevivir entre esta petición
+// y las peticiones SSE que consultan su progreso — ninguna de las dos
+// cosas funciona en el runtime Edge.
+export const runtime = 'nodejs';
 
 const MAX_BYTES = 8_000_000;
 const MAX_FILAS = 10_000;
@@ -200,18 +210,41 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'No hay ninguna sucursal activa configurada.' }, { status: 400 });
     }
 
-    const resultado = await ejecutarImportacion(resumen, tipo, session.id, branchId, company.tarifaBase);
-    const importLogId = await registrarImportLog({
-      nombreArchivo: file.name,
-      nombreLote,
-      formato,
-      resumen,
-      resultado,
-      userId: session.id,
-    });
+    // El ImportLog se crea AHORA (antes de procesar nada) para que cada
+    // Pago/PackageHistory que la ejecución vaya generando pueda quedar
+    // marcado con su importLogId desde el principio — necesario para que
+    // una reversión futura (ver revertirLoteImportacion en
+    // src/lib/importacion.ts) pueda identificar con exactitud qué generó
+    // esta importación puntual.
+    const importLogId = await crearImportLogInicial({ nombreArchivo: file.name, nombreLote, formato, resumen, tipo, userId: session.id });
 
-    const { ip, userAgent } = extraerContextoRequest(req);
-    return NextResponse.json({ resumen, resultado, importLogId, ip, userAgent });
+    const jobId = randomUUID();
+    const total = contarFilasAProcesar(resumen, tipo);
+    crearJob(jobId, total);
+
+    // Fire-and-forget: el procesamiento real (que puede tardar con
+    // archivos grandes) corre en segundo plano en este mismo proceso
+    // Node de larga duración (`next start`, no funciones serverless
+    // efímeras — ver src/lib/importacion-jobs.ts); el cliente sigue el
+    // progreso real por SSE (ver
+    // src/app/api/importacion/progreso/[jobId]/route.ts) en vez de
+    // esperar esta petición HTTP abierta durante todo el proceso — así
+    // un archivo de 999 filas nunca puede producir un 504 por mantener
+    // una única petición gigante abierta (ver auditoría, "No quiero
+    // errores 504 por diseño").
+    void (async () => {
+      try {
+        const onProgreso: OnProgreso = (info, huboError) => actualizarProgresoJob(jobId, info, huboError);
+        const resultado = await ejecutarImportacion(resumen, tipo, session.id, branchId, company.tarifaBase, { importLogId, onProgreso });
+        await finalizarImportLog({ importLogId, nombreArchivo: file.name, nombreLote, resumen, resultado, userId: session.id });
+        completarJob(jobId, resultado, importLogId);
+      } catch (err) {
+        console.error('Error procesando importación en segundo plano:', err);
+        marcarErrorJob(jobId, err instanceof Error ? err.message : 'Ocurrió un error al procesar la importación.');
+      }
+    })();
+
+    return NextResponse.json({ jobId, importLogId, resumen });
   } catch (err) {
     console.error('Error en importación masiva:', err);
     const mensaje = err instanceof Error ? err.message : 'Ocurrió un error al procesar el archivo.';

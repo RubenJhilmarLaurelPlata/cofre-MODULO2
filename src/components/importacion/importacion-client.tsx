@@ -7,7 +7,7 @@
 // Nunca escribe nada sin que el administrador confirme el resumen.
 import * as React from 'react';
 import Link from 'next/link';
-import { Upload, FileText, CheckCircle2, XCircle, HelpCircle, Loader2, History, ClipboardList, PackageCheck, PackagePlus, Archive, Search, AlertTriangle, ArrowRight, Trash2 } from 'lucide-react';
+import { Upload, FileText, CheckCircle2, XCircle, HelpCircle, Loader2, History, ClipboardList, PackageCheck, PackagePlus, Archive, Search, AlertTriangle, ArrowRight, Trash2, RotateCcw } from 'lucide-react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
@@ -90,6 +90,27 @@ interface RegistroHistorial {
   // cuando NINGUNA fila del lote creó/entregó/actualizó un paquete real
   // — nunca se calcula en el cliente.
   puedeEliminarse: boolean;
+  // Revertir (distinto de eliminar, ver revertirLoteImportacion en
+  // src/lib/importacion.ts): true cuando el lote SÍ tuvo efecto real y
+  // todavía no fue revertido.
+  puedeRevertirse: boolean;
+  revertidoAt: string | null;
+}
+
+interface PreviewReversion {
+  paquetesEliminados: number;
+  entregasRevertidas: number;
+  pagosRevertidos: number;
+  actualizacionesNoRevertidas: number;
+  noReversibles: Array<{ codigo: string; motivo: string }>;
+  yaRevertido: boolean;
+}
+
+interface ProgresoImportacion {
+  total: number;
+  procesados: number;
+  errores: number;
+  actual: { numeroFila: number; codigo: string; accion: string } | null;
 }
 
 // Antes "no_encontrado" se mostraba con la misma conotacion de problema
@@ -195,6 +216,72 @@ export function ImportacionClient({ tarifaBase }: ImportacionClientProps) {
   // validación real).
   const [eliminandoLoteId, setEliminandoLoteId] = React.useState<string | null>(null);
   const [mensajeLote, setMensajeLote] = React.useState<{ tipo: 'exito' | 'error'; texto: string } | null>(null);
+
+  // Revertir lista (ver revertirLoteImportacion en src/lib/importacion.ts):
+  // primero se previsualiza (GET, no escribe nada) para armar el aviso de
+  // confirmación con los conteos reales — nunca se le pide al
+  // administrador que confirme "a ciegas" cuántos paquetes/pagos se van a
+  // tocar.
+  const [revirtiendoLoteId, setRevirtiendoLoteId] = React.useState<string | null>(null);
+
+  async function revertirLote(h: RegistroHistorial) {
+    if (eliminandoLoteId || revirtiendoLoteId) return;
+    setRevirtiendoLoteId(h.id);
+    setMensajeLote(null);
+    try {
+      const previewRes = await fetch(`/api/importacion/${h.id}/revertir`);
+      const preview: PreviewReversion | { error: string } = await previewRes.json().catch(() => ({ error: 'Respuesta inválida del servidor.' }));
+      if (!previewRes.ok || 'error' in preview) {
+        setMensajeLote({ tipo: 'error', texto: 'error' in preview ? preview.error : 'No se pudo previsualizar la reversión.' });
+        return;
+      }
+
+      const partes: string[] = [];
+      if (preview.paquetesEliminados > 0) partes.push(`${preview.paquetesEliminados} paquete(s) creado(s) se eliminarán por completo`);
+      if (preview.entregasRevertidas > 0) partes.push(`${preview.entregasRevertidas} entrega(s) volverán a su estado anterior`);
+      if (preview.pagosRevertidos > 0) partes.push(`${preview.pagosRevertidos} movimiento(s) financiero(s) se revertirán`);
+      if (preview.actualizacionesNoRevertidas > 0) {
+        partes.push(`${preview.actualizacionesNoRevertidas} actualización(es) de nombre/celular NO se pueden deshacer (no se guardó el valor anterior)`);
+      }
+      if (partes.length === 0) {
+        setMensajeLote({
+          tipo: 'error',
+          texto:
+            preview.noReversibles.length > 0
+              ? 'Ningún cambio de esta lista puede revertirse con seguridad: todos los paquetes afectados fueron modificados después.'
+              : 'No hay nada que revertir en esta lista.',
+        });
+        return;
+      }
+      const avisoNoReversibles =
+        preview.noReversibles.length > 0
+          ? `\n\n⚠️ ${preview.noReversibles.length} código(s) NO se podrán revertir (el paquete fue modificado después de esta importación): ${preview.noReversibles
+              .slice(0, 5)
+              .map((n) => n.codigo)
+              .join(', ')}${preview.noReversibles.length > 5 ? '…' : ''}`
+          : '';
+      const confirmado = window.confirm(
+        `¿Revertir la importación "${h.nombreLote ?? h.nombreArchivo}"?\n\nEsta acción:\n${partes.map((p) => `• ${p}`).join('\n')}${avisoNoReversibles}\n\nEsta acción no se puede deshacer.`
+      );
+      if (!confirmado) return;
+
+      const res = await fetch(`/api/importacion/${h.id}/revertir`, { method: 'POST' });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setMensajeLote({ tipo: 'error', texto: data.error ?? 'No se pudo revertir la importación.' });
+        return;
+      }
+      setHistorial((prev) => prev?.map((x) => (x.id === h.id ? { ...x, puedeRevertirse: false, revertidoAt: new Date().toISOString() } : x)) ?? prev);
+      setMensajeLote({
+        tipo: 'exito',
+        texto: `Importación revertida: ${data.paquetesEliminados} paquete(s) eliminado(s), ${data.entregasRevertidas} entrega(s) revertida(s), ${data.pagosRevertidos} movimiento(s) financiero(s) revertido(s).`,
+      });
+    } catch {
+      setMensajeLote({ tipo: 'error', texto: 'Error de conexión. Intenta de nuevo.' });
+    } finally {
+      setRevirtiendoLoteId(null);
+    }
+  }
 
   async function eliminarLote(h: RegistroHistorial) {
     if (eliminandoLoteId) return;
@@ -418,10 +505,77 @@ export function ImportacionClient({ tarifaBase }: ImportacionClientProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [filasActivas, busqueda, ediciones]);
 
+  // Progreso real de una importación en curso (ver
+  // src/app/api/importacion/progreso/[jobId]/route.ts): la petición de
+  // "confirmar" solo dispara el job y responde con un jobId de inmediato
+  // — el procesamiento real corre en segundo plano en el servidor y este
+  // componente lo sigue por Server-Sent Events, en vez de esperar una
+  // única petición HTTP abierta durante todo el proceso (eso es lo que
+  // podía producir un 504 con archivos grandes).
+  const [progreso, setProgreso] = React.useState<ProgresoImportacion | null>(null);
+  const eventSourceRef = React.useRef<EventSource | null>(null);
+
+  React.useEffect(() => () => eventSourceRef.current?.close(), []);
+
+  function seguirProgreso(jobId: string) {
+    const es = new EventSource(`/api/importacion/progreso/${jobId}`);
+    eventSourceRef.current = es;
+
+    es.addEventListener('progress', (ev) => {
+      try {
+        const d = JSON.parse((ev as MessageEvent).data);
+        setProgreso({ total: d.total, procesados: d.procesados, errores: d.errores, actual: d.actual });
+      } catch {
+        // Un evento mal formado no debe tumbar el seguimiento del resto.
+      }
+    });
+
+    es.addEventListener('done', (ev) => {
+      try {
+        const d = JSON.parse((ev as MessageEvent).data);
+        setResultado({ resultado: d.resultado, importLogId: d.importLogId });
+      } catch {
+        setError('La importación terminó pero no se pudo leer el resultado final. Revisa el historial.');
+      }
+      cargarHistorial();
+      es.close();
+      eventSourceRef.current = null;
+      setProcesando(null);
+    });
+
+    // "fallo" (evento de aplicación) — no confundir con el "error" nativo
+    // de EventSource (fallo de conexión, sin datos), ver comentario en la
+    // ruta SSE.
+    es.addEventListener('fallo', (ev) => {
+      let mensaje = 'Ocurrió un error al procesar la importación.';
+      try {
+        const d = JSON.parse((ev as MessageEvent).data);
+        if (d?.mensaje) mensaje = d.mensaje;
+      } catch {
+        // Se usa el mensaje genérico de arriba.
+      }
+      setError(mensaje);
+      cargarHistorial();
+      es.close();
+      eventSourceRef.current = null;
+      setProcesando(null);
+    });
+
+    es.onerror = () => {
+      if (es.readyState === EventSource.CLOSED) {
+        setError('Se perdió la conexión siguiendo el progreso. Revisa el historial para confirmar si la importación terminó.');
+        eventSourceRef.current = null;
+        setProcesando(null);
+      }
+    };
+  }
+
   async function confirmar() {
     if (!archivo || !puedeConfirmar || procesando) return;
     setProcesando('confirmar');
     setError(null);
+    setProgreso(null);
+    setResultado(null);
     try {
       const formData = new FormData();
       formData.append('file', archivo);
@@ -439,14 +593,13 @@ export function ImportacionClient({ tarifaBase }: ImportacionClientProps) {
       const data = await res.json();
       if (!res.ok) {
         setError(data.error ?? 'No se pudo confirmar la importación.');
+        setProcesando(null);
         return;
       }
-      setResumen(data.resumen);
-      setResultado({ resultado: data.resultado, importLogId: data.importLogId });
-      cargarHistorial();
+      if (data.resumen) setResumen(data.resumen);
+      seguirProgreso(data.jobId);
     } catch {
       setError('Error de conexión. Intenta de nuevo.');
-    } finally {
       setProcesando(null);
     }
   }
@@ -882,6 +1035,33 @@ export function ImportacionClient({ tarifaBase }: ImportacionClientProps) {
               <CheckCircle2 className="h-4 w-4" /> Confirmar importación
             </Button>
 
+            {procesando === 'confirmar' && progreso && (
+              <div className="space-y-2 rounded-xl border border-gray-200 dark:border-gray-800 p-3">
+                <div className="flex items-center justify-between text-sm font-medium text-ink dark:text-gray-100">
+                  <span>Importando…</span>
+                  <span>
+                    {progreso.procesados} / {progreso.total}
+                  </span>
+                </div>
+                <div className="h-2 w-full overflow-hidden rounded-full bg-gray-100 dark:bg-gray-800">
+                  <div
+                    className="h-full bg-brand-500 transition-all duration-200"
+                    style={{ width: `${progreso.total > 0 ? Math.min(100, (progreso.procesados / progreso.total) * 100) : 0}%` }}
+                  />
+                </div>
+                {progreso.actual && (
+                  <p className="text-xs text-ink-soft dark:text-gray-400">
+                    Fila {progreso.actual.numeroFila} · <span className="font-mono">{progreso.actual.codigo}</span> — {progreso.actual.accion}
+                  </p>
+                )}
+                {progreso.errores > 0 && (
+                  <p className="flex items-center gap-1 text-xs text-amber-600 dark:text-amber-400">
+                    <AlertTriangle className="h-3.5 w-3.5" /> {progreso.errores} fila(s) con error hasta ahora — las demás continúan procesándose.
+                  </p>
+                )}
+              </div>
+            )}
+
             {resultado && (
               <div className="flex items-start gap-2 rounded-xl border border-emerald-200 dark:border-emerald-900/50 bg-emerald-50 dark:bg-emerald-500/10 p-3 text-sm text-emerald-700 dark:text-emerald-400">
                 <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0" />
@@ -941,6 +1121,23 @@ export function ImportacionClient({ tarifaBase }: ImportacionClientProps) {
                     <div className="flex items-center justify-between gap-2">
                       <p className="min-w-0 flex-1 truncate font-medium text-ink dark:text-gray-100">{h.nombreLote ?? h.nombreArchivo}</p>
                       <Badge variant="neutral">{TIPO_LABEL[h.tipoImportacion]}</Badge>
+                      {h.puedeRevertirse && (
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          title="Revertir importación"
+                          aria-label="Revertir importación"
+                          disabled={eliminandoLoteId !== null || revirtiendoLoteId === h.id}
+                          onClick={(e) => {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            revertirLote(h);
+                          }}
+                          className="h-8 w-8 shrink-0 p-0 text-amber-600 hover:bg-amber-50 dark:hover:bg-amber-500/10"
+                        >
+                          {revirtiendoLoteId === h.id ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RotateCcw className="h-3.5 w-3.5" />}
+                        </Button>
+                      )}
                       <Button
                         size="sm"
                         variant="ghost"
@@ -959,6 +1156,7 @@ export function ImportacionClient({ tarifaBase }: ImportacionClientProps) {
                     </div>
                     <p className="mt-1 text-xs text-gray-400 dark:text-gray-500">
                       {fmtFechaHora(h.createdAt)} · {h.usuario}
+                      {h.revertidoAt && <span className="ml-1 text-amber-600 dark:text-amber-400">· Revertida</span>}
                     </p>
                     <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs text-ink-soft dark:text-gray-400">
                       <span>{h.detectados} registros</span>
@@ -983,13 +1181,21 @@ export function ImportacionClient({ tarifaBase }: ImportacionClientProps) {
                       <th className="pb-2 font-medium">Usuario</th>
                       <th className="pb-2 font-medium" />
                       <th className="pb-2 font-medium" />
+                      <th className="pb-2 font-medium" />
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-gray-100 dark:divide-gray-800">
                     {historial.map((h) => (
                       <tr key={h.id}>
                         <td className="py-2 text-ink-soft dark:text-gray-400">{fmtFechaHora(h.createdAt)}</td>
-                        <td className="py-2 text-ink dark:text-gray-100">{h.nombreLote ?? '—'}</td>
+                        <td className="py-2 text-ink dark:text-gray-100">
+                          {h.nombreLote ?? '—'}
+                          {h.revertidoAt && (
+                            <Badge variant="warning" className="ml-1.5">
+                              Revertida
+                            </Badge>
+                          )}
+                        </td>
                         <td className="py-2">
                           <Badge variant="neutral">{TIPO_LABEL[h.tipoImportacion]}</Badge>
                         </td>
@@ -1002,6 +1208,21 @@ export function ImportacionClient({ tarifaBase }: ImportacionClientProps) {
                           <Link href={`/importacion/${h.id}`} className="text-xs font-semibold text-brand-600 dark:text-brand-400 hover:underline">
                             Ver detalle
                           </Link>
+                        </td>
+                        <td className="py-2 text-right">
+                          {h.puedeRevertirse && (
+                            <Button
+                              size="sm"
+                              variant="ghost"
+                              title="Revertir importación"
+                              aria-label="Revertir importación"
+                              disabled={eliminandoLoteId !== null || revirtiendoLoteId === h.id}
+                              onClick={() => revertirLote(h)}
+                              className="h-8 w-8 p-0 text-amber-600 hover:bg-amber-50 dark:hover:bg-amber-500/10"
+                            >
+                              {revirtiendoLoteId === h.id ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RotateCcw className="h-3.5 w-3.5" />}
+                            </Button>
+                          )}
                         </td>
                         <td className="py-2 text-right">
                           <Button

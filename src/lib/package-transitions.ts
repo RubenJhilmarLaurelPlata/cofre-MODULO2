@@ -102,15 +102,78 @@ export async function aplicarPagoEnTx(
   tipo: TipoPago,
   userId: string | null,
   motivo?: string,
-  fecha?: Date
+  fecha?: Date,
+  importLogId?: string
 ): Promise<Package> {
   const montoNuevo = Math.round((montoAnterior + montoDelta) * 100) / 100;
   const estadoPago: PaymentStatus = montoNuevo <= 0 ? 'PENDIENTE' : montoNuevo >= costoActual ? 'PAGADO' : 'PARCIAL';
   const actualizado = await tx.package.update({ where: { id: packageId }, data: { montoPagado: montoNuevo, estadoPago } });
   await tx.pago.create({
-    data: { packageId, tipo, monto: montoDelta, montoAnterior, montoNuevo, motivo: motivo || null, userId, ...(fecha ? { createdAt: fecha } : {}) },
+    data: {
+      packageId,
+      tipo,
+      monto: montoDelta,
+      montoAnterior,
+      montoNuevo,
+      motivo: motivo || null,
+      userId,
+      ...(fecha ? { createdAt: fecha } : {}),
+      ...(importLogId ? { importLogId } : {}),
+    },
   });
   return actualizado;
+}
+
+/**
+ * Núcleo de registrarPago(), reutilizable DENTRO de una transacción ya
+ * abierta por el llamador — usado por la arquitectura de bloques de
+ * Importación masiva (ver crearPaquetesFaltantes/confirmarImportacion/
+ * registrarSoloDatos en importacion.ts) para poder cobrar cada fila sin
+ * abrir una transacción `prisma.$transaction` nueva por cada una (antes
+ * eso significaba, en un import de 1.999 filas, hasta 1.999 transacciones
+ * físicas — cada una con su propio commit/fsync — solo para los cobros).
+ *
+ * Hace EXACTAMENTE el mismo cálculo que registrarPago() (misma relectura
+ * fresca del paquete DENTRO de la transacción para la protección
+ * anti-carrera, mismo cálculo de costoActual, mismo aplicarPagoEnTx) —
+ * "company"/"feriados" se reciben como parámetro en vez de volver a
+ * consultarlos, porque el llamador (una importación masiva) ya los cargó
+ * una sola vez para todo el lote.
+ *
+ * A propósito NO llama a registrarAuditoria(): esa función usa el cliente
+ * `prisma` de nivel superior (no `tx`), y con connection_limit=1 llamarla
+ * desde DENTRO de una transacción interactiva abierta se bloquea para
+ * siempre (verificado: la única conexión ya está tomada por la
+ * transacción en curso, así que una segunda consulta top-level nunca
+ * puede obtenerla hasta que la transacción termine — pero la transacción
+ * está esperando esa misma consulta). El llamador es responsable de
+ * auditar DESPUÉS de que la transacción del bloque haya confirmado
+ * (commit) — ver "auditoriasPendientes" en importacion.ts.
+ */
+export async function registrarPagoEnTx(
+  tx: Prisma.TransactionClient,
+  pkg: Package,
+  tipo: TipoPago,
+  montoDelta: number,
+  userId: string | null,
+  company: { tarifaBase: number; diasIncluidos: number; costoAdicionalDia: number },
+  feriados: Set<string>,
+  motivo?: string,
+  fecha?: Date,
+  importLogId?: string
+): Promise<Package> {
+  const actual = await tx.package.findUniqueOrThrow({ where: { id: pkg.id } });
+
+  const costoActual = calcularCosto(
+    actual.ingresoAt,
+    fechaReferencia(actual),
+    { tarifaBase: company.tarifaBase, diasIncluidos: company.diasIncluidos, costoAdicionalDia: company.costoAdicionalDia },
+    feriados,
+    actual.tarifaBaseOverride,
+    actual.diasIncluidosOverride
+  ).total;
+
+  return aplicarPagoEnTx(tx, actual.id, actual.montoPagado, montoDelta, costoActual, tipo, userId, motivo, fecha, importLogId);
 }
 
 /**
@@ -146,18 +209,17 @@ export async function registrarPago(pkg: Package, tipo: TipoPago, montoDelta: nu
   const [company, feriados] = await Promise.all([getCompanyConfig(), getHolidaySet()]);
 
   const actualizado = await prisma.$transaction(async (tx) => {
-    const actual = await tx.package.findUniqueOrThrow({ where: { id: pkg.id } });
-
-    const costoActual = calcularCosto(
-      actual.ingresoAt,
-      fechaReferencia(actual),
+    return registrarPagoEnTx(
+      tx,
+      pkg,
+      tipo,
+      montoDelta,
+      userId,
       { tarifaBase: company.tarifaBase, diasIncluidos: company.diasIncluidos, costoAdicionalDia: company.costoAdicionalDia },
       feriados,
-      actual.tarifaBaseOverride,
-      actual.diasIncluidosOverride
-    ).total;
-
-    return aplicarPagoEnTx(tx, actual.id, actual.montoPagado, montoDelta, costoActual, tipo, userId, motivo, fecha);
+      motivo,
+      fecha
+    );
   }, TRANSACTION_OPTS);
 
   await registrarAuditoria({

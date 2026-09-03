@@ -38,6 +38,12 @@ export async function GET() {
       usuario: r.user?.nombre ?? 'Sistema',
       createdAt: r.createdAt.toISOString(),
       puedeEliminarse: eliminables.has(r.id),
+      // Revertir (distinto de eliminar): solo tiene sentido para un lote
+      // que SÍ tuvo efecto real (lo contrario de puedeEliminarse) y que
+      // todavía no fue revertido antes — ver revertirLoteImportacion() en
+      // src/lib/importacion.ts.
+      puedeRevertirse: !eliminables.has(r.id) && !r.revertidoAt,
+      revertidoAt: r.revertidoAt ? r.revertidoAt.toISOString() : null,
     }))
   );
 }
