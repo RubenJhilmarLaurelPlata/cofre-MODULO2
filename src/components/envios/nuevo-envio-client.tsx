@@ -6,8 +6,9 @@
 // permite crear un envío sin destino (el <select> exige una elección
 // real, nunca uno "por defecto" adivinado).
 import * as React from 'react';
+import Link from 'next/link';
 import { useRouter } from 'next/navigation';
-import { Send, MapPin, XCircle } from 'lucide-react';
+import { ArrowLeft, Container, MapPin, XCircle } from 'lucide-react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 
@@ -61,15 +62,21 @@ export function NuevoEnvioClient() {
   }
 
   return (
-    <div className="mx-auto max-w-md">
+    <div className="mx-auto max-w-md space-y-4">
+      <Link href="/envios" className="inline-flex items-center gap-1.5 text-sm text-ink-soft hover:text-ink dark:text-gray-400 dark:hover:text-gray-100">
+        <ArrowLeft className="h-4 w-4" /> Envíos
+      </Link>
+
       <Card>
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
-            <Send className="h-5 w-5 text-brand-500" /> Nuevo envío
+            <Container className="h-5 w-5 text-brand-500" /> Nuevo envío
           </CardTitle>
         </CardHeader>
         <CardContent className="space-y-4">
-          <p className="text-sm text-ink-soft dark:text-gray-400">Elige la sucursal de destino. Después de crear el envío podrás escanear los paquetes que lo componen.</p>
+          <p className="text-sm text-ink-soft dark:text-gray-400">
+            Elige la sucursal de destino. Después de crear el envío podrás escanear directamente los códigos de los paquetes — no hace falta que hayan pasado antes por Recepción.
+          </p>
 
           {cargando ? (
             <p className="py-6 text-center text-sm text-gray-400 dark:text-gray-500">Cargando destinos…</p>

@@ -11,6 +11,8 @@ export async function GET(_req: Request, { params }: { params: { id: string } })
   }
 
   try {
+    // getEnvioDetalle() ya incluye "origen" (identidad de esta
+    // instalación, Fase 1) — una sola fuente de verdad, ver envios.ts.
     const envio = await getEnvioDetalle(params.id);
     return NextResponse.json(envio);
   } catch (err) {

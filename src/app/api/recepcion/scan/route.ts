@@ -11,6 +11,7 @@ import { normalizarCodigo, canonicalizarSeparadores } from '@/lib/codigo';
 import { registrarAuditoria, extraerContextoRequest } from '@/lib/auditoria';
 import { guardarFotoPaquete } from '@/lib/paquete-foto';
 import { registrarPago } from '@/lib/package-transitions';
+import { registrarPaqueteBasico } from '@/lib/paquete-registro';
 
 const clienteSchema = z.object({
   nombre: z.string().trim().max(120).optional(),
@@ -85,10 +86,7 @@ export async function POST(req: NextRequest) {
   try {
     const company = await getCompanyConfig();
 
-    const [serie, generatedCode] = await Promise.all([
-      prisma.packageSeries.findUnique({ where: { inicial } }),
-      prisma.generatedCode.findUnique({ where: { code }, select: { tarifaOverride: true, diasIncluidosOverride: true } }),
-    ]);
+    const serie = await prisma.packageSeries.findUnique({ where: { inicial } });
     if (!serie || !serie.activo) {
       return NextResponse.json(
         { error: `La serie "${inicial}" no está configurada o está inactiva. Pide a un administrador que la registre en Configuración.` },
@@ -151,36 +149,24 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    const now = new Date();
-
-    const pkg = await prisma.$transaction(async (tx) => {
-      const nuevo = await tx.package.create({
-        data: {
+    const pkg = await prisma.$transaction(
+      (tx) =>
+        registrarPaqueteBasico(
+          tx,
           code,
-          codigoNormalizado,
-          inicial,
           branchId,
-          status: 'EN_PAQUETERIA',
-          ingresoAt: now,
-          tarifaBaseOverride: parsed.data.tarifaAcordada ?? generatedCode?.tarifaOverride ?? serie.tarifaBaseOverride,
-          diasIncluidosOverride: generatedCode?.diasIncluidosOverride ?? null,
-          registradoPorId: session.id,
-          clienteId,
-          descripcion: parsed.data.descripcion || null,
-          destinatario: parsed.data.destinatario || null,
-          destinatarioTelefono: parsed.data.destinatarioTelefono || null,
-          destinatarioObservaciones: parsed.data.destinatarioObservaciones || null,
-        },
-      });
-
-      await tx.packageHistory.create({
-        data: { packageId: nuevo.id, estado: 'EN_PAQUETERIA', fecha: now, userId: session.id },
-      });
-
-      await tx.generatedCode.updateMany({ where: { code, usado: false }, data: { usado: true } });
-
-      return nuevo;
-    }, TRANSACTION_OPTS);
+          session.id,
+          { tarifaBaseOverride: parsed.data.tarifaAcordada },
+          {
+            clienteId,
+            descripcion: parsed.data.descripcion || null,
+            destinatario: parsed.data.destinatario || null,
+            destinatarioTelefono: parsed.data.destinatarioTelefono || null,
+            destinatarioObservaciones: parsed.data.destinatarioObservaciones || null,
+          }
+        ),
+      TRANSACTION_OPTS
+    );
 
     // Foto (opcional): se guarda en disco despues de crear el paquete
     // (necesita el id). Si falla, no debe hacer fallar el registro del
@@ -205,7 +191,7 @@ export async function POST(req: NextRequest) {
     const feriados = await getHolidaySet();
     const costo = calcularCosto(
       pkg.ingresoAt,
-      now,
+      pkg.ingresoAt,
       { tarifaBase: company.tarifaBase, diasIncluidos: company.diasIncluidos, costoAdicionalDia: company.costoAdicionalDia },
       feriados,
       pkg.tarifaBaseOverride,

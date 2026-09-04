@@ -31,7 +31,16 @@ function obtenerConstructor(): (new () => SpeechRecognitionLike) | null {
   return w.SpeechRecognition ?? w.webkitSpeechRecognition ?? null;
 }
 
-export function VoiceInputButton({ onResult, className }: { onResult: (texto: string) => void; className?: string }) {
+export function VoiceInputButton({
+  onResult,
+  className,
+  mostrarSiNoSoportado = false,
+}: {
+  onResult: (texto: string) => void;
+  className?: string;
+  /** Fase 2.1 (Envíos): en vez de desaparecer, muestra un ícono MicOff deshabilitado con explicación — para que quede claro que el campo sigue funcionando por teclado, en vez de dar la impresión de que falta un botón. Por defecto false (comportamiento original: no se muestra nada). */
+  mostrarSiNoSoportado?: boolean;
+}) {
   const [soportado, setSoportado] = React.useState(false);
   const [escuchando, setEscuchando] = React.useState(false);
   const recognitionRef = React.useRef<SpeechRecognitionLike | null>(null);
@@ -64,7 +73,20 @@ export function VoiceInputButton({ onResult, className }: { onResult: (texto: st
 
   React.useEffect(() => () => recognitionRef.current?.stop(), []);
 
-  if (!soportado) return null;
+  if (!soportado) {
+    if (!mostrarSiNoSoportado) return null;
+    return (
+      <button
+        type="button"
+        disabled
+        aria-label="Dictado por voz no disponible en este navegador"
+        title="Dictado por voz no disponible en este navegador — puedes escribir normalmente"
+        className={cn('flex h-8 w-8 shrink-0 cursor-not-allowed items-center justify-center rounded-lg text-gray-300 dark:text-gray-700', className)}
+      >
+        <MicOff className="h-4 w-4" />
+      </button>
+    );
+  }
 
   return (
     <button

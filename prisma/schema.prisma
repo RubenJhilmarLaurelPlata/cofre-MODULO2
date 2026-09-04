@@ -749,8 +749,9 @@ model SucursalDestino {
   @@index([activa])
 }
 
-// Valores permitidos de "estado": BORRADOR | CERRADO | CANCELADO (ver
-// nota sobre enums en SQLite, arriba). Un envio agrupa paquetes locales
+// Valores permitidos de "estado": BORRADOR | CERRADO | CANCELADO | RECIBIDO
+// (ver nota sobre enums en SQLite, arriba; RECIBIDO agregado en Fase 2.1,
+// sin migracion porque "estado" ya era texto libre). Un envio agrupa paquetes locales
 // que van a transferirse a otra sucursal. Package.status NUNCA cambia
 // por pertenecer a un Envio (ver comentario en EnvioItem y en
 // Package.enviosItems) — la exclusividad de "este paquete ya esta

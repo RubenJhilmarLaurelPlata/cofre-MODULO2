@@ -2,10 +2,15 @@
 
 // src/components/scanner/camera-scanner.tsx
 //
-// Escaner de codigo de barras por camara, compartido por Recepcion,
-// Entrega, Buscador y Deposito (Enviar/Bajar) — un solo componente, no
-// una implementacion por pantalla. Solo Code128 (nunca QR), igual que el
-// codigo real que genera el PDF de etiquetas (ver src/lib/etiquetas-pdf.ts).
+// Escaner por camara, compartido por Recepcion, Entrega, Buscador y
+// Deposito (Enviar/Bajar) — un solo componente, no una implementacion
+// por pantalla. Por defecto lee Code128 (nunca QR), igual que el codigo
+// real que genera el PDF de etiquetas (ver src/lib/etiquetas-pdf.ts).
+// Fase 2.1 (Envios): el prop opcional `formats` permite pedir "qr_code"
+// en vez del default — usado SOLO por "Envios -> Recibir envio" para
+// leer el QR de un envio (ver src/app/api/envios/[id]/qr/route.ts). Los
+// 4 llamadores existentes no pasan este prop, asi que su comportamiento
+// no cambia en absoluto.
 //
 // Estrategia de deteccion (en ese orden):
 //   1. BarcodeDetector nativo del navegador, si existe y declara soporte
@@ -24,12 +29,14 @@
 // despues de elegir la pestaña Camara — ver especificacion Fase 6,
 // seccion 13.
 import * as React from 'react';
-import { Camera, CameraOff, AlertCircle, ScanLine, RotateCcw } from 'lucide-react';
+import { Camera, CameraOff, AlertCircle, ScanLine, RotateCcw, QrCode } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { setCameraActiva } from '@/lib/scanner/camera-provider';
 import { normalizarEntradaEscaneo } from '@/lib/codigo';
 import { playSound, desbloquearAudio } from '@/lib/sound';
 import { vibrar } from '@/lib/haptics';
+
+type FormatoEscaneable = 'code_128' | 'qr_code';
 
 interface CameraScannerProps {
   onDetect: (code: string) => void;
@@ -37,11 +44,23 @@ interface CameraScannerProps {
   cooldownMs?: number;
   /** Arranca la camara sola al montarse (sin exigir un click extra). Por defecto true. */
   autoStart?: boolean;
+  /** Que formato(s) buscar. Por defecto solo Code128 (paquetes) — ver comentario arriba. */
+  formats?: FormatoEscaneable[];
+  /**
+   * Fase 2.2: texto de instrucción mostrado sobre el visor mientras no se
+   * detectó nada todavía. Si no se pasa, se infiere de `formats` ("código
+   * QR" cuando es solo qr_code, "código de barras" en cualquier otro
+   * caso) — así Recepción/Entrega/Buscador/Depósito no cambian nada, y
+   * "Envíos -> Recibir envío" puede pedir un texto específico de QR sin
+   * tocar este componente de nuevo.
+   */
+  textoInstruccion?: string;
 }
 
 type EstrategiaDeteccion = 'nativo' | 'zxing' | null;
 
-export function CameraScanner({ onDetect, cooldownMs = 1800, autoStart = true }: CameraScannerProps) {
+export function CameraScanner({ onDetect, cooldownMs = 1800, autoStart = true, formats = ['code_128'], textoInstruccion }: CameraScannerProps) {
+  const esSoloQr = formats.includes('qr_code') && !formats.includes('code_128');
   const videoRef = React.useRef<HTMLVideoElement | null>(null);
   const readerRef = React.useRef<import('@zxing/library').BrowserMultiFormatReader | null>(null);
   const streamRef = React.useRef<MediaStream | null>(null);
@@ -127,7 +146,7 @@ export function CameraScanner({ onDetect, cooldownMs = 1800, autoStart = true }:
       videoRef.current.srcObject = stream;
       await videoRef.current.play().catch(() => {});
 
-      const detector = new BarcodeDetectorCtor({ formats: ['code_128'] });
+      const detector = new BarcodeDetectorCtor({ formats });
 
       const loop = async () => {
         if (!montadoRef.current || !videoRef.current) return;
@@ -143,7 +162,7 @@ export function CameraScanner({ onDetect, cooldownMs = 1800, autoStart = true }:
       rafIdRef.current = requestAnimationFrame(loop);
       setEstrategia('nativo');
     },
-    [aceptarDeteccion]
+    [aceptarDeteccion, formats]
   );
 
   const iniciarZxing = React.useCallback(async () => {
@@ -151,8 +170,9 @@ export function CameraScanner({ onDetect, cooldownMs = 1800, autoStart = true }:
     // navegador) durante el renderizado en el servidor.
     const { BrowserMultiFormatReader, BarcodeFormat, DecodeHintType } = await import('@zxing/library');
 
+    const MAPA_ZXING: Record<FormatoEscaneable, number> = { code_128: BarcodeFormat.CODE_128, qr_code: BarcodeFormat.QR_CODE };
     const hints = new Map();
-    hints.set(DecodeHintType.POSSIBLE_FORMATS, [BarcodeFormat.CODE_128]);
+    hints.set(DecodeHintType.POSSIBLE_FORMATS, formats.map((f) => MAPA_ZXING[f]));
     hints.set(DecodeHintType.TRY_HARDER, true);
 
     const reader = new BrowserMultiFormatReader(hints);
@@ -178,7 +198,7 @@ export function CameraScanner({ onDetect, cooldownMs = 1800, autoStart = true }:
       return;
     }
     setEstrategia('zxing');
-  }, [aceptarDeteccion]);
+  }, [aceptarDeteccion, formats]);
 
   const iniciandoRef = React.useRef(false);
 
@@ -216,7 +236,7 @@ export function CameraScanner({ onDetect, cooldownMs = 1800, autoStart = true }:
           const formatosSoportados: string[] = await (
             window as unknown as { BarcodeDetector: { getSupportedFormats(): Promise<string[]> } }
           ).BarcodeDetector.getSupportedFormats();
-          if (formatosSoportados.includes('code_128')) {
+          if (formats.every((f) => formatosSoportados.includes(f))) {
             await iniciarNativo(BarcodeDetectorCtor);
             usoNativo = true;
           }
@@ -261,7 +281,7 @@ export function CameraScanner({ onDetect, cooldownMs = 1800, autoStart = true }:
       setCargando(false);
       iniciandoRef.current = false;
     }
-  }, [activa, iniciarNativo, iniciarZxing]);
+  }, [activa, iniciarNativo, iniciarZxing, formats]);
 
   React.useEffect(() => {
     montadoRef.current = true;
@@ -282,31 +302,39 @@ export function CameraScanner({ onDetect, cooldownMs = 1800, autoStart = true }:
         <video ref={videoRef} className="h-full w-full object-cover" muted autoPlay playsInline />
         {!activa && !cargando && (
           <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 text-gray-400 dark:text-gray-500">
-            <Camera className="h-8 w-8" strokeWidth={1.5} />
+            {esSoloQr ? <QrCode className="h-8 w-8" strokeWidth={1.5} /> : <Camera className="h-8 w-8" strokeWidth={1.5} />}
             <p className="text-xs">La cámara está apagada</p>
           </div>
         )}
         {cargando && (
           <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 text-gray-400 dark:text-gray-500">
-            <Camera className="h-8 w-8 animate-pulse" strokeWidth={1.5} />
+            {esSoloQr ? <QrCode className="h-8 w-8 animate-pulse" strokeWidth={1.5} /> : <Camera className="h-8 w-8 animate-pulse" strokeWidth={1.5} />}
             <p className="text-xs">Solicitando acceso a la cámara…</p>
           </div>
         )}
         {activa && (
-          <div className="pointer-events-none absolute inset-x-10 top-1/2 h-14 -translate-y-1/2 rounded-md border-2 border-brand-400" />
+          // Marco de encuadre: cuadrado y centrado para QR (así se ve
+          // claramente distinto de un lector de código de barras lineal —
+          // sección 8 del pedido); rectángulo horizontal para Code128,
+          // igual que antes.
+          esSoloQr ? (
+            <div className="pointer-events-none absolute left-1/2 top-1/2 h-40 w-40 -translate-x-1/2 -translate-y-1/2 rounded-2xl border-2 border-brand-400" />
+          ) : (
+            <div className="pointer-events-none absolute inset-x-10 top-1/2 h-14 -translate-y-1/2 rounded-md border-2 border-brand-400" />
+          )
         )}
       </div>
 
       {activa && (
         <div className="flex items-center gap-2 rounded-lg border border-gray-200 dark:border-gray-800 bg-gray-50 dark:bg-gray-900/50 px-3 py-2">
-          <ScanLine className="h-4 w-4 shrink-0 text-brand-500" />
+          {esSoloQr ? <QrCode className="h-4 w-4 shrink-0 text-brand-500" /> : <ScanLine className="h-4 w-4 shrink-0 text-brand-500" />}
           {ultimoDetectado ? (
             <div className="min-w-0">
               <p className="text-[10px] uppercase tracking-wide text-gray-400 dark:text-gray-500">Código detectado</p>
               <p className="truncate font-mono text-sm font-semibold text-gray-900 dark:text-gray-100">{ultimoDetectado}</p>
             </div>
           ) : (
-            <p className="text-xs text-gray-400 dark:text-gray-500">Apunta la cámara al código de barras…</p>
+            <p className="text-xs text-gray-400 dark:text-gray-500">{textoInstruccion ?? `Apunta la cámara al ${esSoloQr ? 'código QR del envío' : 'código de barras'}…`}</p>
           )}
         </div>
       )}

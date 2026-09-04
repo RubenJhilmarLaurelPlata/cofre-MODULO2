@@ -3,7 +3,7 @@
 // src/components/envios/envios-list-client.tsx
 import * as React from 'react';
 import Link from 'next/link';
-import { Send, Plus, RefreshCw, Search } from 'lucide-react';
+import { ArrowLeft, ClipboardList, Plus, RefreshCw, Search } from 'lucide-react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -24,7 +24,8 @@ interface EnvioDTO {
 
 const ESTADO_BADGE: Record<string, { label: string; variant: 'brand' | 'success' | 'neutral' }> = {
   BORRADOR: { label: 'Borrador', variant: 'brand' },
-  CERRADO: { label: 'Cerrado', variant: 'success' },
+  CERRADO: { label: 'En tránsito', variant: 'success' },
+  RECIBIDO: { label: 'Recibido', variant: 'success' },
   CANCELADO: { label: 'Cancelado', variant: 'neutral' },
 };
 
@@ -59,11 +60,15 @@ export function EnviosListClient() {
 
   return (
     <div className="space-y-5">
+      <Link href="/envios" className="inline-flex items-center gap-1.5 text-sm text-ink-soft hover:text-ink dark:text-gray-400 dark:hover:text-gray-100">
+        <ArrowLeft className="h-4 w-4" /> Envíos
+      </Link>
+
       <Card>
         <CardHeader>
           <div className="flex flex-wrap items-center justify-between gap-3">
             <CardTitle className="flex items-center gap-2">
-              <Send className="h-5 w-5 text-brand-500" /> Envíos
+              <ClipboardList className="h-5 w-5 text-brand-500" /> Historial de envíos
             </CardTitle>
             <Link href="/envios/nuevo">
               <Button size="sm">
@@ -73,16 +78,22 @@ export function EnviosListClient() {
           </div>
         </CardHeader>
         <CardContent className="space-y-4">
-          <div className="flex flex-wrap items-center gap-3">
-            <div className="relative flex-1 min-w-[220px]">
-              <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-gray-400" />
-              <Input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Buscar por código…" className="pl-9" />
+          <div className="space-y-3">
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
+              <div className="relative flex-1 sm:min-w-[220px]">
+                <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-gray-400" />
+                <Input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Buscar por código…" className="pl-9" />
+              </div>
+              <Button variant="ghost" size="sm" onClick={cargar} loading={cargando} className="self-end sm:self-auto">
+                <RefreshCw className="h-3.5 w-3.5" /> Actualizar
+              </Button>
             </div>
-            <div className="flex gap-1 rounded-lg bg-gray-100 dark:bg-gray-800 p-1">
+            <div className="flex flex-wrap gap-1 rounded-lg bg-gray-100 dark:bg-gray-800 p-1">
               {[
                 { id: '', label: 'Todos' },
                 { id: 'BORRADOR', label: 'Borrador' },
-                { id: 'CERRADO', label: 'Cerrado' },
+                { id: 'CERRADO', label: 'En tránsito' },
+                { id: 'RECIBIDO', label: 'Recibido' },
                 { id: 'CANCELADO', label: 'Cancelado' },
               ].map((op) => (
                 <button
@@ -97,9 +108,6 @@ export function EnviosListClient() {
                 </button>
               ))}
             </div>
-            <Button variant="ghost" size="sm" onClick={cargar} loading={cargando}>
-              <RefreshCw className="h-3.5 w-3.5" /> Actualizar
-            </Button>
           </div>
 
           {cargando ? (
@@ -114,18 +122,21 @@ export function EnviosListClient() {
                   <Link
                     key={e.id}
                     href={`/envios/${e.id}`}
-                    className="flex items-center justify-between gap-3 py-3 transition-colors hover:bg-gray-50 dark:hover:bg-gray-800/40 -mx-2 px-2 rounded-lg"
+                    className="flex flex-col gap-2 py-3.5 transition-colors hover:bg-gray-50 dark:hover:bg-gray-800/40 -mx-2 px-2 rounded-lg sm:flex-row sm:items-center sm:justify-between sm:gap-3"
                   >
-                    <div className="min-w-0">
-                      <div className="flex items-center gap-2">
-                        <span className="font-mono text-sm font-semibold text-ink dark:text-gray-100">{e.codigo}</span>
+                    <div className="min-w-0 space-y-1">
+                      <div className="flex flex-wrap items-center gap-2">
+                        {/* whitespace-nowrap: sin esto, el navegador corta
+                            "ENV-20260904-002" en cada guion (son puntos de
+                            quiebre validos en CSS) — nunca debe partirse. */}
+                        <span className="whitespace-nowrap font-mono text-sm font-semibold text-ink dark:text-gray-100">{e.codigo}</span>
                         <Badge variant={badge.variant}>{badge.label}</Badge>
                       </div>
-                      <p className="mt-0.5 text-xs text-gray-400 dark:text-gray-500">
-                        Destino: {e.destino.nombre} · {e.cantidadPaquetes} paquete{e.cantidadPaquetes === 1 ? '' : 's'}
+                      <p className="text-xs text-gray-400 dark:text-gray-500">
+                        Destino: <span className="text-ink-soft dark:text-gray-300">{e.destino.nombre}</span> · {e.cantidadPaquetes} paquete{e.cantidadPaquetes === 1 ? '' : 's'}
                       </p>
                     </div>
-                    <div className="shrink-0 text-right text-xs text-gray-400 dark:text-gray-500">
+                    <div className="shrink-0 text-xs text-gray-400 dark:text-gray-500 sm:text-right">
                       <p>Creado {fmtFecha(e.createdAt)}</p>
                       {e.cerradoAt && <p>Cerrado {fmtFecha(e.cerradoAt)}</p>}
                     </div>

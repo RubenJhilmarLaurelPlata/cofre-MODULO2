@@ -1,14 +1,26 @@
 'use client';
 
 // src/components/envios/envio-detalle-client.tsx
+// Fase 2.1: flujo directo — escanear un código que todavía no existe lo
+// registra y lo reserva en un solo paso (ver agregarPaquete() en
+// src/lib/envios.ts), sin pasar primero por Recepción. Corrección final:
+// datos opcionales de quien recogerá (reutiliza Package.destinatario/
+// destinatarioTelefono, los mismos campos que ya usa Recepción — nunca
+// una estructura paralela), botón de teclado explícito para cuando un
+// lector Bluetooth oculta el teclado del dispositivo, y dictado por voz
+// opcional para el nombre (Web Speech API del navegador, sin backend
+// propio ni almacenamiento de audio).
 import * as React from 'react';
 import Link from 'next/link';
-import { ArrowLeft, Send, ScanLine, Trash2, CheckCircle2, XCircle, Lock, Ban, RefreshCw, QrCode } from 'lucide-react';
+import { ArrowLeft, Container, ScanLine, Trash2, CheckCircle2, XCircle, Lock, Ban, RefreshCw, QrCode, PackageCheck, Keyboard, Camera as CameraIcon, UserRound, Phone } from 'lucide-react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
 import { ScannerStatus } from '@/components/scanner/scanner-status';
+import { CameraScanner } from '@/components/scanner/camera-scanner';
+import { TecladoVirtual } from '@/components/scanner/teclado-virtual';
+import { VoiceInputButton } from '@/components/ui/voice-input-button';
 import { useScanQueue } from '@/lib/scanner/use-scan-queue';
 import { normalizarEntradaEscaneo } from '@/lib/codigo';
 import { playSound } from '@/lib/sound';
@@ -27,6 +39,7 @@ interface EnvioDetalleDTO {
   codigo: string;
   estado: string;
   destino: { id: string; codigo: string; nombre: string; ciudad: string | null };
+  origen: { codigo: string | null; nombre: string | null };
   cantidadPaquetes: number;
   creadoPor: string | null;
   cerradoPor: string | null;
@@ -36,9 +49,16 @@ interface EnvioDetalleDTO {
   items: EnvioItemDTO[];
 }
 
+interface ItemEscaneado {
+  code: string;
+  destinatario?: string;
+  destinatarioTelefono?: string;
+}
+
 const ESTADO_BADGE: Record<string, { label: string; variant: 'brand' | 'success' | 'neutral' }> = {
   BORRADOR: { label: 'Borrador', variant: 'brand' },
-  CERRADO: { label: 'Cerrado', variant: 'success' },
+  CERRADO: { label: 'En tránsito', variant: 'success' },
+  RECIBIDO: { label: 'Recibido', variant: 'success' },
   CANCELADO: { label: 'Cancelado', variant: 'neutral' },
 };
 
@@ -52,11 +72,16 @@ export function EnvioDetalleClient({ envioId }: { envioId: string }) {
   const [cargando, setCargando] = React.useState(true);
   const [error, setError] = React.useState<string | null>(null);
   const [valor, setValor] = React.useState('');
+  const [destinatario, setDestinatario] = React.useState('');
+  const [destinatarioTelefono, setDestinatarioTelefono] = React.useState('');
   const [ultimoScan, setUltimoScan] = React.useState<{ ok: boolean; code: string; mensaje: string } | null>(null);
   const [cerrando, setCerrando] = React.useState(false);
   const [cancelando, setCancelando] = React.useState(false);
   const [confirmarCierre, setConfirmarCierre] = React.useState(false);
   const [confirmarCancelar, setConfirmarCancelar] = React.useState(false);
+  const [mostrarCamara, setMostrarCamara] = React.useState(false);
+  const [mostrarTeclado, setMostrarTeclado] = React.useState(false);
+  const [campoListo, setCampoListo] = React.useState(false);
   const inputRef = React.useRef<HTMLInputElement | null>(null);
 
   const cargar = React.useCallback(async () => {
@@ -74,24 +99,24 @@ export function EnvioDetalleClient({ envioId }: { envioId: string }) {
     cargar().finally(() => setCargando(false));
   }, [cargar]);
 
-  async function procesarAgregar(code: string) {
+  async function procesarAgregar(item: ItemEscaneado) {
     const res = await fetch(`/api/envios/${envioId}/paquetes`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ code }),
+      body: JSON.stringify(item),
     });
     const data = await res.json();
     if (!res.ok) {
-      setUltimoScan({ ok: false, code, mensaje: data.error ?? 'No se pudo agregar el paquete.' });
+      setUltimoScan({ ok: false, code: item.code, mensaje: data.error ?? 'No se pudo agregar el paquete.' });
       playSound('error');
       return;
     }
     setEnvio(data);
-    setUltimoScan({ ok: true, code, mensaje: 'Agregado al envío.' });
+    setUltimoScan({ ok: true, code: item.code, mensaje: 'Agregado al envío.' });
     playSound('ok');
   }
 
-  const { encolar, procesando } = useScanQueue<string>({
+  const { encolar, procesando } = useScanQueue<ItemEscaneado>({
     procesar: procesarAgregar,
     inputRef,
     debeEnfocar: () => envio?.estado === 'BORRADOR',
@@ -101,7 +126,34 @@ export function EnvioDetalleClient({ envioId }: { envioId: string }) {
     const code = normalizarEntradaEscaneo(codigoCrudo);
     setValor('');
     if (!code) return;
-    encolar(code);
+    encolar({
+      code,
+      destinatario: destinatario.trim() || undefined,
+      destinatarioTelefono: destinatarioTelefono.trim() || undefined,
+    });
+    // Listo para el siguiente escaneo: nunca hay que borrar a mano.
+    setDestinatario('');
+    setDestinatarioTelefono('');
+  }
+
+  /**
+   * Botón "Teclado" (sección 1/2 del pedido): en Mac/Windows no existe
+   * ningún "teclado virtual" que forzar — no hay nada que inventar ahí,
+   * así que solo enfoca el campo. En móvil, un `.focus()` disparado por
+   * un gesto directo del usuario (este click) es lo único que un
+   * navegador puede usar para decidir mostrar su teclado nativo — no hay
+   * ninguna API que lo garantice más allá de eso. Para que el botón
+   * nunca "no haga nada visible" en NINGUNA plataforma, además muestra
+   * el teclado en pantalla completo (TecladoVirtual, ya usado en
+   * Buscador/Depósito para este mismo problema real: un lector
+   * Bluetooth que oculta el teclado del dispositivo) y resalta el campo
+   * un instante — así siempre hay una confirmación visual clara.
+   */
+  function alternarTeclado() {
+    inputRef.current?.focus();
+    setMostrarTeclado((v) => !v);
+    setCampoListo(true);
+    setTimeout(() => setCampoListo(false), 900);
   }
 
   async function quitar(item: EnvioItemDTO) {
@@ -159,6 +211,7 @@ export function EnvioDetalleClient({ envioId }: { envioId: string }) {
 
   const badge = ESTADO_BADGE[envio.estado] ?? { label: envio.estado, variant: 'neutral' as const };
   const esBorrador = envio.estado === 'BORRADOR';
+  const yaEnCamino = envio.estado === 'CERRADO' || envio.estado === 'RECIBIDO';
 
   return (
     <div className="space-y-5">
@@ -168,43 +221,46 @@ export function EnvioDetalleClient({ envioId }: { envioId: string }) {
 
       <div className="grid grid-cols-1 gap-5 lg:grid-cols-3">
         <div className="space-y-5 lg:col-span-2">
-          <Card>
-            <CardHeader>
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                <CardTitle className="flex items-center gap-2">
-                  <Send className="h-5 w-5 text-brand-500" />
-                  <span className="font-mono">{envio.codigo}</span>
-                </CardTitle>
-                <Badge variant={badge.variant}>{badge.label}</Badge>
+          <div className="relative overflow-hidden rounded-2xl bg-gradient-to-br from-gray-900 via-gray-900 to-brand-900 p-6 text-white shadow-sm">
+            <Container className="pointer-events-none absolute -bottom-8 -right-8 h-32 w-32 -rotate-12 text-white/[0.06]" strokeWidth={1} aria-hidden />
+            <div className="relative flex flex-wrap items-start justify-between gap-3">
+              <div className="flex items-center gap-3">
+                <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-brand-500/15 ring-1 ring-brand-500/30">
+                  <Container className="h-5 w-5 text-brand-400" strokeWidth={1.75} />
+                </div>
+                <div>
+                  <p className="text-lg font-semibold leading-tight">Envío a {envio.destino.nombre}</p>
+                  <p className="font-mono text-sm text-gray-300">{envio.codigo}</p>
+                </div>
               </div>
-            </CardHeader>
-            <CardContent className="space-y-1 text-sm text-ink-soft dark:text-gray-400">
-              <p>
-                Destino: <strong className="text-ink dark:text-gray-100">{envio.destino.nombre}</strong>
-                {envio.destino.ciudad && ` (${envio.destino.ciudad})`}
-              </p>
-              <p>Creado {fmtFecha(envio.createdAt)}{envio.creadoPor && ` por ${envio.creadoPor}`}</p>
+              <Badge variant={badge.variant}>{badge.label}</Badge>
+            </div>
+            <p className="relative mt-3 text-xs text-gray-400">
+              Creado {fmtFecha(envio.createdAt)}{envio.creadoPor && ` por ${envio.creadoPor}`}
               {envio.cerradoAt && (
-                <p>
-                  Cerrado {fmtFecha(envio.cerradoAt)}
+                <>
+                  {' · '}Cerrado {fmtFecha(envio.cerradoAt)}
                   {envio.cerradoPor && ` por ${envio.cerradoPor}`}
-                </p>
+                </>
               )}
-            </CardContent>
-          </Card>
+            </p>
+          </div>
 
           {esBorrador && (
             <Card>
               <CardHeader>
-                <div className="flex items-center justify-between">
+                <div className="flex flex-wrap items-center justify-between gap-2">
                   <CardTitle>Escanear paquetes</CardTitle>
                   <ScannerStatus />
                 </div>
               </CardHeader>
-              <CardContent>
+              <CardContent className="space-y-4">
                 <div
                   onClick={() => inputRef.current?.focus()}
-                  className="cursor-text rounded-xl border-2 border-dashed border-gray-200 dark:border-gray-800 bg-gray-50 dark:bg-gray-800/40 p-8 text-center"
+                  className={cn(
+                    'cursor-text rounded-xl border-2 border-dashed p-8 text-center transition-colors',
+                    campoListo ? 'border-brand-400 bg-brand-50 dark:bg-brand-500/10' : 'border-gray-200 dark:border-gray-800 bg-gray-50 dark:bg-gray-800/40'
+                  )}
                 >
                   <ScanLine className="mx-auto mb-3 h-8 w-8 text-gray-300 dark:text-gray-600" strokeWidth={1.5} />
                   <Input
@@ -214,17 +270,100 @@ export function EnvioDetalleClient({ envioId }: { envioId: string }) {
                     onKeyDown={(e) => {
                       if (e.key === 'Enter') agregar(valor);
                     }}
-                    placeholder="Escanea aquí"
+                    placeholder="Escanea o escribe el código"
                     className="mx-auto max-w-xs text-center font-mono text-lg"
                     autoFocus
                   />
-                  <p className="mt-3 text-xs text-gray-400 dark:text-gray-500">Solo se pueden agregar paquetes &quot;En Paquetería&quot; que no estén ya en otro envío.</p>
+                  {campoListo && <p className="mt-2 text-xs font-medium text-brand-600 dark:text-brand-400">Listo para escribir ✓</p>}
+                  <div className="mx-auto mt-3 flex items-center justify-center gap-4">
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setMostrarCamara((v) => !v);
+                        if (!mostrarCamara) setMostrarTeclado(false);
+                      }}
+                      className="flex items-center gap-1.5 text-xs font-medium text-brand-600 dark:text-brand-400 hover:underline"
+                    >
+                      <CameraIcon className="h-3.5 w-3.5" /> {mostrarCamara ? 'Ocultar cámara' : 'Cámara'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        alternarTeclado();
+                        if (!mostrarTeclado) setMostrarCamara(false);
+                      }}
+                      className="flex items-center gap-1.5 text-xs font-medium text-brand-600 dark:text-brand-400 hover:underline"
+                    >
+                      <Keyboard className="h-3.5 w-3.5" /> {mostrarTeclado ? 'Ocultar teclado' : 'Teclado'}
+                    </button>
+                  </div>
+                  <p className="mt-2 text-xs text-gray-400 dark:text-gray-500">
+                    Si el código todavía no existe en el sistema, se registra automáticamente. No hace falta pasar antes por Recepción.
+                  </p>
                 </div>
+
+                {mostrarCamara && (
+                  <div className="mx-auto max-w-sm" onClick={(e) => e.stopPropagation()}>
+                    <CameraScanner onDetect={agregar} />
+                  </div>
+                )}
+
+                {mostrarTeclado && (
+                  <div className="mx-auto max-w-sm" onClick={(e) => e.stopPropagation()}>
+                    <TecladoVirtual onDetect={agregar} />
+                  </div>
+                )}
+
+                <div className="rounded-xl border border-gray-100 dark:border-gray-800 p-4">
+                  <p className="mb-3 text-sm font-medium text-ink dark:text-gray-100">
+                    Información de quien recogerá <span className="font-normal text-gray-400 dark:text-gray-500">(Opcional)</span>
+                  </p>
+                  <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                    <div className="relative">
+                      <UserRound className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-gray-400" />
+                      <Input
+                        value={destinatario}
+                        onChange={(e) => setDestinatario(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') agregar(valor);
+                        }}
+                        placeholder="Nombre"
+                        className="h-11 pl-9 pr-10 text-base"
+                      />
+                      <VoiceInputButton
+                        onResult={(texto) => setDestinatario((actual) => (actual ? `${actual} ${texto}` : texto))}
+                        className="absolute right-1 top-1/2 -translate-y-1/2"
+                        mostrarSiNoSoportado
+                      />
+                    </div>
+                    <div className="relative">
+                      <Phone className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-gray-400" />
+                      <Input
+                        value={destinatarioTelefono}
+                        onChange={(e) => setDestinatarioTelefono(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') agregar(valor);
+                        }}
+                        placeholder="Celular"
+                        type="tel"
+                        inputMode="tel"
+                        autoComplete="tel"
+                        className="h-11 pl-9 text-base"
+                      />
+                    </div>
+                  </div>
+                </div>
+
+                <Button className="w-full" size="lg" onClick={() => agregar(valor)} disabled={!valor.trim()}>
+                  Agregar paquete
+                </Button>
 
                 {ultimoScan && (
                   <div
                     className={cn(
-                      'mt-4 flex items-center gap-3 rounded-xl border-2 p-3',
+                      'flex items-center gap-3 rounded-xl border-2 p-3',
                       ultimoScan.ok ? 'border-emerald-200 dark:border-emerald-900/50 bg-emerald-50/40' : 'border-red-200 dark:border-red-900/50 bg-red-50/40'
                     )}
                   >
@@ -242,7 +381,7 @@ export function EnvioDetalleClient({ envioId }: { envioId: string }) {
 
           <Card>
             <CardHeader>
-              <CardTitle>Paquetes ({envio.items.length})</CardTitle>
+              <CardTitle>{envio.items.length} paquete{envio.items.length === 1 ? '' : 's'}</CardTitle>
             </CardHeader>
             <CardContent>
               {envio.items.length === 0 ? (
@@ -251,7 +390,9 @@ export function EnvioDetalleClient({ envioId }: { envioId: string }) {
                 <div className="divide-y divide-gray-100 dark:divide-gray-800">
                   {envio.items.map((it) => (
                     <div key={it.id} className="flex items-center justify-between py-2 text-sm">
-                      <span className="font-mono font-medium text-ink dark:text-gray-100">{it.code}</span>
+                      <span className="flex items-center gap-2 font-mono font-medium text-ink dark:text-gray-100">
+                        <CheckCircle2 className="h-4 w-4 text-emerald-500" /> {it.code}
+                      </span>
                       {esBorrador && (
                         <Button variant="ghost" size="sm" onClick={() => quitar(it)}>
                           <Trash2 className="h-3.5 w-3.5 text-red-500" /> Quitar
@@ -279,7 +420,7 @@ export function EnvioDetalleClient({ envioId }: { envioId: string }) {
               </CardHeader>
               <CardContent className="space-y-3">
                 {!confirmarCierre ? (
-                  <Button className="w-full" disabled={envio.items.length === 0} onClick={() => setConfirmarCierre(true)}>
+                  <Button className="w-full" size="lg" disabled={envio.items.length === 0} onClick={() => setConfirmarCierre(true)}>
                     <Lock className="h-4 w-4" /> Cerrar envío
                   </Button>
                 ) : (
@@ -319,17 +460,35 @@ export function EnvioDetalleClient({ envioId }: { envioId: string }) {
             </Card>
           )}
 
-          {envio.estado === 'CERRADO' && envio.qrToken && (
-            <Card>
-              <CardHeader>
-                <CardTitle className="flex items-center gap-2">
-                  <QrCode className="h-4 w-4" /> QR del envío
-                </CardTitle>
-              </CardHeader>
-              <CardContent className="flex flex-col items-center gap-3">
+          {yaEnCamino && envio.qrToken && (
+            <Card className="border-emerald-200 dark:border-emerald-900/50">
+              <CardContent className="flex flex-col items-center gap-3 py-6 text-center">
+                <CheckCircle2 className="h-10 w-10 text-emerald-500" />
+                <div>
+                  <p className="text-base font-semibold text-ink dark:text-gray-100">Envío preparado</p>
+                  <p className="font-mono text-sm text-ink-soft dark:text-gray-400">{envio.codigo}</p>
+                </div>
+                <p className="text-sm text-ink-soft dark:text-gray-400">
+                  {envio.origen.nombre ?? 'Esta instalación'} → {envio.destino.nombre}
+                </p>
+                <p className="text-sm font-medium text-ink dark:text-gray-100">
+                  {envio.cantidadPaquetes} paquete{envio.cantidadPaquetes === 1 ? '' : 's'}
+                </p>
+
+                {envio.estado === 'RECIBIDO' && (
+                  <div className="flex items-center gap-1.5 rounded-full bg-emerald-50 dark:bg-emerald-500/10 px-3 py-1 text-xs font-medium text-emerald-700 dark:text-emerald-400">
+                    <PackageCheck className="h-3.5 w-3.5" /> Recibido
+                  </div>
+                )}
+
+                <div className="flex items-center gap-1.5 pt-2 text-xs font-medium text-gray-400 dark:text-gray-500">
+                  <QrCode className="h-3.5 w-3.5" /> QR del envío
+                </div>
                 {/* eslint-disable-next-line @next/next/no-img-element */}
                 <img src={`/api/envios/${envio.id}/qr`} alt={`QR del envío ${envio.codigo}`} className="h-48 w-48 rounded-lg border border-gray-100 dark:border-gray-800" />
-                <p className="text-center text-xs text-gray-400 dark:text-gray-500">La sucursal destino podrá escanear este código cuando exista comunicación entre servidores.</p>
+                <p className="text-center text-xs text-gray-400 dark:text-gray-500">
+                  Al llegar a destino, escanea este código desde Envíos → Recibir envío.
+                </p>
               </CardContent>
             </Card>
           )}

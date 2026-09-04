@@ -7,8 +7,24 @@ import { prisma } from '@/lib/prisma';
 import { getCompanyConfig, getHolidaySet } from '@/lib/config';
 import { calcularCosto } from '@/lib/pricing';
 import { normalizarCodigo } from '@/lib/codigo';
+import { getReservaActivaDePaquete } from '@/lib/envios';
 import type { Package, Company, Prisma } from '@prisma/client';
 import type { PackageStatus, PaymentStatus } from '@/types';
+
+/**
+ * Fase 2.2 — ubicación operativa real de un paquete: si está reservado
+ * en un envío BORRADOR/CERRADO hacia otra sucursal, NO está disponible
+ * para entregar/enviar a depósito/denegar aquí, sin importar que
+ * Package.status siga en "EN_PAQUETERIA" (nunca cambia por Envíos, ver
+ * src/lib/envios.ts). Reutiliza exactamente getReservaActivaDePaquete()
+ * — la misma función que ya usa el backend de Entrega/Depósito para
+ * RECHAZAR la operación — para que el frontend muestre la razón antes
+ * de ofrecer un botón que el backend de todos modos va a rechazar.
+ */
+export interface EnTransitoDTO {
+  envioCodigo: string;
+  destinoNombre: string;
+}
 
 export interface ClienteInfoDTO {
   nombre: string | null;
@@ -51,6 +67,18 @@ export interface PackageDetailDTO {
   estadoPago: PaymentStatus;
   montoPagado: number;
   saldoPendiente: number;
+  // Identidad de ESTA instalación (Fase 1: Company.sucursalNombre — misma
+  // fuente que src/lib/envios.ts:getEnvioDetalle(), nunca duplicada).
+  origenNombre: string | null;
+  // Fase 2.2: null si el paquete está disponible aquí. Si no, viene de
+  // getReservaActivaDePaquete() — el paquete está reservado en un envío
+  // BORRADOR/CERRADO hacia otra sucursal y el backend de Entrega/Depósito
+  // va a rechazar cualquier intento de entregarlo/enviarlo/denegarlo
+  // aquí (ver PaqueteEnEnvioError en package-transitions.ts). Solo se
+  // calcula en el detalle de UN paquete (toPackageDetailDTO/
+  // getPackageDetail) — nunca en toPackageDetailDTOList(), para no
+  // convertir cada lista (Reportes/Dashboard) en un N+1.
+  enTransito: EnTransitoDTO | null;
 }
 
 /**
@@ -85,7 +113,7 @@ type ClienteRelacionado = { nombre: string | null; emprendimiento: string | null
  * cliente asociado es opcional: las vistas de lista (reportes, dashboard)
  * no lo necesitan y así evitan un JOIN/consulta extra por paquete.
  */
-function buildPackageDetailDTO(pkg: Package, company: Company, feriados: Set<string>, cliente?: ClienteRelacionado): PackageDetailDTO {
+function buildPackageDetailDTO(pkg: Package, company: Company, feriados: Set<string>, cliente?: ClienteRelacionado, enTransito: EnTransitoDTO | null = null): PackageDetailDTO {
   const costo = calcularCosto(
     pkg.ingresoAt,
     fechaReferencia(pkg),
@@ -130,19 +158,22 @@ function buildPackageDetailDTO(pkg: Package, company: Company, feriados: Set<str
     estadoPago,
     montoPagado: pkg.montoPagado,
     saldoPendiente,
+    origenNombre: company.sucursalNombre,
+    enTransito,
   };
 }
 
 export async function toPackageDetailDTO(pkg: Package): Promise<PackageDetailDTO> {
-  const [company, feriados, cliente] = await Promise.all([
+  const [company, feriados, cliente, enTransito] = await Promise.all([
     getCompanyConfig(),
     getHolidaySet(),
     pkg.clienteId ? prisma.cliente.findUnique({ where: { id: pkg.clienteId } }) : Promise.resolve(null),
+    getReservaActivaDePaquete(pkg.id),
   ]);
-  return buildPackageDetailDTO(pkg, company, feriados, cliente);
+  return buildPackageDetailDTO(pkg, company, feriados, cliente, enTransito);
 }
 
-/** Igual que toPackageDetailDTO pero trayendo la config de empresa y los feriados una sola vez para toda la lista, en vez de una vez por paquete. No incluye datos de cliente (no se usa en vistas de lista). */
+/** Igual que toPackageDetailDTO pero trayendo la config de empresa y los feriados una sola vez para toda la lista, en vez de una vez por paquete. No incluye datos de cliente (no se usa en vistas de lista) ni "enTransito" (requeriría una consulta extra por fila — ver comentario en PackageDetailDTO — las vistas de lista que usan esto, ej. Reportes/Dashboard, no ofrecen acciones de entrega/depósito). */
 export async function toPackageDetailDTOList(pkgs: Package[]): Promise<PackageDetailDTO[]> {
   const [company, feriados] = await Promise.all([getCompanyConfig(), getHolidaySet()]);
   return pkgs.map((pkg) => buildPackageDetailDTO(pkg, company, feriados));

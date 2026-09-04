@@ -179,7 +179,15 @@ export function EntregaClient({
   const [query, setQuery] = React.useState(codigoInicial ?? '');
   const [paquete, setPaquete] = React.useState<PackageDetailDTO | null>(paqueteInicial ?? null);
   const [fase, setFase] = React.useState<FaseEntrega>(
-    paqueteInicial ? (paqueteInicial.status === 'EN_PAQUETERIA' ? 'COUNTDOWN' : 'FOUND') : codigoInicial ? 'ERROR' : 'IDLE'
+    paqueteInicial
+      ? paqueteInicial.enTransito
+        ? 'FOUND'
+        : paqueteInicial.status === 'EN_PAQUETERIA'
+          ? 'COUNTDOWN'
+          : 'FOUND'
+      : codigoInicial
+        ? 'ERROR'
+        : 'IDLE'
   );
   const [mensajeError, setMensajeError] = React.useState<string | null>(
     codigoInicial && !paqueteInicial ? `No se encontró ningún paquete con el código "${codigoInicial}".` : null
@@ -254,7 +262,7 @@ export function EntregaClient({
     if (paqueteInicial) {
       setPaquete(paqueteInicial);
       setMensajeError(null);
-      setFase(paqueteInicial.status === 'EN_PAQUETERIA' ? 'COUNTDOWN' : 'FOUND');
+      setFase(!paqueteInicial.enTransito && paqueteInicial.status === 'EN_PAQUETERIA' ? 'COUNTDOWN' : 'FOUND');
       if (paqueteInicial.status === 'ENTREGADO') mostrarAlertaEntregado(paqueteInicial.code, paqueteInicial.entregaAt);
     } else {
       setPaquete(null);
@@ -341,9 +349,10 @@ export function EntregaClient({
       } else {
         playSound('ok');
       }
-      if (data.status !== 'EN_PAQUETERIA') {
+      if (data.enTransito || data.status !== 'EN_PAQUETERIA') {
         // Encontrado pero no entregable ahora mismo (en deposito,
-        // pendiente de bajar, ya entregado, denegado): se muestra su
+        // pendiente de bajar, ya entregado, denegado, o — Fase 2.2 —
+        // reservado en un envío hacia otra sucursal): se muestra su
         // informacion, pero no hay contador que esperar — la cola sigue
         // de largo con el siguiente codigo sin ninguna demora.
         setFase('FOUND');
@@ -686,10 +695,17 @@ export function EntregaClient({
     }
   }
 
-  const puedeEntregar = paquete?.status === 'EN_PAQUETERIA';
-  const puedeEnviarDeposito = paquete?.status === 'EN_PAQUETERIA';
+  // Fase 2.2 — regla fundamental: una sucursal solo puede operar sobre
+  // paquetes que actualmente están disponibles en ella. Un paquete
+  // reservado en un envío BORRADOR/CERRADO hacia otra sucursal
+  // (paquete.enTransito) nunca es entregable/enviable/denegable AQUÍ,
+  // sin importar su Package.status — el backend ya lo rechaza
+  // (PaqueteEnEnvioError, ver package-transitions.ts); esto solo evita
+  // ofrecer un botón que el backend de todos modos va a rechazar.
+  const puedeEntregar = paquete?.status === 'EN_PAQUETERIA' && !paquete.enTransito;
+  const puedeEnviarDeposito = paquete?.status === 'EN_PAQUETERIA' && !paquete.enTransito;
   const puedeSolicitarBajar = paquete?.status === 'EN_DEPOSITO';
-  const puedeDenegar = paquete && !['ENTREGADO', 'DENEGADO'].includes(paquete.status);
+  const puedeDenegar = paquete && !['ENTREGADO', 'DENEGADO'].includes(paquete.status) && !paquete.enTransito;
   const esFinal = paquete && ['ENTREGADO', 'DENEGADO'].includes(paquete.status);
   const puedeReingresar = paquete?.status === 'ENTREGADO';
   // "Editar"/"Guardar datos" quedan disponibles tanto en el flujo normal
@@ -1271,10 +1287,32 @@ export function EntregaClient({
                 </div>
               )}
 
-              {MOTIVO_NO_ENTREGABLE[paquete.status] && (
-                <p className="rounded-lg bg-brand-50 dark:bg-brand-500/10 p-3 text-sm text-brand-700 dark:text-brand-400">
-                  {MOTIVO_NO_ENTREGABLE[paquete.status]}
-                </p>
+              {paquete.enTransito ? (
+                <div className="space-y-2 rounded-xl border border-amber-200 dark:border-amber-900/50 bg-amber-50 dark:bg-amber-500/10 p-4">
+                  <p className="flex items-center gap-2 text-sm font-semibold text-amber-800 dark:text-amber-300">
+                    <Truck className="h-4 w-4 shrink-0" /> Paquete enviado a otra sucursal
+                  </p>
+                  <div className="grid grid-cols-1 gap-1 text-sm text-amber-800 dark:text-amber-300 sm:grid-cols-2">
+                    <p>
+                      Origen: <strong>{paquete.origenNombre ?? 'Esta instalación'}</strong>
+                    </p>
+                    <p>
+                      Destino: <strong>{paquete.enTransito.destinoNombre}</strong>
+                    </p>
+                  </div>
+                  <p className="text-sm text-amber-800 dark:text-amber-300">
+                    Estado: <strong>EN TRÁNSITO</strong> (envío {paquete.enTransito.envioCodigo})
+                  </p>
+                  <p className="text-xs text-amber-700 dark:text-amber-400">
+                    Este paquete no está disponible para entrega en esta sucursal. Vuelve a estarlo cuando la sucursal destino confirme la recepción del envío.
+                  </p>
+                </div>
+              ) : (
+                MOTIVO_NO_ENTREGABLE[paquete.status] && (
+                  <p className="rounded-lg bg-brand-50 dark:bg-brand-500/10 p-3 text-sm text-brand-700 dark:text-brand-400">
+                    {MOTIVO_NO_ENTREGABLE[paquete.status]}
+                  </p>
+                )
               )}
 
               <div className="flex flex-wrap gap-3 border-t border-gray-100 dark:border-gray-800/60 pt-4">
