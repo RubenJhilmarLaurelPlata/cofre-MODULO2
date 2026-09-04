@@ -6,6 +6,7 @@
 // cada accion, y que Package.status NUNCA cambia por estar en un envio.
 import { describe, test, expect, beforeAll } from 'vitest';
 import { prisma } from '@/lib/prisma';
+import { normalizarEntradaEscaneo } from '@/lib/codigo';
 import {
   crearEnvio,
   agregarPaquete,
@@ -626,6 +627,31 @@ describe('Fase 3 — QR seguro (resolución por token)', () => {
     const cerrado = await cerrarEnvio(envio.id, userId);
 
     const encontrado = await buscarEnvioParaRecibir(cerrado.codigo);
+    expect(encontrado?.id).toBe(envio.id);
+  });
+
+  // Fase 4.1 — bug real de producción: la cámara SÍ detectaba el QR real
+  // ("ENV-20260904-008|8fe33691-...") pero el flujo de "Envíos -> Recibir
+  // envío" respondía "no encontrado". Causa: normalizarEntradaEscaneo()
+  // (src/lib/codigo.ts) — el único punto de normalización del lado del
+  // cliente, usado tanto por camera-scanner.tsx como por
+  // recibir-envio-client.tsx — aplicaba .toUpperCase() al payload
+  // COMPLETO, incluido el qrToken (un crypto.randomUUID() en minúsculas,
+  // comparado con === contra la BD). Este test reproduce exactamente ese
+  // camino cliente->servidor para que no pueda volver a romperse en
+  // silencio.
+  test('F. el payload que el cliente normaliza (codigo|qrToken) sigue resolviendo el envío — no se reenvía como código roto', async () => {
+    const envio = await crearEnvio(destinoId, userId);
+    const pkg = await crearPaqueteDePrueba();
+    await agregarPaquete(envio.id, pkg.code, userId);
+    const cerrado = await cerrarEnvio(envio.id, userId);
+    expect(cerrado.qrToken).toMatch(/[a-f]/); // crypto.randomUUID(): siempre en minúsculas
+
+    const payloadCrudo = `${cerrado.codigo.toLowerCase()}|${cerrado.qrToken}`;
+    const normalizado = normalizarEntradaEscaneo(payloadCrudo);
+    expect(normalizado).toBe(`${cerrado.codigo}|${cerrado.qrToken}`); // código en mayúsculas, token intacto
+
+    const encontrado = await buscarEnvioParaRecibir(normalizado);
     expect(encontrado?.id).toBe(envio.id);
   });
 });

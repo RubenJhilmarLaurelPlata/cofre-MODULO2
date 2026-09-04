@@ -71,7 +71,24 @@ export function canonicalizarSeparadores(code: string): string {
  * forma, en el mismo instante. El backend vuelve a normalizar por su
  * cuenta (nunca confia solo en el cliente), pero la interfaz nunca debe
  * llegar a mostrar un apostrofe/acento aunque el lector lo haya enviado.
+ *
+ * "Envios -> Recibir envio" es la unica pantalla cuyo escaneo (QR, via
+ * camera-scanner.tsx) puede traer un payload "codigo|qrToken" (ver
+ * buscarEnvioParaRecibir() en src/lib/envios.ts) — el qrToken es un
+ * crypto.randomUUID() en minusculas, comparado con `===` contra el valor
+ * guardado en BD, asi que NO puede pasar por .toUpperCase() ni por
+ * canonicalizarSeparadores() como el resto del texto o deja de coincidir
+ * (bug real de produccion: la camara detectaba el QR real, pero el
+ * token quedaba en mayusculas y el backend respondia "no encontrado").
+ * Un codigo de paquete/envio real nunca contiene "|", asi que separar
+ * aqui es un cambio seguro para los otros 7 puntos de llamada — cuando
+ * no hay "|" el comportamiento es exactamente el de antes.
  */
 export function normalizarEntradaEscaneo(raw: string): string {
-  return canonicalizarSeparadores(raw.trim()).toUpperCase();
+  const trimmed = raw.trim();
+  const separador = trimmed.indexOf('|');
+  if (separador === -1) return canonicalizarSeparadores(trimmed).toUpperCase();
+  const codigo = canonicalizarSeparadores(trimmed.slice(0, separador)).toUpperCase();
+  const token = trimmed.slice(separador + 1).trim();
+  return `${codigo}|${token}`;
 }
