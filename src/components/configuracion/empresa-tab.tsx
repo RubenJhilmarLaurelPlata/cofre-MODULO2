@@ -22,6 +22,11 @@ interface EmpresaForm {
   moneda: string;
   climaLat: string;
   climaLon: string;
+  sucursalCodigo: string;
+  sucursalNombre: string;
+  googleMapsUrl: string;
+  tiktokUrl: string;
+  whatsapp: string;
 }
 
 const VACIO: EmpresaForm = {
@@ -37,6 +42,11 @@ const VACIO: EmpresaForm = {
   moneda: '',
   climaLat: '',
   climaLon: '',
+  sucursalCodigo: '',
+  sucursalNombre: '',
+  googleMapsUrl: '',
+  tiktokUrl: '',
+  whatsapp: '',
 };
 
 export function EmpresaTab() {
@@ -62,6 +72,11 @@ export function EmpresaTab() {
           moneda: data.moneda ?? '',
           climaLat: data.climaLat ?? '',
           climaLon: data.climaLon ?? '',
+          sucursalCodigo: data.sucursalCodigo ?? '',
+          sucursalNombre: data.sucursalNombre ?? '',
+          googleMapsUrl: data.googleMapsUrl ?? '',
+          tiktokUrl: data.tiktokUrl ?? '',
+          whatsapp: data.whatsapp ?? '',
         })
       )
       .finally(() => setCargando(false));
@@ -116,6 +131,7 @@ export function EmpresaTab() {
   if (cargando) return <p className="py-8 text-center text-sm text-gray-400 dark:text-gray-500">Cargando…</p>;
 
   return (
+    <div className="space-y-5">
     <Card>
       <CardHeader>
         <CardTitle>Datos de la empresa</CardTitle>
@@ -197,6 +213,72 @@ export function EmpresaTab() {
             Dashboard muestra &quot;Clima no configurado&quot; en vez de inventar un dato.
           </p>
         </div>
+      </CardContent>
+    </Card>
+
+    <Card>
+      <CardHeader>
+        <CardTitle>Identidad de esta instalación (sucursal)</CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-5">
+        <p className="text-xs text-gray-400 dark:text-gray-500">
+          Cofre Express está pensado para instalarse por sucursal: esta misma aplicación, con su propia base de datos, puede desplegarse en otra
+          ciudad simplemente configurando aquí su identidad — sin cambiar ningún código. Ciudad, teléfono y horario de atención de esta instalación
+          son los mismos que ya configuraste arriba, en <span className="font-medium text-ink dark:text-gray-200">Datos de la empresa</span>.
+        </p>
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+          <div>
+            <Label htmlFor="sucursalCodigo">Código de sucursal</Label>
+            <Input
+              id="sucursalCodigo"
+              value={form.sucursalCodigo}
+              onChange={(e) => actualizar('sucursalCodigo', e.target.value.toUpperCase())}
+              className="mt-1"
+              placeholder="LPZ"
+              maxLength={10}
+            />
+          </div>
+          <div>
+            <Label htmlFor="sucursalNombre">Nombre de la sucursal</Label>
+            <Input
+              id="sucursalNombre"
+              value={form.sucursalNombre}
+              onChange={(e) => actualizar('sucursalNombre', e.target.value)}
+              className="mt-1"
+              placeholder="Cofre Express La Paz"
+            />
+          </div>
+          <div>
+            <Label htmlFor="googleMapsUrl">Google Maps (opcional)</Label>
+            <Input
+              id="googleMapsUrl"
+              value={form.googleMapsUrl}
+              onChange={(e) => actualizar('googleMapsUrl', e.target.value)}
+              className="mt-1"
+              placeholder="https://maps.google.com/…"
+            />
+          </div>
+          <div>
+            <Label htmlFor="tiktokUrl">TikTok (opcional)</Label>
+            <Input
+              id="tiktokUrl"
+              value={form.tiktokUrl}
+              onChange={(e) => actualizar('tiktokUrl', e.target.value)}
+              className="mt-1"
+              placeholder="https://tiktok.com/@…"
+            />
+          </div>
+          <div>
+            <Label htmlFor="whatsapp">WhatsApp (opcional)</Label>
+            <Input
+              id="whatsapp"
+              value={form.whatsapp}
+              onChange={(e) => actualizar('whatsapp', e.target.value)}
+              className="mt-1"
+              placeholder="+591 700 00000"
+            />
+          </div>
+        </div>
 
         {feedback && (
           <div
@@ -214,5 +296,6 @@ export function EmpresaTab() {
         </Button>
       </CardContent>
     </Card>
+    </div>
   );
 }

@@ -39,6 +39,15 @@ const bodySchema = z.object({
   // no configurado, nunca se inventa un valor.
   climaLat: z.number().min(-90).max(90).nullable().optional(),
   climaLon: z.number().min(-180).max(180).nullable().optional(),
+
+  // Identidad de esta instalacion (Fase 1 — multi-sucursal). Ciudad,
+  // telefono y horario de atencion NO se repiten aqui: son los campos de
+  // arriba (reutilizados tal cual, ver prisma/schema.prisma).
+  sucursalCodigo: z.string().trim().max(10).optional(),
+  sucursalNombre: z.string().trim().max(120).optional(),
+  googleMapsUrl: z.string().trim().max(300).optional(),
+  tiktokUrl: z.string().trim().max(300).optional(),
+  whatsapp: z.string().trim().max(40).optional(),
 });
 
 export async function PATCH(req: Request) {
@@ -69,6 +78,11 @@ export async function PATCH(req: Request) {
       moneda: parsed.data.moneda,
       ...(parsed.data.climaLat !== undefined ? { climaLat: parsed.data.climaLat } : {}),
       ...(parsed.data.climaLon !== undefined ? { climaLon: parsed.data.climaLon } : {}),
+      ...(parsed.data.sucursalCodigo !== undefined ? { sucursalCodigo: parsed.data.sucursalCodigo || null } : {}),
+      ...(parsed.data.sucursalNombre !== undefined ? { sucursalNombre: parsed.data.sucursalNombre || null } : {}),
+      ...(parsed.data.googleMapsUrl !== undefined ? { googleMapsUrl: parsed.data.googleMapsUrl || null } : {}),
+      ...(parsed.data.tiktokUrl !== undefined ? { tiktokUrl: parsed.data.tiktokUrl || null } : {}),
+      ...(parsed.data.whatsapp !== undefined ? { whatsapp: parsed.data.whatsapp || null } : {}),
     },
   });
 

@@ -170,6 +170,25 @@ model Company {
   // verificarCierreAutomatico() en src/lib/finanzas.ts.
   cierreAutomaticoHabilitado Boolean @default(false)
   horaCierreAutomatico       String  @default("20:00")
+
+  // Identidad de esta instalación (Fase 1 — arquitectura multi-sucursal):
+  // cada instalación de Cofre Express (La Paz, El Alto, futuras) corre el
+  // MISMO código fuente contra su PROPIA base de datos; esta fila (id=1,
+  // ya el patron de configuracion de "esta instalacion") es donde vive su
+  // identidad. Deliberadamente separado de "nombre" (la marca/empresa,
+  // ej. "Cofre Express", igual en todas las instalaciones): sucursalNombre
+  // es especifico de ESTA instalacion (ej. "Cofre Express La Paz"). Ciudad,
+  // telefono y horario de atencion NO se duplican aqui: ya existen como
+  // "ciudad"/"telefono"/"horarioAtencion" arriba y significan exactamente
+  // lo mismo para una instalacion de una sola sucursal — se reutilizan tal
+  // cual. Todos nullable: una instalacion recien desplegada (base nueva,
+  // sin configurar todavia) debe poder distinguirse de una ya identificada
+  // sin inventar ningun valor por defecto.
+  sucursalCodigo String? // ej. "LPZ", "ELA" — identidad corta de ESTA instalacion
+  sucursalNombre String? // ej. "Cofre Express La Paz" — nombre de ESTA instalacion, no de la marca
+  googleMapsUrl  String?
+  tiktokUrl      String?
+  whatsapp       String?
 }
 
 model Holiday {
