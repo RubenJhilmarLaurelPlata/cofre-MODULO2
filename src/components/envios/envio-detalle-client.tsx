@@ -12,7 +12,7 @@
 // propio ni almacenamiento de audio).
 import * as React from 'react';
 import Link from 'next/link';
-import { ArrowLeft, Container, ScanLine, Trash2, CheckCircle2, XCircle, Lock, Ban, RefreshCw, QrCode, PackageCheck, Keyboard, Camera as CameraIcon, UserRound, Phone } from 'lucide-react';
+import { ArrowLeft, Container, ScanLine, Trash2, CheckCircle2, XCircle, Lock, Ban, RefreshCw, QrCode, PackageCheck, Keyboard, Camera as CameraIcon, UserRound, Phone, Wallet, RotateCcw } from 'lucide-react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -21,10 +21,13 @@ import { ScannerStatus } from '@/components/scanner/scanner-status';
 import { CameraScanner } from '@/components/scanner/camera-scanner';
 import { TecladoVirtual } from '@/components/scanner/teclado-virtual';
 import { VoiceInputButton } from '@/components/ui/voice-input-button';
+import { getEstadoEnvioInfo } from '@/components/envios/estado-envio';
 import { useScanQueue } from '@/lib/scanner/use-scan-queue';
 import { normalizarEntradaEscaneo } from '@/lib/codigo';
 import { playSound } from '@/lib/sound';
 import { cn } from '@/lib/utils';
+
+type EstadoPagoEnvioItem = 'PENDIENTE' | 'PAGADO';
 
 interface EnvioItemDTO {
   id: string;
@@ -33,6 +36,10 @@ interface EnvioItemDTO {
   status: string;
   ingresoAt: string;
   createdAt: string;
+  destinatario: string | null;
+  destinatarioTelefono: string | null;
+  estadoPago: EstadoPagoEnvioItem;
+  montoPagado: number;
 }
 interface EnvioDetalleDTO {
   id: string;
@@ -47,20 +54,16 @@ interface EnvioDetalleDTO {
   cerradoAt: string | null;
   qrToken: string | null;
   items: EnvioItemDTO[];
+  resumenPago: { pagados: number; pendientes: number; fondosDestino: number };
 }
 
 interface ItemEscaneado {
   code: string;
   destinatario?: string;
   destinatarioTelefono?: string;
+  estadoPago?: EstadoPagoEnvioItem;
+  monto?: number;
 }
-
-const ESTADO_BADGE: Record<string, { label: string; variant: 'brand' | 'success' | 'neutral' }> = {
-  BORRADOR: { label: 'Borrador', variant: 'brand' },
-  CERRADO: { label: 'En tránsito', variant: 'success' },
-  RECIBIDO: { label: 'Recibido', variant: 'success' },
-  CANCELADO: { label: 'Cancelado', variant: 'neutral' },
-};
 
 function fmtFecha(iso: string | null): string {
   if (!iso) return '—';
@@ -74,6 +77,10 @@ export function EnvioDetalleClient({ envioId }: { envioId: string }) {
   const [valor, setValor] = React.useState('');
   const [destinatario, setDestinatario] = React.useState('');
   const [destinatarioTelefono, setDestinatarioTelefono] = React.useState('');
+  const [estadoPago, setEstadoPago] = React.useState<EstadoPagoEnvioItem>('PENDIENTE');
+  const [monto, setMonto] = React.useState('');
+  const [qrError, setQrError] = React.useState(false);
+  const [qrIntento, setQrIntento] = React.useState(0);
   const [ultimoScan, setUltimoScan] = React.useState<{ ok: boolean; code: string; mensaje: string } | null>(null);
   const [cerrando, setCerrando] = React.useState(false);
   const [cancelando, setCancelando] = React.useState(false);
@@ -126,14 +133,19 @@ export function EnvioDetalleClient({ envioId }: { envioId: string }) {
     const code = normalizarEntradaEscaneo(codigoCrudo);
     setValor('');
     if (!code) return;
+    const montoNum = parseFloat(monto);
     encolar({
       code,
       destinatario: destinatario.trim() || undefined,
       destinatarioTelefono: destinatarioTelefono.trim() || undefined,
+      estadoPago,
+      monto: estadoPago === 'PAGADO' && !Number.isNaN(montoNum) ? montoNum : undefined,
     });
     // Listo para el siguiente escaneo: nunca hay que borrar a mano.
     setDestinatario('');
     setDestinatarioTelefono('');
+    setEstadoPago('PENDIENTE');
+    setMonto('');
   }
 
   /**
@@ -209,7 +221,7 @@ export function EnvioDetalleClient({ envioId }: { envioId: string }) {
     );
   }
 
-  const badge = ESTADO_BADGE[envio.estado] ?? { label: envio.estado, variant: 'neutral' as const };
+  const badge = getEstadoEnvioInfo(envio.estado);
   const esBorrador = envio.estado === 'BORRADOR';
   const yaEnCamino = envio.estado === 'CERRADO' || envio.estado === 'RECIBIDO';
 
@@ -356,6 +368,58 @@ export function EnvioDetalleClient({ envioId }: { envioId: string }) {
                   </div>
                 </div>
 
+                <div className="rounded-xl border border-gray-100 dark:border-gray-800 p-4">
+                  <p className="mb-3 flex items-center gap-1.5 text-sm font-medium text-ink dark:text-gray-100">
+                    <Wallet className="h-4 w-4 text-brand-500" /> Pago en destino
+                  </p>
+                  <div className="grid grid-cols-2 gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setEstadoPago('PENDIENTE')}
+                      className={cn(
+                        'rounded-lg border-2 py-2.5 text-sm font-semibold transition-colors',
+                        estadoPago === 'PENDIENTE'
+                          ? 'border-amber-400 bg-amber-50 text-amber-700 dark:bg-amber-500/10 dark:text-amber-400'
+                          : 'border-gray-200 dark:border-gray-800 text-ink-soft dark:text-gray-400'
+                      )}
+                    >
+                      Pendiente
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setEstadoPago('PAGADO')}
+                      className={cn(
+                        'rounded-lg border-2 py-2.5 text-sm font-semibold transition-colors',
+                        estadoPago === 'PAGADO'
+                          ? 'border-emerald-400 bg-emerald-50 text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-400'
+                          : 'border-gray-200 dark:border-gray-800 text-ink-soft dark:text-gray-400'
+                      )}
+                    >
+                      Pagado
+                    </button>
+                  </div>
+                  {estadoPago === 'PAGADO' && (
+                    <div className="mt-3">
+                      <Input
+                        value={monto}
+                        onChange={(e) => setMonto(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') agregar(valor);
+                        }}
+                        type="number"
+                        step="0.01"
+                        min="0"
+                        inputMode="decimal"
+                        placeholder="Monto entregado (ej: 2.00)"
+                        className="h-11 text-base"
+                      />
+                      <p className="mt-1.5 text-xs text-gray-400 dark:text-gray-500">
+                        Lo que el cliente entregó aquí para el destino — no la tarifa de esta sucursal.
+                      </p>
+                    </div>
+                  )}
+                </div>
+
                 <Button className="w-full" size="lg" onClick={() => agregar(valor)} disabled={!valor.trim()}>
                   Agregar paquete
                 </Button>
@@ -389,15 +453,28 @@ export function EnvioDetalleClient({ envioId }: { envioId: string }) {
               ) : (
                 <div className="divide-y divide-gray-100 dark:divide-gray-800">
                   {envio.items.map((it) => (
-                    <div key={it.id} className="flex items-center justify-between py-2 text-sm">
-                      <span className="flex items-center gap-2 font-mono font-medium text-ink dark:text-gray-100">
-                        <CheckCircle2 className="h-4 w-4 text-emerald-500" /> {it.code}
-                      </span>
-                      {esBorrador && (
-                        <Button variant="ghost" size="sm" onClick={() => quitar(it)}>
-                          <Trash2 className="h-3.5 w-3.5 text-red-500" /> Quitar
-                        </Button>
-                      )}
+                    <div key={it.id} className="flex flex-wrap items-center justify-between gap-2 py-2.5 text-sm">
+                      <div className="min-w-0 space-y-0.5">
+                        <span className="flex items-center gap-2 font-mono font-medium text-ink dark:text-gray-100">
+                          <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-500" /> {it.code}
+                        </span>
+                        {it.destinatario && (
+                          <p className="truncate pl-6 text-xs text-gray-400 dark:text-gray-500">
+                            {it.destinatario}
+                            {it.destinatarioTelefono && ` · ${it.destinatarioTelefono}`}
+                          </p>
+                        )}
+                      </div>
+                      <div className="flex shrink-0 items-center gap-2">
+                        <Badge variant={it.estadoPago === 'PAGADO' ? 'success' : 'warning'}>
+                          {it.estadoPago === 'PAGADO' ? `Pagado Bs ${it.montoPagado.toFixed(2)}` : 'Pendiente'}
+                        </Badge>
+                        {esBorrador && (
+                          <Button variant="ghost" size="sm" onClick={() => quitar(it)}>
+                            <Trash2 className="h-3.5 w-3.5 text-red-500" />
+                          </Button>
+                        )}
+                      </div>
                     </div>
                   ))}
                 </div>
@@ -413,6 +490,34 @@ export function EnvioDetalleClient({ envioId }: { envioId: string }) {
         </div>
 
         <div className="space-y-5">
+          {envio.items.length > 0 && (
+            <Card>
+              <CardHeader>
+                <CardTitle className="flex items-center gap-1.5">
+                  <Wallet className="h-4 w-4 text-brand-500" /> Resumen
+                </CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-2 text-sm">
+                <div className="flex items-center justify-between">
+                  <span className="text-ink-soft dark:text-gray-400">Paquetes</span>
+                  <span className="font-medium text-ink dark:text-gray-100">{envio.cantidadPaquetes}</span>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-ink-soft dark:text-gray-400">Pagados</span>
+                  <span className="font-medium text-emerald-600 dark:text-emerald-400">{envio.resumenPago.pagados}</span>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-ink-soft dark:text-gray-400">Pendientes</span>
+                  <span className="font-medium text-amber-600 dark:text-amber-400">{envio.resumenPago.pendientes}</span>
+                </div>
+                <div className="flex items-center justify-between border-t border-gray-100 dark:border-gray-800 pt-2">
+                  <span className="font-medium text-ink dark:text-gray-100">Fondos para {envio.destino.nombre}</span>
+                  <span className="font-semibold text-brand-600 dark:text-brand-400">Bs {envio.resumenPago.fondosDestino.toFixed(2)}</span>
+                </div>
+              </CardContent>
+            </Card>
+          )}
+
           {esBorrador && (
             <Card>
               <CardHeader>
@@ -428,6 +533,11 @@ export function EnvioDetalleClient({ envioId }: { envioId: string }) {
                     <p className="text-xs text-amber-800 dark:text-amber-300">
                       Al cerrar, este envío queda <strong>inmutable</strong>: no podrás agregar ni quitar paquetes. Se generará su código QR.
                     </p>
+                    {envio.resumenPago.fondosDestino > 0 && (
+                      <p className="text-xs text-amber-800 dark:text-amber-300">
+                        Fondos para {envio.destino.nombre}: <strong>Bs {envio.resumenPago.fondosDestino.toFixed(2)}</strong> ({envio.resumenPago.pagados} pagado{envio.resumenPago.pagados === 1 ? '' : 's'}).
+                      </p>
+                    )}
                     <div className="flex gap-2">
                       <Button size="sm" onClick={cerrar} loading={cerrando}>
                         Confirmar cierre
@@ -484,10 +594,33 @@ export function EnvioDetalleClient({ envioId }: { envioId: string }) {
                 <div className="flex items-center gap-1.5 pt-2 text-xs font-medium text-gray-400 dark:text-gray-500">
                   <QrCode className="h-3.5 w-3.5" /> QR del envío
                 </div>
-                {/* eslint-disable-next-line @next/next/no-img-element */}
-                <img src={`/api/envios/${envio.id}/qr`} alt={`QR del envío ${envio.codigo}`} className="h-48 w-48 rounded-lg border border-gray-100 dark:border-gray-800" />
+                {qrError ? (
+                  <div className="flex h-48 w-48 flex-col items-center justify-center gap-2 rounded-lg border border-red-200 dark:border-red-900/50 bg-red-50 dark:bg-red-500/10 p-3 text-center">
+                    <XCircle className="h-6 w-6 text-red-500" />
+                    <p className="text-xs text-red-700 dark:text-red-400">No se pudo cargar el QR. Verifica tu sesión.</p>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setQrError(false);
+                        setQrIntento((n) => n + 1);
+                      }}
+                      className="flex items-center gap-1 text-xs font-medium text-brand-600 dark:text-brand-400 hover:underline"
+                    >
+                      <RotateCcw className="h-3 w-3" /> Reintentar
+                    </button>
+                  </div>
+                ) : (
+                  // eslint-disable-next-line @next/next/no-img-element
+                  <img
+                    src={`/api/envios/${envio.id}/qr${qrIntento > 0 ? `?intento=${qrIntento}` : ''}`}
+                    alt={`QR del envío ${envio.codigo}`}
+                    onError={() => setQrError(true)}
+                    className="h-48 w-48 rounded-lg border border-gray-100 dark:border-gray-800"
+                  />
+                )}
                 <p className="text-center text-xs text-gray-400 dark:text-gray-500">
-                  Al llegar a destino, escanea este código desde Envíos → Recibir envío.
+                  Al llegar a destino, escanea este código desde Envíos → Recibir envío. Si la cámara no puede
+                  leerlo, también puedes escribir el código <span className="font-mono font-medium text-ink-soft dark:text-gray-300">{envio.codigo}</span> manualmente.
                 </p>
               </CardContent>
             </Card>

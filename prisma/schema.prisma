@@ -75,21 +75,22 @@ model User {
   permisosExtra     String?
   permisosRevocados String?
 
-  paquetesRegistrados     Package[]        @relation("PackageRegistradoPor")
-  historialAcciones       PackageHistory[]
-  lotesGenerados          LabelBatch[]
-  reportesGenerados       ReportLog[]
-  auditorias              AuditLog[]
-  respaldos               Backup[]
-  pagosRegistrados        Pago[]
-  gastosRegistrados       Gasto[]
-  cierresCaja             CierreCaja[]
-  importaciones           ImportLog[]
-  importacionesRevertidas ImportLog[]      @relation("ImportLogRevertidoPor")
-  cajasAbiertas           CajaSesion[]     @relation("CajaAbiertaPor")
-  cajasCerradas           CajaSesion[]     @relation("CajaCerradaPor")
-  enviosCreados           Envio[]          @relation("EnvioCreadoPor")
-  enviosCerrados          Envio[]          @relation("EnvioCerradoPor")
+  paquetesRegistrados      Package[]          @relation("PackageRegistradoPor")
+  historialAcciones        PackageHistory[]
+  lotesGenerados           LabelBatch[]
+  reportesGenerados        ReportLog[]
+  auditorias               AuditLog[]
+  respaldos                Backup[]
+  pagosRegistrados         Pago[]
+  gastosRegistrados        Gasto[]
+  cierresCaja              CierreCaja[]
+  importaciones            ImportLog[]
+  importacionesRevertidas  ImportLog[]        @relation("ImportLogRevertidoPor")
+  cajasAbiertas            CajaSesion[]       @relation("CajaAbiertaPor")
+  cajasCerradas            CajaSesion[]       @relation("CajaCerradaPor")
+  enviosCreados            Envio[]            @relation("EnvioCreadoPor")
+  enviosCerrados           Envio[]            @relation("EnvioCerradoPor")
+  liquidacionesRegistradas LiquidacionEnvio[]
 
   @@index([role])
   @@index([branchId])
@@ -387,8 +388,8 @@ model Package {
   // reportes — nunca debe parecer una entrega hecha con el lector.
   origenEntrega String?
 
-  historial PackageHistory[]
-  pagos     Pago[]
+  historial   PackageHistory[]
+  pagos       Pago[]
   // Fase 2 (modulo Envios): en que EnvioItem(s) aparecio este paquete a lo
   // largo del tiempo. Un paquete "reservado" para transferencia hoy es el
   // que tiene un EnvioItem cuyo Envio.estado esta en BORRADOR o CERRADO
@@ -744,7 +745,8 @@ model SucursalDestino {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  envios Envio[]
+  envios        Envio[]
+  liquidaciones LiquidacionEnvio[]
 
   @@index([activa])
 }
@@ -781,11 +783,22 @@ model Envio {
   updatedAt DateTime  @updatedAt
   cerradoAt DateTime?
 
+  // Fase 3 (fondos entre sucursales): null = el dinero cobrado en origen
+  // por los paquetes de este envio (ver EnvioItem.montoPagado) todavia NO
+  // fue entregado fisicamente a la sucursal destino. Se llena UNA sola vez
+  // cuando registrarLiquidacion() (envios.ts) agrupa este envio dentro de
+  // una LiquidacionEnvio — nunca se vuelve a null despues. Un envio
+  // CANCELADO nunca llega a tener esto (nunca pasa por CERRADO/RECIBIDO,
+  // los unicos estados que getFondosPendientesPorDestino() considera).
+  liquidacionId String?
+  liquidacion   LiquidacionEnvio? @relation(fields: [liquidacionId], references: [id])
+
   items EnvioItem[]
 
   @@index([destinoId])
   @@index([estado])
   @@index([createdAt])
+  @@index([liquidacionId])
 }
 
 // Un paquete dentro de un envio. Sin campo de "baja logica": mientras el
@@ -803,11 +816,50 @@ model EnvioItem {
   packageId String
   package   Package @relation(fields: [packageId], references: [id])
 
+  // Fase 3 (fondos entre sucursales): dinero que el cliente entrego EN
+  // ORIGEN por este paquete, correspondiente economicamente al DESTINO —
+  // nunca se mezcla con Package.montoPagado/estadoPago ni con la tabla
+  // Pago (esos representan el cobro LOCAL de la tarifa de esta sucursal,
+  // un concepto distinto). Valores permitidos de "estadoPago": PENDIENTE |
+  // PAGADO (mismo vocabulario que PaymentStatus, con un estado intermedio
+  // de menos porque aqui no existe "pago parcial" — es un monto en
+  // efectivo que el operador declara de una vez, no un saldo que se
+  // recalcula con el paso de los dias). "montoPagado" es un monto libre
+  // (lo que el cliente realmente entrego), NUNCA un calculo de tarifa: la
+  // tarifa de la sucursal destino no es accesible desde el origen (cada
+  // instalacion tiene su propia configuracion — ver Company).
+  estadoPago  String @default("PENDIENTE")
+  montoPagado Float  @default(0)
+
   createdAt DateTime @default(now())
 
   @@unique([envioId, packageId])
   @@index([packageId])
   @@index([envioId])
+}
+
+// Fase 3 (fondos entre sucursales): registra que ESTA instalacion entrego
+// fisicamente a la sucursal destino el efectivo cobrado por sus envios ya
+// CERRADOS/RECIBIDOS (ver EnvioItem.montoPagado / Envio.liquidacionId).
+// "monto" es una foto congelada de la suma al momento de liquidar — nunca
+// se recalcula despues, aunque los envios asociados sigan existiendo (ver
+// registrarLiquidacion() en src/lib/envios.ts). NO representa una
+// transferencia bancaria: es la trazabilidad de una entrega de dinero en
+// efectivo entre personas/sucursales.
+model LiquidacionEnvio {
+  id        String          @id @default(cuid())
+  destinoId String
+  destino   SucursalDestino @relation(fields: [destinoId], references: [id])
+  monto     Float
+  userId    String?
+  user      User?           @relation(fields: [userId], references: [id])
+  notas     String?
+  createdAt DateTime        @default(now())
+
+  envios Envio[]
+
+  @@index([destinoId])
+  @@index([createdAt])
 }
 
 // Catalogo de PERMISOS en si (la clave, su nombre y descripcion legibles)

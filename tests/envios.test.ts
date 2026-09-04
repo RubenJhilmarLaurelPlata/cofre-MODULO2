@@ -15,6 +15,10 @@ import {
   recibirEnvio,
   buscarEnvioParaRecibir,
   getEnvioDetalle,
+  actualizarPagoItem,
+  getFondosPendientesPorDestino,
+  registrarLiquidacion,
+  listarLiquidaciones,
   DestinoNoEncontradoError,
   DestinoInactivoError,
   EnvioNoModificableError,
@@ -23,9 +27,15 @@ import {
   PaqueteNoEncontradoParaEnvioError,
   PaqueteNoElegibleError,
   PaqueteYaReservadoError,
+  MontoPagoRequeridoError,
+  ItemNoEditableError,
+  NoHayFondosPendientesError,
 } from '@/lib/envios';
 import { entregarPaquete, PaqueteEnEnvioError } from '@/lib/package-transitions';
 import { getPackageDetail } from '@/lib/package-detail';
+import { getDashboardData } from '@/lib/dashboard-data';
+import { getResumenFinanciero } from '@/lib/finanzas';
+import { CATALOGO_PERMISOS } from '@/lib/permisos';
 
 let branchId: string;
 
@@ -501,6 +511,334 @@ describe('Fase 2.1 — Recibir envío', () => {
     await recibirEnvio(envio.id, userId);
     const despues = await prisma.auditLog.count({ where: { modulo: 'envios', accion: 'ENVIO_RECIBIDO' } });
     expect(despues).toBe(antes + 1);
+  });
+});
+
+describe('Fase 3 — pago por paquete al armar el envío', () => {
+  test('G/H. estadoPago=PAGADO sin monto se rechaza (backend, no solo UI)', async () => {
+    const envio = await crearEnvio(destinoId, userId);
+    const pkg = await crearPaqueteDePrueba();
+    await expect(agregarPaquete(envio.id, pkg.code, userId, undefined, undefined, { estadoPago: 'PAGADO' })).rejects.toThrow(MontoPagoRequeridoError);
+  });
+
+  test('F/G/H. guarda estadoPago/montoPagado en el EnvioItem, nunca en Package.montoPagado/Pago', async () => {
+    const envio = await crearEnvio(destinoId, userId);
+    const pkg = await crearPaqueteDePrueba();
+    const actualizado = await agregarPaquete(envio.id, pkg.code, userId, undefined, undefined, { estadoPago: 'PAGADO', monto: 2 });
+
+    expect(actualizado.items[0]!.estadoPago).toBe('PAGADO');
+    expect(actualizado.items[0]!.montoPagado).toBe(2);
+
+    // Nunca toca el paquete ni genera un Pago — ese dinero es del destino,
+    // no un cobro local (ver comentario de EnvioItem en el schema).
+    const pkgDespues = await prisma.package.findUnique({ where: { id: pkg.id } });
+    expect(pkgDespues!.montoPagado).toBe(0);
+    expect(pkgDespues!.estadoPago).toBe('PENDIENTE');
+    const pagos = await prisma.pago.count({ where: { packageId: pkg.id } });
+    expect(pagos).toBe(0);
+  });
+
+  test('N. 3 paquetes (2 pagados + 1 pendiente): resumenPago y fondosDestino calculados en vivo', async () => {
+    const envio = await crearEnvio(destinoId, userId);
+    const p1 = await crearPaqueteDePrueba();
+    const p2 = await crearPaqueteDePrueba();
+    const p3 = await crearPaqueteDePrueba();
+
+    await agregarPaquete(envio.id, p1.code, userId, undefined, undefined, { estadoPago: 'PAGADO', monto: 2 });
+    await agregarPaquete(envio.id, p2.code, userId, undefined, undefined, { estadoPago: 'PENDIENTE' });
+    const final = await agregarPaquete(envio.id, p3.code, userId, undefined, undefined, { estadoPago: 'PAGADO', monto: 2 });
+
+    expect(final.resumenPago).toEqual({ pagados: 2, pendientes: 1, fondosDestino: 4 });
+  });
+
+  test('D/E. nombre/celular y pago conviven en el mismo escaneo, sin pisarse', async () => {
+    await prisma.packageSeries.upsert({ where: { inicial: 'X' }, update: {}, create: { inicial: 'X', descripcion: 'Prueba' } });
+    const envio = await crearEnvio(destinoId, userId);
+    const codigo = 'X1T-PAGOYNOMBRE';
+
+    const actualizado = await agregarPaquete(
+      envio.id,
+      codigo,
+      userId,
+      branchId,
+      { destinatario: 'Juan Pérez', destinatarioTelefono: '71234567' },
+      { estadoPago: 'PAGADO', monto: 2 }
+    );
+    const item = actualizado.items.find((i) => i.code === codigo)!;
+    expect(item.destinatario).toBe('Juan Pérez');
+    expect(item.destinatarioTelefono).toBe('71234567');
+    expect(item.estadoPago).toBe('PAGADO');
+    expect(item.montoPagado).toBe(2);
+  });
+
+  test('sin pago ni datos de quien recoge: quedan como PENDIENTE/0/null (fallback "Sin datos" a nivel de DTO)', async () => {
+    const envio = await crearEnvio(destinoId, userId);
+    const pkg = await crearPaqueteDePrueba();
+    const actualizado = await agregarPaquete(envio.id, pkg.code, userId);
+    const item = actualizado.items[0]!;
+    expect(item.estadoPago).toBe('PENDIENTE');
+    expect(item.montoPagado).toBe(0);
+    expect(item.destinatario).toBeNull();
+    expect(item.destinatarioTelefono).toBeNull();
+  });
+
+  test('actualizarPagoItem corrige el pago mientras BORRADOR, y se rechaza una vez CERRADO', async () => {
+    const envio = await crearEnvio(destinoId, userId);
+    const pkg = await crearPaqueteDePrueba();
+    await agregarPaquete(envio.id, pkg.code, userId);
+
+    const corregido = await actualizarPagoItem(envio.id, pkg.id, { estadoPago: 'PAGADO', monto: 3 }, userId);
+    expect(corregido.items[0]!.estadoPago).toBe('PAGADO');
+    expect(corregido.items[0]!.montoPagado).toBe(3);
+
+    await cerrarEnvio(envio.id, userId);
+    await expect(actualizarPagoItem(envio.id, pkg.id, { estadoPago: 'PENDIENTE' }, userId)).rejects.toThrow(ItemNoEditableError);
+  });
+});
+
+describe('Fase 3 — QR seguro (resolución por token)', () => {
+  test('K/L. "codigo|qrToken" válido resuelve el envío', async () => {
+    const envio = await crearEnvio(destinoId, userId);
+    const pkg = await crearPaqueteDePrueba();
+    await agregarPaquete(envio.id, pkg.code, userId);
+    const cerrado = await cerrarEnvio(envio.id, userId);
+
+    const encontrado = await buscarEnvioParaRecibir(`${cerrado.codigo}|${cerrado.qrToken}`);
+    expect(encontrado?.id).toBe(envio.id);
+  });
+
+  test('un token equivocado se rechaza aunque el código sea correcto (no basta con el código visible)', async () => {
+    const envio = await crearEnvio(destinoId, userId);
+    const pkg = await crearPaqueteDePrueba();
+    await agregarPaquete(envio.id, pkg.code, userId);
+    const cerrado = await cerrarEnvio(envio.id, userId);
+
+    expect(await buscarEnvioParaRecibir(`${cerrado.codigo}|un-token-invalido`)).toBeNull();
+  });
+
+  test('M. la entrada manual (solo el código, sin "|") sigue funcionando igual que siempre', async () => {
+    const envio = await crearEnvio(destinoId, userId);
+    const pkg = await crearPaqueteDePrueba();
+    await agregarPaquete(envio.id, pkg.code, userId);
+    const cerrado = await cerrarEnvio(envio.id, userId);
+
+    const encontrado = await buscarEnvioParaRecibir(cerrado.codigo);
+    expect(encontrado?.id).toBe(envio.id);
+  });
+});
+
+describe('Fase 3 — fondos entre sucursales y liquidación', () => {
+  test('H. un paquete pagado en un envío BORRADOR no genera fondos todavía (no salió de aquí)', async () => {
+    const destino = await prisma.sucursalDestino.create({ data: { codigo: 'FONDOSBORRADOR', nombre: 'Destino fondos borrador' } });
+    const envio = await crearEnvio(destino.id, userId);
+    const pkg = await crearPaqueteDePrueba();
+    await agregarPaquete(envio.id, pkg.code, userId, undefined, undefined, { estadoPago: 'PAGADO', monto: 5 });
+
+    const fondos = await getFondosPendientesPorDestino();
+    const deEsteDestino = fondos.find((f) => f.destinoId === destino.id);
+    expect(deEsteDestino).toBeUndefined();
+  });
+
+  test('H. al cerrar, los fondos pagados sí se cuentan; al recibir, se siguen contando (hasta liquidar)', async () => {
+    const destino = await prisma.sucursalDestino.create({ data: { codigo: 'FONDOSCERRADO', nombre: 'Destino fondos cerrado' } });
+    const envio = await crearEnvio(destino.id, userId);
+    const pkg = await crearPaqueteDePrueba();
+    await agregarPaquete(envio.id, pkg.code, userId, undefined, undefined, { estadoPago: 'PAGADO', monto: 7 });
+    await cerrarEnvio(envio.id, userId);
+
+    let fondos = await getFondosPendientesPorDestino();
+    expect(fondos.find((f) => f.destinoId === destino.id)?.fondosPendientes).toBe(7);
+
+    await recibirEnvio(envio.id, userId);
+    fondos = await getFondosPendientesPorDestino();
+    expect(fondos.find((f) => f.destinoId === destino.id)?.fondosPendientes).toBe(7);
+  });
+
+  test('R/28. cancelar un envío BORRADOR con un ítem pagado no genera fondos ni liquidación falsa', async () => {
+    const otroDestino = await prisma.sucursalDestino.create({ data: { codigo: 'CANCFONDO', nombre: 'Destino cancelación fondos' } });
+    const envio = await crearEnvio(otroDestino.id, userId);
+    const pkg = await crearPaqueteDePrueba();
+    await agregarPaquete(envio.id, pkg.code, userId, undefined, undefined, { estadoPago: 'PAGADO', monto: 9 });
+    await cancelarEnvio(envio.id, userId);
+
+    const fondos = await getFondosPendientesPorDestino();
+    expect(fondos.find((f) => f.destinoId === otroDestino.id)).toBeUndefined();
+    await expect(registrarLiquidacion(otroDestino.id, userId)).rejects.toThrow(NoHayFondosPendientesError);
+  });
+
+  test('U. registrarLiquidacion congela el monto, pone el saldo pendiente en 0 y queda en el historial', async () => {
+    const otroDestino = await prisma.sucursalDestino.create({ data: { codigo: 'LIQ1', nombre: 'Destino liquidación 1' } });
+    const envio = await crearEnvio(otroDestino.id, userId);
+    const pkg = await crearPaqueteDePrueba();
+    await agregarPaquete(envio.id, pkg.code, userId, undefined, undefined, { estadoPago: 'PAGADO', monto: 12 });
+    await cerrarEnvio(envio.id, userId);
+
+    const antes = await getFondosPendientesPorDestino();
+    expect(antes.find((f) => f.destinoId === otroDestino.id)?.fondosPendientes).toBe(12);
+
+    const liquidacion = await registrarLiquidacion(otroDestino.id, userId, 'Entregado en mano');
+    expect(liquidacion.monto).toBe(12);
+    expect(liquidacion.destino.id).toBe(otroDestino.id);
+    expect(liquidacion.notas).toBe('Entregado en mano');
+
+    const despues = await getFondosPendientesPorDestino();
+    expect(despues.find((f) => f.destinoId === otroDestino.id)).toBeUndefined();
+
+    const historial = await listarLiquidaciones(otroDestino.id);
+    expect(historial.some((l) => l.id === liquidacion.id)).toBe(true);
+
+    // Un segundo llamado inmediato no vuelve a contar los mismos envíos.
+    await expect(registrarLiquidacion(otroDestino.id, userId)).rejects.toThrow(NoHayFondosPendientesError);
+  });
+
+  test('la liquidación solo incluye envíos con fondosDestino > 0 (un envío en Bs0 queda fuera y sin liquidacionId)', async () => {
+    const destino = await prisma.sucursalDestino.create({ data: { codigo: 'LIQSALDO', nombre: 'Destino liquidación por saldo' } });
+
+    // ENV-001: Bs2
+    const env1 = await crearEnvio(destino.id, userId);
+    const pkg1 = await crearPaqueteDePrueba();
+    await agregarPaquete(env1.id, pkg1.code, userId, undefined, undefined, { estadoPago: 'PAGADO', monto: 2 });
+    await cerrarEnvio(env1.id, userId);
+
+    // ENV-002: Bs2
+    const env2 = await crearEnvio(destino.id, userId);
+    const pkg2 = await crearPaqueteDePrueba();
+    await agregarPaquete(env2.id, pkg2.code, userId, undefined, undefined, { estadoPago: 'PAGADO', monto: 2 });
+    await cerrarEnvio(env2.id, userId);
+
+    // ENV-003: Bs0 (paquete PENDIENTE, sin nada pagado)
+    const env3 = await crearEnvio(destino.id, userId);
+    const pkg3 = await crearPaqueteDePrueba();
+    await agregarPaquete(env3.id, pkg3.code, userId, undefined, undefined, { estadoPago: 'PENDIENTE' });
+    await cerrarEnvio(env3.id, userId);
+
+    const fondos = await getFondosPendientesPorDestino();
+    expect(fondos.find((f) => f.destinoId === destino.id)?.fondosPendientes).toBe(4);
+
+    const liquidacion = await registrarLiquidacion(destino.id, userId);
+    expect(liquidacion.monto).toBe(4);
+    expect(liquidacion.cantidadEnvios).toBe(2);
+
+    const [e1, e2, e3] = await Promise.all([
+      prisma.envio.findUniqueOrThrow({ where: { id: env1.id } }),
+      prisma.envio.findUniqueOrThrow({ where: { id: env2.id } }),
+      prisma.envio.findUniqueOrThrow({ where: { id: env3.id } }),
+    ]);
+    expect(e1.liquidacionId).toBe(liquidacion.id);
+    expect(e2.liquidacionId).toBe(liquidacion.id);
+    expect(e3.liquidacionId).toBeNull();
+
+    // ENV-003 sigue disponible para una futura liquidación si algún día se paga.
+    const fondosDespues = await getFondosPendientesPorDestino();
+    expect(fondosDespues.find((f) => f.destinoId === destino.id)).toBeUndefined();
+  });
+});
+
+describe('Fase 3 — "Recibir envío" muestra el desglose completo por paquete', () => {
+  test('N/O. getEnvioDetalle/buscarEnvioParaRecibir devuelven destinatario/teléfono/pago por cada paquete', async () => {
+    await prisma.packageSeries.upsert({ where: { inicial: 'X' }, update: {}, create: { inicial: 'X', descripcion: 'Prueba' } });
+    const envio = await crearEnvio(destinoId, userId);
+    await agregarPaquete(envio.id, 'X1T-DESGLOSE1', userId, branchId, { destinatario: 'Juan Pérez', destinatarioTelefono: '71234567' }, { estadoPago: 'PAGADO', monto: 2 });
+    await agregarPaquete(envio.id, 'X1T-DESGLOSE2', userId, branchId, {}, { estadoPago: 'PENDIENTE' });
+    const cerrado = await cerrarEnvio(envio.id, userId);
+
+    const encontrado = await buscarEnvioParaRecibir(`${cerrado.codigo}|${cerrado.qrToken}`);
+    expect(encontrado?.items).toHaveLength(2);
+    const conDatos = encontrado!.items.find((i) => i.code === 'X1T-DESGLOSE1')!;
+    expect(conDatos.destinatario).toBe('Juan Pérez');
+    expect(conDatos.destinatarioTelefono).toBe('71234567');
+    expect(conDatos.estadoPago).toBe('PAGADO');
+    expect(conDatos.montoPagado).toBe(2);
+    const sinDatos = encontrado!.items.find((i) => i.code === 'X1T-DESGLOSE2')!;
+    expect(sinDatos.destinatario).toBeNull();
+    expect(sinDatos.estadoPago).toBe('PENDIENTE');
+
+    const recibido = await recibirEnvio(envio.id, userId);
+    expect(recibido.items).toHaveLength(2);
+    expect(recibido.items.find((i) => i.code === 'X1T-DESGLOSE1')?.destinatario).toBe('Juan Pérez');
+  });
+});
+
+describe('Fase 3 — simulación end-to-end (crear → 3 paquetes → cerrar → QR → recibir → entregar → liquidar)', () => {
+  test('flujo completo de 15 pasos contra SQLite real', async () => {
+    // 1. crear envío
+    const envio = await crearEnvio(destinoId, userId);
+    // 2/3/4. agregar 3 paquetes, 2 pagados y 1 pendiente
+    const p1 = await crearPaqueteDePrueba();
+    const p2 = await crearPaqueteDePrueba();
+    const p3 = await crearPaqueteDePrueba();
+    await agregarPaquete(envio.id, p1.code, userId, undefined, { destinatario: 'Juan Pérez', destinatarioTelefono: '71234567' }, { estadoPago: 'PAGADO', monto: 2 });
+    await agregarPaquete(envio.id, p2.code, userId, undefined, { destinatario: 'María López', destinatarioTelefono: '76543210' }, { estadoPago: 'PAGADO', monto: 2 });
+    await agregarPaquete(envio.id, p3.code, userId, undefined, {}, { estadoPago: 'PENDIENTE' });
+
+    // 5. cerrar
+    const cerrado = await cerrarEnvio(envio.id, userId);
+    expect(cerrado.resumenPago).toEqual({ pagados: 2, pendientes: 1, fondosDestino: 4 });
+
+    // 6/7. "generar QR" (el payload real) y resolverlo
+    const payloadQr = `${cerrado.codigo}|${cerrado.qrToken}`;
+    const resuelto = await buscarEnvioParaRecibir(payloadQr);
+    expect(resuelto?.id).toBe(envio.id);
+
+    // 8. recibir
+    await recibirEnvio(envio.id, userId);
+
+    // 9. comprobar datos
+    const detalle = await getEnvioDetalle(envio.id);
+    expect(detalle.estado).toBe('RECIBIDO');
+    expect(detalle.items).toHaveLength(3);
+
+    // 10. entregar uno
+    const antesFinanzas = await prisma.pago.count();
+    await entregarPaquete(p1.code, userId, { montoCobrado: 2 });
+
+    // 11/12. comprobar Finanzas y Dashboard reflejan el mismo hecho
+    const hoy = new Date();
+    hoy.setHours(0, 0, 0, 0);
+    const manana = new Date(hoy);
+    manana.setDate(manana.getDate() + 1);
+    const [resumen, dashboard] = await Promise.all([getResumenFinanciero({ desde: hoy, hasta: manana }), getDashboardData()]);
+    expect(resumen.ingresos).toBe(dashboard.cobradoHoy);
+    const despuesFinanzas = await prisma.pago.count();
+    expect(despuesFinanzas).toBe(antesFinanzas + 1);
+
+    // 13. comprobar saldo pendiente de fondos (independiente del cobro local anterior)
+    const fondosAntes = await getFondosPendientesPorDestino();
+    expect(fondosAntes.find((f) => f.destinoId === destinoId)?.fondosPendientes).toBeGreaterThanOrEqual(4);
+
+    // 14. liquidar fondos
+    await registrarLiquidacion(destinoId, userId, 'Simulación E2E');
+
+    // 15. comprobar saldo = 0 para este destino
+    const fondosDespues = await getFondosPendientesPorDestino();
+    const restante = fondosDespues.find((f) => f.destinoId === destinoId);
+    // Puede quedar undefined (sin fondos pendientes) o, si otros tests del
+    // archivo generaron fondos nuevos para el mismo destino compartido, un
+    // valor que ya NO incluye los Bs4 recién liquidados.
+    if (restante) expect(restante.fondosPendientes).toBeLessThan(fondosAntes.find((f) => f.destinoId === destinoId)!.fondosPendientes);
+  });
+});
+
+describe('Fase 3 — Dashboard y Finanzas usan la misma fuente de "cobrado hoy" (regresión)', () => {
+  test('tras un cobro real, getDashboardData().cobradoHoy === getResumenFinanciero(hoy).ingresos', async () => {
+    const pkg = await crearPaqueteDePrueba();
+    await entregarPaquete(pkg.code, userId, { montoCobrado: 2 });
+
+    const hoy = new Date();
+    hoy.setHours(0, 0, 0, 0);
+    const manana = new Date(hoy);
+    manana.setDate(manana.getDate() + 1);
+
+    const [resumen, dashboard] = await Promise.all([getResumenFinanciero({ desde: hoy, hasta: manana }), getDashboardData()]);
+    expect(dashboard.cobradoHoy).toBe(resumen.ingresos);
+  });
+});
+
+describe('Fase 3 — catálogo de permisos', () => {
+  test('envios.ver_fondos y envios.liquidar están registrados en el grupo "envios"', () => {
+    const claves = CATALOGO_PERMISOS.filter((p) => p.modulo === 'envios').map((p) => p.key);
+    expect(claves).toContain('envios.ver_fondos');
+    expect(claves).toContain('envios.liquidar');
   });
 });
 

@@ -9,7 +9,7 @@
 // servidores — ver src/lib/envios.ts:recibirEnvio()).
 import * as React from 'react';
 import Link from 'next/link';
-import { ArrowLeft, QrCode, Container, Package, ArrowRight, CheckCircle2, XCircle, Ban, PackageCheck, Camera as CameraIcon, Keyboard } from 'lucide-react';
+import { ArrowLeft, QrCode, Container, Package, ArrowRight, CheckCircle2, XCircle, Ban, PackageCheck, Camera as CameraIcon, Keyboard, UserRound, Phone } from 'lucide-react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -17,10 +17,20 @@ import { Badge } from '@/components/ui/badge';
 import { ScannerStatus } from '@/components/scanner/scanner-status';
 import { CameraScanner } from '@/components/scanner/camera-scanner';
 import { TecladoVirtual } from '@/components/scanner/teclado-virtual';
+import { getEstadoEnvioInfo } from '@/components/envios/estado-envio';
 import { useScanQueue } from '@/lib/scanner/use-scan-queue';
 import { normalizarEntradaEscaneo } from '@/lib/codigo';
 import { playSound } from '@/lib/sound';
 import { cn } from '@/lib/utils';
+
+interface EnvioItemParaRecibirDTO {
+  id: string;
+  code: string;
+  destinatario: string | null;
+  destinatarioTelefono: string | null;
+  estadoPago: 'PENDIENTE' | 'PAGADO';
+  montoPagado: number;
+}
 
 interface EnvioParaRecibirDTO {
   id: string;
@@ -29,14 +39,42 @@ interface EnvioParaRecibirDTO {
   destino: { nombre: string; ciudad: string | null };
   origen: { codigo: string | null; nombre: string | null };
   cantidadPaquetes: number;
+  items: EnvioItemParaRecibirDTO[];
+  resumenPago: { pagados: number; pendientes: number; fondosDestino: number };
 }
 
-const ESTADO_LABEL: Record<string, string> = {
-  BORRADOR: 'Borrador (todavía no fue cerrado)',
-  CERRADO: 'En tránsito',
-  RECIBIDO: 'Recibido',
-  CANCELADO: 'Cancelado',
-};
+function ListaPaquetes({ items }: { items: EnvioItemParaRecibirDTO[] }) {
+  return (
+    <div className="divide-y divide-gray-100 dark:divide-gray-800">
+      {items.map((it) => (
+        <div key={it.id} className="flex flex-wrap items-center justify-between gap-2 py-2.5 text-sm">
+          <div className="min-w-0 space-y-0.5">
+            <span className="font-mono font-medium text-ink dark:text-gray-100">{it.code}</span>
+            {it.destinatario || it.destinatarioTelefono ? (
+              <p className="flex flex-wrap items-center gap-x-3 gap-y-0.5 text-xs text-gray-400 dark:text-gray-500">
+                {it.destinatario && (
+                  <span className="flex items-center gap-1">
+                    <UserRound className="h-3 w-3" /> {it.destinatario}
+                  </span>
+                )}
+                {it.destinatarioTelefono && (
+                  <span className="flex items-center gap-1">
+                    <Phone className="h-3 w-3" /> {it.destinatarioTelefono}
+                  </span>
+                )}
+              </p>
+            ) : (
+              <p className="text-xs text-gray-400 dark:text-gray-500">Sin datos de quien recoge</p>
+            )}
+          </div>
+          <Badge variant={it.estadoPago === 'PAGADO' ? 'success' : 'warning'}>
+            {it.estadoPago === 'PAGADO' ? `Pagado Bs ${it.montoPagado.toFixed(2)}` : 'Pendiente'}
+          </Badge>
+        </div>
+      ))}
+    </div>
+  );
+}
 
 export function RecibirEnvioClient() {
   const [valor, setValor] = React.useState('');
@@ -121,19 +159,34 @@ export function RecibirEnvioClient() {
       </Link>
 
       {recibido ? (
-        <Card className="border-emerald-200 dark:border-emerald-900/50">
-          <CardContent className="flex flex-col items-center gap-3 py-8 text-center">
-            <PackageCheck className="h-12 w-12 text-emerald-500" />
-            <p className="text-lg font-semibold text-ink dark:text-gray-100">✓ Envío recibido correctamente</p>
-            <p className="font-mono text-sm text-ink-soft dark:text-gray-400">{recibido.codigo}</p>
-            <p className="text-sm font-medium text-ink dark:text-gray-100">
-              {recibido.cantidadPaquetes} paquete{recibido.cantidadPaquetes === 1 ? '' : 's'} recibido{recibido.cantidadPaquetes === 1 ? '' : 's'}
-            </p>
-            <Button className="mt-2" variant="secondary" onClick={otraVez}>
-              Recibir otro envío
-            </Button>
-          </CardContent>
-        </Card>
+        <>
+          <Card className="border-emerald-200 dark:border-emerald-900/50">
+            <CardContent className="flex flex-col items-center gap-3 py-8 text-center">
+              <PackageCheck className="h-12 w-12 text-emerald-500" />
+              <p className="text-lg font-semibold text-ink dark:text-gray-100">✓ Envío recibido correctamente</p>
+              <p className="font-mono text-sm text-ink-soft dark:text-gray-400">{recibido.codigo}</p>
+              <p className="text-sm text-ink-soft dark:text-gray-400">
+                {recibido.origen.nombre ?? 'Origen'} → {recibido.destino.nombre}
+              </p>
+              <p className="text-sm font-medium text-ink dark:text-gray-100">
+                {recibido.cantidadPaquetes} paquete{recibido.cantidadPaquetes === 1 ? '' : 's'} recibido{recibido.cantidadPaquetes === 1 ? '' : 's'}
+              </p>
+              <Button className="mt-2" variant="secondary" onClick={otraVez}>
+                Recibir otro envío
+              </Button>
+            </CardContent>
+          </Card>
+          {recibido.items.length > 0 && (
+            <Card>
+              <CardHeader>
+                <CardTitle>Paquetes recibidos</CardTitle>
+              </CardHeader>
+              <CardContent>
+                <ListaPaquetes items={recibido.items} />
+              </CardContent>
+            </Card>
+          )}
+        </>
       ) : envio ? (
         <>
           <div className="relative overflow-hidden rounded-2xl bg-gradient-to-br from-gray-900 via-gray-900 to-brand-900 p-6 text-center text-white">
@@ -157,11 +210,21 @@ export function RecibirEnvioClient() {
               </div>
               <div className="flex items-center justify-between">
                 <span className="text-ink-soft dark:text-gray-400">Estado</span>
-                <Badge variant={envio.estado === 'CERRADO' ? 'success' : envio.estado === 'RECIBIDO' ? 'success' : 'neutral'}>
-                  {ESTADO_LABEL[envio.estado] ?? envio.estado}
-                </Badge>
+                <Badge variant={getEstadoEnvioInfo(envio.estado).variant}>{getEstadoEnvioInfo(envio.estado).label}</Badge>
               </div>
+              {envio.resumenPago.fondosDestino > 0 && (
+                <div className="flex items-center justify-between">
+                  <span className="text-ink-soft dark:text-gray-400">Fondos para {envio.destino.nombre}</span>
+                  <span className="font-medium text-brand-600 dark:text-brand-400">Bs {envio.resumenPago.fondosDestino.toFixed(2)}</span>
+                </div>
+              )}
             </div>
+
+            {envio.items.length > 0 && (
+              <div className="rounded-xl border border-gray-100 dark:border-gray-800 p-3">
+                <ListaPaquetes items={envio.items} />
+              </div>
+            )}
 
             {envio.estado === 'RECIBIDO' ? (
               <p className="rounded-lg border border-amber-200 dark:border-amber-900/50 bg-amber-50 dark:bg-amber-500/10 p-3 text-center text-sm text-amber-700 dark:text-amber-400">

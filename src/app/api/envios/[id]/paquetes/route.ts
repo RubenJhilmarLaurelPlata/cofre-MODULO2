@@ -13,6 +13,7 @@ import {
   PaqueteNoEncontradoParaEnvioError,
   PaqueteNoElegibleError,
   PaqueteYaReservadoError,
+  MontoPagoRequeridoError,
 } from '@/lib/envios';
 import { CodigoInvalidoError, SerieNoConfiguradaError } from '@/lib/paquete-registro';
 
@@ -24,6 +25,11 @@ const bodySchema = z.object({
   // agregarPaquete() en src/lib/envios.ts.
   destinatario: z.string().trim().max(120).optional(),
   destinatarioTelefono: z.string().trim().max(30).optional(),
+  // Pago cobrado en origen para el destino (Fase 3): "monto" es un
+  // efectivo libre, nunca un cálculo de tarifa — ver validarPago() en
+  // src/lib/envios.ts.
+  estadoPago: z.enum(['PENDIENTE', 'PAGADO']).optional(),
+  monto: z.number().positive().optional(),
 });
 
 export async function POST(req: Request, { params }: { params: { id: string } }) {
@@ -46,10 +52,17 @@ export async function POST(req: Request, { params }: { params: { id: string } })
     const company = await getCompanyConfig();
     const branchId = session.branchId ?? company.sucursalActualId ?? (await prisma.branch.findFirst({ where: { activo: true } }))?.id;
 
-    const envio = await agregarPaquete(params.id, parsed.data.code, session.id, branchId, {
-      destinatario: parsed.data.destinatario,
-      destinatarioTelefono: parsed.data.destinatarioTelefono,
-    });
+    const envio = await agregarPaquete(
+      params.id,
+      parsed.data.code,
+      session.id,
+      branchId,
+      {
+        destinatario: parsed.data.destinatario,
+        destinatarioTelefono: parsed.data.destinatarioTelefono,
+      },
+      parsed.data.estadoPago ? { estadoPago: parsed.data.estadoPago, monto: parsed.data.monto } : undefined
+    );
     return NextResponse.json(envio);
   } catch (err) {
     if (err instanceof EnvioNoEncontradoError) return NextResponse.json({ error: err.message }, { status: 404 });
@@ -59,6 +72,7 @@ export async function POST(req: Request, { params }: { params: { id: string } })
     if (err instanceof PaqueteNoElegibleError) return NextResponse.json({ error: err.message }, { status: 400 });
     if (err instanceof CodigoInvalidoError) return NextResponse.json({ error: err.message }, { status: 400 });
     if (err instanceof SerieNoConfiguradaError) return NextResponse.json({ error: err.message }, { status: 400 });
+    if (err instanceof MontoPagoRequeridoError) return NextResponse.json({ error: err.message }, { status: 400 });
     if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
       return NextResponse.json({ error: 'Este código ya fue registrado por otra operación. Intenta agregarlo de nuevo.' }, { status: 409 });
     }

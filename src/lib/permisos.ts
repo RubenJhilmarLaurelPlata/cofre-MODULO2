@@ -52,6 +52,8 @@ export const CATALOGO_PERMISOS: PermisoDef[] = [
   { key: 'envios.cerrar', modulo: 'envios', nombre: 'Cerrar envío', descripcion: 'Permite cerrar un envío y dejarlo preparado e inmutable para transferencia.' },
   { key: 'envios.cancelar', modulo: 'envios', nombre: 'Cancelar envío', descripcion: 'Permite cancelar un envío antes de su salida, liberando sus paquetes.' },
   { key: 'envios.ver_qr', modulo: 'envios', nombre: 'Ver código QR', descripcion: 'Permite ver e imprimir el QR de un envío ya cerrado.' },
+  { key: 'envios.ver_fondos', modulo: 'envios', nombre: 'Ver fondos de otra sucursal', descripcion: 'Permite consultar el dinero cobrado en esta instalación que corresponde a otras sucursales, y el historial de liquidaciones.' },
+  { key: 'envios.liquidar', modulo: 'envios', nombre: 'Registrar liquidación de fondos', descripcion: 'Permite registrar que esta instalación entregó físicamente a otra sucursal el efectivo que le correspondía.' },
 
   // Recepción de transferencias — catalogado ahora, sin ningún endpoint
   // que lo consulte todavía: queda reservado para cuando exista

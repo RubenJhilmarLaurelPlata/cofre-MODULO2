@@ -8,6 +8,7 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
+import { getEstadoEnvioInfo } from '@/components/envios/estado-envio';
 import { cn } from '@/lib/utils';
 
 interface EnvioDTO {
@@ -21,13 +22,6 @@ interface EnvioDTO {
   createdAt: string;
   cerradoAt: string | null;
 }
-
-const ESTADO_BADGE: Record<string, { label: string; variant: 'brand' | 'success' | 'neutral' }> = {
-  BORRADOR: { label: 'Borrador', variant: 'brand' },
-  CERRADO: { label: 'En tránsito', variant: 'success' },
-  RECIBIDO: { label: 'Recibido', variant: 'success' },
-  CANCELADO: { label: 'Cancelado', variant: 'neutral' },
-};
 
 function fmtFecha(iso: string | null): string {
   if (!iso) return '—';
@@ -117,7 +111,7 @@ export function EnviosListClient() {
           ) : (
             <div className="divide-y divide-gray-100 dark:divide-gray-800">
               {envios.map((e) => {
-                const badge = ESTADO_BADGE[e.estado] ?? { label: e.estado, variant: 'neutral' as const };
+                const badge = getEstadoEnvioInfo(e.estado);
                 return (
                   <Link
                     key={e.id}

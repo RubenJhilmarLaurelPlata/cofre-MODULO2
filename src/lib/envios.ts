@@ -86,6 +86,24 @@ export class EnvioNoRecibibleError extends Error {
     this.name = 'EnvioNoRecibibleError';
   }
 }
+export class MontoPagoRequeridoError extends Error {
+  constructor() {
+    super('Indica el monto que se cobró para poder marcar este paquete como pagado.');
+    this.name = 'MontoPagoRequeridoError';
+  }
+}
+export class ItemNoEditableError extends Error {
+  constructor() {
+    super('Solo se puede corregir el pago de un paquete mientras el envío sigue en borrador.');
+    this.name = 'ItemNoEditableError';
+  }
+}
+export class NoHayFondosPendientesError extends Error {
+  constructor() {
+    super('No hay fondos pendientes de liquidar para este destino.');
+    this.name = 'NoHayFondosPendientesError';
+  }
+}
 
 const ESTADOS_ACTIVOS = ['BORRADOR', 'CERRADO'] as const;
 
@@ -203,6 +221,25 @@ export async function listarEnvios(filtros: FiltrosEnvios): Promise<EnvioDTO[]> 
   return envios.map(toEnvioDTO);
 }
 
+export type EstadoPagoEnvioItem = 'PENDIENTE' | 'PAGADO';
+
+// Lo que el operador declara al agregar/corregir un paquete (Fase 3: pago
+// por paquete). "monto" es el efectivo que el cliente realmente entregó en
+// ORIGEN por este paquete — nunca un cálculo de tarifa (ver comentario de
+// EnvioItem.montoPagado en el schema): la tarifa de la sucursal destino no
+// es visible desde aquí. Obligatorio y > 0 solo cuando estadoPago='PAGADO'
+// (validado en agregarPaquete()/actualizarPagoItem()).
+export interface PagoEnvioItemInput {
+  estadoPago: EstadoPagoEnvioItem;
+  monto?: number;
+}
+
+function validarPago(pago?: PagoEnvioItemInput): { estadoPago: EstadoPagoEnvioItem; montoPagado: number } {
+  if (!pago || pago.estadoPago === 'PENDIENTE') return { estadoPago: 'PENDIENTE', montoPagado: 0 };
+  if (!pago.monto || pago.monto <= 0) throw new MontoPagoRequeridoError();
+  return { estadoPago: 'PAGADO', montoPagado: Math.round(pago.monto * 100) / 100 };
+}
+
 export interface EnvioItemDTO {
   id: string;
   packageId: string;
@@ -210,6 +247,25 @@ export interface EnvioItemDTO {
   status: string;
   ingresoAt: string;
   createdAt: string;
+  // Fase 3: mismos campos que ya usa Recepción/Entrega (Package.destinatario/
+  // destinatarioTelefono), nunca una estructura paralela — ver
+  // registrarPaqueteBasico()/agregarPaquete().
+  destinatario: string | null;
+  destinatarioTelefono: string | null;
+  estadoPago: EstadoPagoEnvioItem;
+  montoPagado: number;
+}
+
+export interface ResumenPagoEnvio {
+  pagados: number;
+  pendientes: number;
+  fondosDestino: number;
+}
+
+function calcularResumenPago(items: Pick<EnvioItemDTO, 'estadoPago' | 'montoPagado'>[]): ResumenPagoEnvio {
+  const pagados = items.filter((it) => it.estadoPago === 'PAGADO').length;
+  const fondosDestino = Math.round(items.reduce((acc, it) => acc + (it.estadoPago === 'PAGADO' ? it.montoPagado : 0), 0) * 100) / 100;
+  return { pagados, pendientes: items.length - pagados, fondosDestino };
 }
 
 export interface EnvioDetalleDTO extends EnvioDTO {
@@ -225,6 +281,10 @@ export interface EnvioDetalleDTO extends EnvioDTO {
   // cualquier otra acción).
   origen: { codigo: string | null; nombre: string | null };
   items: EnvioItemDTO[];
+  // Fase 3: derivado en vivo de "items" (nunca almacenado — mismo criterio
+  // que "saldoPendiente" en package-detail.ts), para que el cliente nunca
+  // tenga que sumarlo a mano.
+  resumenPago: ResumenPagoEnvio;
 }
 
 export async function getEnvioDetalle(id: string): Promise<EnvioDetalleDTO> {
@@ -235,24 +295,34 @@ export async function getEnvioDetalle(id: string): Promise<EnvioDetalleDTO> {
         destino: { select: { id: true, codigo: true, nombre: true, ciudad: true } },
         creadoPor: { select: { nombre: true } },
         cerradoPor: { select: { nombre: true } },
-        items: { include: { package: { select: { id: true, code: true, status: true, ingresoAt: true } } }, orderBy: { createdAt: 'asc' } },
+        items: {
+          include: { package: { select: { id: true, code: true, status: true, ingresoAt: true, destinatario: true, destinatarioTelefono: true } } },
+          orderBy: { createdAt: 'asc' },
+        },
       },
     }),
     getCompanyConfig(),
   ]);
   if (!envio) throw new EnvioNoEncontradoError();
 
+  const items: EnvioItemDTO[] = envio.items.map((it) => ({
+    id: it.id,
+    packageId: it.package.id,
+    code: it.package.code,
+    status: it.package.status,
+    ingresoAt: it.package.ingresoAt.toISOString(),
+    createdAt: it.createdAt.toISOString(),
+    destinatario: it.package.destinatario,
+    destinatarioTelefono: it.package.destinatarioTelefono,
+    estadoPago: it.estadoPago as EstadoPagoEnvioItem,
+    montoPagado: it.montoPagado,
+  }));
+
   return {
     ...toEnvioDTO(envio),
     origen: { codigo: company.sucursalCodigo, nombre: company.sucursalNombre },
-    items: envio.items.map((it) => ({
-      id: it.id,
-      packageId: it.package.id,
-      code: it.package.code,
-      status: it.package.status,
-      ingresoAt: it.package.ingresoAt.toISOString(),
-      createdAt: it.createdAt.toISOString(),
-    })),
+    items,
+    resumenPago: calcularResumenPago(items),
   };
 }
 
@@ -294,16 +364,23 @@ export async function crearEnvio(destinoId: string, userId: string): Promise<Env
  * paquete YA existía, se ignoran por completo (nunca sobrescriben datos
  * ya guardados; quien quiera completarlos ahí usa Entrega/Recepción,
  * igual que hoy).
+ *
+ * `pago` (Fase 3 — dinero cobrado en origen para el destino): se guarda
+ * en EnvioItem.estadoPago/montoPagado, nunca en Package.montoPagado/Pago
+ * (ver comentario de EnvioItem en el schema) — así el dinero de otra
+ * sucursal nunca infla los ingresos propios de esta.
  */
 export async function agregarPaquete(
   envioId: string,
   code: string,
   userId: string,
   branchId?: string,
-  datosRecogida?: Pick<CamposExtraRegistro, 'destinatario' | 'destinatarioTelefono'>
+  datosRecogida?: Pick<CamposExtraRegistro, 'destinatario' | 'destinatarioTelefono'>,
+  pago?: PagoEnvioItemInput
 ): Promise<EnvioDetalleDTO> {
   const codeCanonico = canonicalizarSeparadores(code.trim()).toUpperCase();
   const codigoNormalizado = normalizarCodigo(codeCanonico);
+  const { estadoPago, montoPagado } = validarPago(pago);
 
   // registrarAuditoria() usa el cliente `prisma` de nivel superior, nunca
   // `tx` — con connection_limit=1 llamarla DESDE DENTRO de esta
@@ -333,12 +410,39 @@ export async function agregarPaquete(
     });
     if (reservaActiva) throw new PaqueteYaReservadoError(pkg.code, reservaActiva.envio.codigo);
 
-    await tx.envioItem.create({ data: { envioId, packageId: pkg.id } });
+    await tx.envioItem.create({ data: { envioId, packageId: pkg.id, estadoPago, montoPagado } });
 
     return { envioCodigo: envio.codigo, packageCode: pkg.code };
   }, TRANSACTION_OPTS);
 
-  await registrarAuditoria({ userId, accion: 'ENVIO_PAQUETE_AGREGADO', modulo: 'envios', valorNuevo: { envio: envioCodigo, paquete: packageCode } });
+  await registrarAuditoria({ userId, accion: 'ENVIO_PAQUETE_AGREGADO', modulo: 'envios', valorNuevo: { envio: envioCodigo, paquete: packageCode, estadoPago, montoPagado } });
+
+  return getEnvioDetalle(envioId);
+}
+
+/**
+ * Corrige el pago declarado de un paquete ya agregado (Fase 3), solo
+ * mientras el envío sigue en BORRADOR — mismo guard que quitarPaquete().
+ * Nunca se usa después de CERRADO: un envío cerrado es inmutable, igual
+ * que el resto de este módulo.
+ */
+export async function actualizarPagoItem(envioId: string, packageId: string, pago: PagoEnvioItemInput, userId: string): Promise<EnvioDetalleDTO> {
+  const { estadoPago, montoPagado } = validarPago(pago);
+
+  const { envioCodigo, packageCode } = await prisma.$transaction(async (tx) => {
+    const envio = await tx.envio.findUnique({ where: { id: envioId } });
+    if (!envio) throw new EnvioNoEncontradoError();
+    if (envio.estado !== 'BORRADOR') throw new ItemNoEditableError();
+
+    const item = await tx.envioItem.findUnique({ where: { envioId_packageId: { envioId, packageId } }, include: { package: { select: { code: true } } } });
+    if (!item) throw new PaqueteNoEnEsteEnvioError();
+
+    await tx.envioItem.update({ where: { id: item.id }, data: { estadoPago, montoPagado } });
+
+    return { envioCodigo: envio.codigo, packageCode: item.package.code };
+  }, TRANSACTION_OPTS);
+
+  await registrarAuditoria({ userId, accion: 'ENVIO_PAGO_ACTUALIZADO', modulo: 'envios', valorNuevo: { envio: envioCodigo, paquete: packageCode, estadoPago, montoPagado } });
 
   return getEnvioDetalle(envioId);
 }
@@ -405,17 +509,37 @@ export async function cancelarEnvio(envioId: string, userId: string): Promise<En
 }
 
 /**
- * Busca un envío por su código (lo que el QR codifica — ver
- * src/app/api/envios/[id]/qr/route.ts) para el flujo "Envíos → Recibir
- * envío" (Fase 2.1). Funciona para cualquier estado: CERRADO (listo para
- * recibir) y RECIBIDO (para poder mostrar "ya fue recibido" en vez de un
- * error genérico de "no encontrado") — BORRADOR/CANCELADO nunca tuvieron
- * QR, así que no deberían llegar aquí en la práctica, pero tampoco es un
- * error mostrarlos si alguien escribe el código a mano.
+ * Busca un envío para el flujo "Envíos → Recibir envío" (Fase 2.1/2.3) — la
+ * ÚNICA función de resolución, usada tanto por la cámara (QR) como por la
+ * entrada manual (ver recibir-envio-client.tsx: ambos caminos llaman a
+ * GET /api/envios/buscar, que llama a esto), para que nunca puedan
+ * desincronizarse.
+ *
+ * Acepta dos formatos de entrada:
+ *  - "ENV-20260904-004"                 → solo el código visible (entrada
+ *    manual, o un QR viejo/reimpreso). Funciona igual que siempre.
+ *  - "ENV-20260904-004|<qrToken>"       → código + token seguro (Fase 3:
+ *    lo que ahora codifica el QR real, ver qr/route.ts). Si el token no
+ *    coincide con el qrToken guardado, se trata como "no encontrado" — un
+ *    código visible por sí solo (fácil de adivinar/copiar) ya NO alcanza
+ *    para resolver un envío por esta vía si el que escanea llegó con un
+ *    payload de token y este no calza.
+ *
+ * Funciona para cualquier estado: CERRADO (listo para recibir) y RECIBIDO
+ * (para poder mostrar "ya fue recibido" en vez de un error genérico de "no
+ * encontrado") — BORRADOR/CANCELADO nunca tuvieron QR, así que no deberían
+ * llegar aquí en la práctica, pero tampoco es un error mostrarlos si
+ * alguien escribe el código a mano.
  */
-export async function buscarEnvioParaRecibir(codigo: string): Promise<EnvioDetalleDTO | null> {
-  const envio = await prisma.envio.findUnique({ where: { codigo: codigo.trim().toUpperCase() }, select: { id: true } });
+export async function buscarEnvioParaRecibir(input: string): Promise<EnvioDetalleDTO | null> {
+  const raw = input.trim();
+  const separador = raw.indexOf('|');
+  const codigo = (separador === -1 ? raw : raw.slice(0, separador)).toUpperCase();
+  const tokenEsperado = separador === -1 ? null : raw.slice(separador + 1).trim();
+
+  const envio = await prisma.envio.findUnique({ where: { codigo }, select: { id: true, qrToken: true } });
   if (!envio) return null;
+  if (tokenEsperado !== null && envio.qrToken !== tokenEsperado) return null;
   return getEnvioDetalle(envio.id);
 }
 
@@ -444,6 +568,142 @@ export async function recibirEnvio(envioId: string, userId: string): Promise<Env
   await registrarAuditoria({ userId, accion: 'ENVIO_RECIBIDO', modulo: 'envios', valorNuevo: { codigo: envioCodigo, cantidadPaquetes } });
 
   return getEnvioDetalle(envioId);
+}
+
+// ---------------------------------------------------------------------
+// Fondos entre sucursales y liquidación (Fase 3)
+// ---------------------------------------------------------------------
+
+export interface FondoPorDestinoDTO {
+  destinoId: string;
+  destinoCodigo: string;
+  destinoNombre: string;
+  fondosPendientes: number;
+  cantidadEnvios: number;
+}
+
+/**
+ * Dinero cobrado en ESTA instalación por paquetes destinados a otra
+ * sucursal, todavía no entregado físicamente a esa sucursal (ver
+ * registrarLiquidacion() más abajo). Solo cuenta envíos ya CERRADOS o
+ * RECIBIDOS — un BORRADOR todavía no "salió" de aquí (mismo criterio que
+ * getReservaActivaDePaquete()) y uno CANCELADO nunca cobró nada en firme —
+ * y solo ítems marcados PAGADO (los PENDIENTE no son fondos de nadie
+ * todavía). Nunca toca Pago/Package.montoPagado — ver comentario de
+ * EnvioItem en el schema.
+ */
+export async function getFondosPendientesPorDestino(): Promise<FondoPorDestinoDTO[]> {
+  const items = await prisma.envioItem.findMany({
+    where: { estadoPago: 'PAGADO', envio: { estado: { in: ['CERRADO', 'RECIBIDO'] }, liquidacionId: null } },
+    select: { montoPagado: true, envio: { select: { id: true, destino: { select: { id: true, codigo: true, nombre: true } } } } },
+  });
+
+  const porDestino = new Map<string, FondoPorDestinoDTO & { envioIds: Set<string> }>();
+  for (const item of items) {
+    const d = item.envio.destino;
+    let acc = porDestino.get(d.id);
+    if (!acc) {
+      acc = { destinoId: d.id, destinoCodigo: d.codigo, destinoNombre: d.nombre, fondosPendientes: 0, cantidadEnvios: 0, envioIds: new Set() };
+      porDestino.set(d.id, acc);
+    }
+    acc.fondosPendientes = Math.round((acc.fondosPendientes + item.montoPagado) * 100) / 100;
+    acc.envioIds.add(item.envio.id);
+  }
+
+  return Array.from(porDestino.values())
+    .map((d) => ({ destinoId: d.destinoId, destinoCodigo: d.destinoCodigo, destinoNombre: d.destinoNombre, fondosPendientes: d.fondosPendientes, cantidadEnvios: d.envioIds.size }))
+    .sort((a, b) => b.fondosPendientes - a.fondosPendientes);
+}
+
+export interface LiquidacionDTO {
+  id: string;
+  destino: { id: string; codigo: string; nombre: string };
+  monto: number;
+  usuario: string | null;
+  notas: string | null;
+  createdAt: string;
+  cantidadEnvios: number;
+}
+
+function toLiquidacionDTO(l: {
+  id: string;
+  monto: number;
+  notas: string | null;
+  createdAt: Date;
+  destino: { id: string; codigo: string; nombre: string };
+  user: { nombre: string } | null;
+  envios: { id: string }[];
+}): LiquidacionDTO {
+  return {
+    id: l.id,
+    destino: l.destino,
+    monto: l.monto,
+    usuario: l.user?.nombre ?? null,
+    notas: l.notas,
+    createdAt: l.createdAt.toISOString(),
+    cantidadEnvios: l.envios.length,
+  };
+}
+
+/**
+ * Registra que esta instalación entregó físicamente a la sucursal destino
+ * el efectivo pendiente (ver getFondosPendientesPorDestino()) — NO una
+ * transferencia bancaria, es la trazabilidad de una entrega de dinero en
+ * efectivo. Toma los envíos CERRADOS/RECIBIDOS de ese destino que todavía
+ * no estén en ninguna liquidación Y que tengan al menos un ítem PAGADO
+ * (fondosDestino > 0 — un envío sin nada pagado no tiene dinero que
+ * entregar, así que no debe quedar asociado a una liquidación por
+ * trazabilidad: cada LiquidacionEnvio.envios[] debe representar
+ * exactamente qué envíos entregaron el efectivo, no "todo lo que estaba
+ * pendiente de marcar"), congela la suma de sus ítems pagados en "monto",
+ * y los marca liquidados en la MISMA transacción — así un segundo llamado
+ * inmediato nunca puede volver a contar los mismos envíos (mismo
+ * principio de atomicidad que el resto del módulo). Un envío sin fondos
+ * simplemente queda sin liquidacionId hasta que algún ítem suyo se marque
+ * PAGADO — nunca bloquea ni se "pierde".
+ */
+export async function registrarLiquidacion(destinoId: string, userId: string, notas?: string): Promise<LiquidacionDTO> {
+  const destino = await prisma.sucursalDestino.findUnique({ where: { id: destinoId } });
+  if (!destino) throw new DestinoNoEncontradoError();
+
+  const liquidacionId = await prisma.$transaction(async (tx) => {
+    const candidatos = await tx.envio.findMany({
+      where: { destinoId, estado: { in: ['CERRADO', 'RECIBIDO'] }, liquidacionId: null },
+      select: { id: true, items: { where: { estadoPago: 'PAGADO' }, select: { montoPagado: true } } },
+    });
+    // Solo envíos con fondosDestino > 0 — ver comentario de la función.
+    const envios = candidatos
+      .map((e) => ({ id: e.id, montoEnvio: Math.round(e.items.reduce((s, it) => s + it.montoPagado, 0) * 100) / 100 }))
+      .filter((e) => e.montoEnvio > 0);
+    const envioIds = envios.map((e) => e.id);
+    const monto = Math.round(envios.reduce((acc, e) => acc + e.montoEnvio, 0) * 100) / 100;
+    if (monto <= 0 || envioIds.length === 0) throw new NoHayFondosPendientesError();
+
+    const liquidacion = await tx.liquidacionEnvio.create({
+      data: { destinoId, monto, userId, notas: notas?.trim() || null },
+    });
+    await tx.envio.updateMany({ where: { id: { in: envioIds } }, data: { liquidacionId: liquidacion.id } });
+
+    return liquidacion.id;
+  }, TRANSACTION_OPTS);
+
+  await registrarAuditoria({ userId, accion: 'LIQUIDACION_REGISTRADA', modulo: 'envios', valorNuevo: { destino: destino.nombre, liquidacionId } });
+
+  const liquidacion = await prisma.liquidacionEnvio.findUniqueOrThrow({
+    where: { id: liquidacionId },
+    include: { destino: { select: { id: true, codigo: true, nombre: true } }, user: { select: { nombre: true } }, envios: { select: { id: true } } },
+  });
+  return toLiquidacionDTO(liquidacion);
+}
+
+export async function listarLiquidaciones(destinoId?: string): Promise<LiquidacionDTO[]> {
+  const liquidaciones = await prisma.liquidacionEnvio.findMany({
+    where: destinoId ? { destinoId } : {},
+    include: { destino: { select: { id: true, codigo: true, nombre: true } }, user: { select: { nombre: true } }, envios: { select: { id: true } } },
+    orderBy: { createdAt: 'desc' },
+    take: 200,
+  });
+  return liquidaciones.map(toLiquidacionDTO);
 }
 
 export type { EnvioItem };

@@ -8,8 +8,10 @@
 // del módulo) dibujado como marca de agua vectorial con CSS — ninguna
 // imagen externa ni generada.
 import Link from 'next/link';
-import { Container, QrCode, ClipboardList, ChevronRight, MapPin, ArrowRight } from 'lucide-react';
+import { Container, QrCode, ClipboardList, ChevronRight, MapPin, ArrowRight, Wallet } from 'lucide-react';
 import { getCompanyConfig } from '@/lib/config';
+import { getSession } from '@/lib/auth';
+import { tienePermiso } from '@/lib/permisos';
 
 const ACCIONES = [
   {
@@ -35,9 +37,19 @@ const ACCIONES = [
   },
 ] as const;
 
+const ACCION_FONDOS = {
+  href: '/envios/fondos',
+  icon: Wallet,
+  titulo: 'Fondos entre sucursales',
+  descripcion: 'Dinero cobrado aquí que corresponde a otra sucursal.',
+  destacado: false,
+} as const;
+
 export default async function EnviosHubPage() {
-  const company = await getCompanyConfig();
+  const [company, session] = await Promise.all([getCompanyConfig(), getSession()]);
   const origen = company.sucursalNombre ?? 'Esta instalación';
+  const puedeVerFondos = session ? await tienePermiso(session, 'envios.ver_fondos') : false;
+  const acciones = puedeVerFondos ? [...ACCIONES, ACCION_FONDOS] : ACCIONES;
 
   return (
     <div className="space-y-6">
@@ -63,7 +75,7 @@ export default async function EnviosHubPage() {
       </div>
 
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
-        {ACCIONES.map((a) => (
+        {acciones.map((a) => (
           <Link
             key={a.href}
             href={a.href}
