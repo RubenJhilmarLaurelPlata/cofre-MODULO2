@@ -15,6 +15,8 @@ import {
   Info,
   CheckCircle2,
   XCircle,
+  ArrowRight,
+  Container,
 } from 'lucide-react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -396,6 +398,30 @@ export function BuscadorClient({ resultadosIniciales, limite, puedeIrAEntrega, p
                       </span>
                     )}
                   </div>
+
+                  {/* Fase 4: paquete intersucursal — solo se muestra cuando
+                      aplica (p.envioInfo), nunca infla las tarjetas de
+                      paquetes normales. Persiste también después de
+                      RECIBIDO — ver getInfoEnvioDePaquete(). */}
+                  {p.envioInfo && (
+                    <div className="flex flex-wrap items-center gap-1.5 rounded-lg bg-blue-50 dark:bg-blue-500/10 px-3 py-1.5 text-xs text-blue-700 dark:text-blue-400">
+                      <Container className="h-3.5 w-3.5 shrink-0" />
+                      <span className="truncate">{p.envioInfo.origenNombre ?? 'Origen'}</span>
+                      <ArrowRight className="h-3 w-3 shrink-0" />
+                      <span className="truncate">{p.envioInfo.destinoNombre}</span>
+                      <span className="ml-auto shrink-0 font-medium">
+                        {p.envioInfo.estado === 'RECIBIDO' ? 'Disponible en destino' : 'En tránsito'}
+                      </span>
+                    </div>
+                  )}
+
+                  {(p.destinatario || p.envioInfo) && (
+                    <p className="flex items-center gap-1.5 truncate text-xs text-gray-500 dark:text-gray-400">
+                      <span className="font-medium text-ink-soft dark:text-gray-300">Destinatario:</span>{' '}
+                      {p.destinatario || 'Sin datos'}
+                      {p.destinatarioTelefono && ` · ${p.destinatarioTelefono}`}
+                    </p>
+                  )}
 
                   <div className="flex flex-wrap items-center justify-between gap-1.5 rounded-lg bg-gray-50 dark:bg-gray-800/40 px-3 py-2 text-sm">
                     <span className="flex shrink-0 items-center gap-1.5 whitespace-nowrap font-semibold text-ink dark:text-gray-100">

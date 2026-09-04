@@ -59,6 +59,32 @@ interface CameraScannerProps {
 
 type EstrategiaDeteccion = 'nativo' | 'zxing' | null;
 
+// Fase 4 (auditoria QR en produccion): sin pedir una resolucion minima,
+// muchos dispositivos entregan un video de baja resolucion/foco fijo por
+// defecto — mucho mas dificil de decodificar un QR real a la distancia
+// normal de uso. `focusMode: 'continuous'` se ignora silenciosamente
+// donde el navegador no lo soporta (nunca rompe el arranque de la
+// camara), pero mejora notablemente la nitidez en los que si lo soportan
+// (Chrome/Android). Mismas constraints para la via nativa y la via zxing,
+// para que ambas tengan la misma calidad de imagen de entrada.
+const VIDEO_CONSTRAINTS: MediaTrackConstraints = {
+  facingMode: { ideal: 'environment' },
+  width: { ideal: 1280 },
+  height: { ideal: 720 },
+  advanced: [{ focusMode: 'continuous' } as MediaTrackConstraintSet],
+};
+
+// Fase 4: cuantos frames consecutivos puede fallar detect() del
+// BarcodeDetector nativo antes de asumir que, aunque el navegador declaro
+// soporte via getSupportedFormats(), el servicio de deteccion real no
+// esta disponible en este dispositivo (caso documentado de Chrome/
+// Android: el modulo de Play Services puede no estar descargado) — y
+// pasar a zxing dinamicamente en vez de quedarse escaneando para siempre
+// sin detectar nunca nada. A ~30-60fps esto son unos pocos segundos, mas
+// que suficiente para no confundir "todavia no encontro el QR" (normal,
+// nunca cuenta como fallo) con "esto nunca va a funcionar aqui".
+const MAX_FALLOS_NATIVO_CONSECUTIVOS = 60;
+
 export function CameraScanner({ onDetect, cooldownMs = 1800, autoStart = true, formats = ['code_128'], textoInstruccion }: CameraScannerProps) {
   const esSoloQr = formats.includes('qr_code') && !formats.includes('code_128');
   const videoRef = React.useRef<HTMLVideoElement | null>(null);
@@ -69,6 +95,11 @@ export function CameraScanner({ onDetect, cooldownMs = 1800, autoStart = true, f
   const onDetectRef = React.useRef(onDetect);
   onDetectRef.current = onDetect;
   const montadoRef = React.useRef(true);
+  // Fase 4: permite que el loop de iniciarNativo() llame a iniciarZxing()
+  // como fallback dinamico sin que ambas funciones tengan que declararse
+  // en un orden particular ni capturarse mutuamente en sus dependencias
+  // de useCallback — mismo patron ya usado arriba para onDetectRef.
+  const iniciarZxingRef = React.useRef<() => Promise<void>>(async () => {});
 
   const [activa, setActiva] = React.useState(false);
   const [cargando, setCargando] = React.useState(false);
@@ -129,7 +160,7 @@ export function CameraScanner({ onDetect, cooldownMs = 1800, autoStart = true, f
 
   const iniciarNativo = React.useCallback(
     async (BarcodeDetectorCtor: new (opts: { formats: string[] }) => { detect(source: CanvasImageSource): Promise<Array<{ rawValue: string }>> }) => {
-      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' } } });
+      const stream = await navigator.mediaDevices.getUserMedia({ video: VIDEO_CONSTRAINTS });
       // getUserMedia() puede tardar varios segundos en resolver (espera al
       // dialogo de permiso del sistema operativo) — si el operador cambia
       // de pestaña (vuelve a "Lector USB") ANTES de que resuelva, este
@@ -148,21 +179,40 @@ export function CameraScanner({ onDetect, cooldownMs = 1800, autoStart = true, f
 
       const detector = new BarcodeDetectorCtor({ formats });
 
+      // Fase 4 (causa raiz del QR que "nunca se detecta" en produccion):
+      // getSupportedFormats() puede reportar soporte de qr_code/code_128
+      // aunque el servicio real de deteccion no este disponible en este
+      // dispositivo concreto (modulo de Play Services no descargado, ej.
+      // en algunos Android/WebView) — ahi detect() no deja de "fallar
+      // silenciosamente" nunca, y sin este contador el operador se queda
+      // escaneando para siempre sin que el codigo note que deberia pasar
+      // a zxing. Solo cuentan las EXCEPCIONES reales de detect() — un
+      // frame que resuelve con un array vacio (todavia no encontro nada)
+      // es el comportamiento normal mientras se apunta la camara, nunca
+      // un fallo.
+      let fallosConsecutivos = 0;
       const loop = async () => {
         if (!montadoRef.current || !videoRef.current) return;
         try {
           const barcodes = await detector.detect(videoRef.current);
+          fallosConsecutivos = 0;
           const primero = barcodes[0];
           if (primero?.rawValue) aceptarDeteccion(primero.rawValue);
         } catch {
-          // Un frame fallido (ej. video todavia no tiene datos) no es un error real — se reintenta en el siguiente frame.
+          fallosConsecutivos++;
+          if (fallosConsecutivos >= MAX_FALLOS_NATIVO_CONSECUTIVOS) {
+            detenerNativo();
+            setEstrategia(null);
+            await iniciarZxingRef.current();
+            return;
+          }
         }
         rafIdRef.current = requestAnimationFrame(loop);
       };
       rafIdRef.current = requestAnimationFrame(loop);
       setEstrategia('nativo');
     },
-    [aceptarDeteccion, formats]
+    [aceptarDeteccion, formats, detenerNativo]
   );
 
   const iniciarZxing = React.useCallback(async () => {
@@ -184,7 +234,7 @@ export function CameraScanner({ onDetect, cooldownMs = 1800, autoStart = true, f
     // decodeFromConstraints solo recibe (result, error) — no hay un
     // tercer parametro de "controles". Para detener la camara se llama
     // reader.reset() sobre la misma instancia (guardada en readerRef).
-    await reader.decodeFromConstraints({ video: { facingMode: { ideal: 'environment' } } }, videoRef.current, (result) => {
+    await reader.decodeFromConstraints({ video: VIDEO_CONSTRAINTS }, videoRef.current, (result) => {
       if (!result) return;
       aceptarDeteccion(result.getText());
     });
@@ -199,6 +249,7 @@ export function CameraScanner({ onDetect, cooldownMs = 1800, autoStart = true, f
     }
     setEstrategia('zxing');
   }, [aceptarDeteccion, formats]);
+  iniciarZxingRef.current = iniciarZxing;
 
   const iniciandoRef = React.useRef(false);
 

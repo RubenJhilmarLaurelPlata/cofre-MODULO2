@@ -31,6 +31,8 @@ import {
   Keyboard,
   AlertTriangle,
   RotateCcw,
+  ArrowRight,
+  Container,
 } from 'lucide-react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -198,8 +200,15 @@ export function EntregaClient({
   const [entregadosRecientes, setEntregadosRecientes] = React.useState(entregadosRecientesIniciales);
 
   const [obs, setObs] = React.useState('');
-  const [destinatario, setDestinatario] = React.useState('');
-  const [destinatarioTelefono, setDestinatarioTelefono] = React.useState('');
+  // Fase 4: "quién recoge" — persona que se presenta físicamente a
+  // retirar el paquete, editable solo desde Entrega. Deliberadamente
+  // distinto del DESTINATARIO ORIGINAL (paquete.destinatario/
+  // destinatarioTelefono, de solo lectura aquí — ver bloque "Destinatario"
+  // más abajo): antes este mismo estado se llamaba destinatario/
+  // destinatarioTelefono y se guardaba sobre esos campos, perdiendo el
+  // registro original de Recepción/Envíos.
+  const [quienRecogeNombre, setQuienRecogeNombre] = React.useState('');
+  const [quienRecogeTelefono, setQuienRecogeTelefono] = React.useState('');
   const [destinatarioObs, setDestinatarioObs] = React.useState('');
 
   const [montoCobrar, setMontoCobrar] = React.useState(0);
@@ -274,8 +283,8 @@ export function EntregaClient({
 
   React.useEffect(() => {
     setObs(paquete?.observaciones ?? '');
-    setDestinatario(paquete?.destinatario ?? '');
-    setDestinatarioTelefono(paquete?.destinatarioTelefono ?? '');
+    setQuienRecogeNombre(paquete?.quienRecogeNombre ?? '');
+    setQuienRecogeTelefono(paquete?.quienRecogeTelefono ?? '');
     setDestinatarioObs(paquete?.destinatarioObservaciones ?? '');
     // El monto a cobrar por defecto es el saldo pendiente completo (nunca
     // negativo aqui: un saldo a favor del cliente no se "cobra"). El
@@ -560,8 +569,8 @@ export function EntregaClient({
           observaciones: obs,
           montoCobrado: montoCobrar > 0 ? montoCobrar : undefined,
           motivoCobro: motivoCobro.trim() || undefined,
-          destinatario: destinatario.trim() || undefined,
-          destinatarioTelefono: destinatarioTelefono.trim() || undefined,
+          quienRecogeNombre: quienRecogeNombre.trim() || undefined,
+          quienRecogeTelefono: quienRecogeTelefono.trim() || undefined,
           destinatarioObservaciones: destinatarioObs.trim() || undefined,
         }),
       });
@@ -612,7 +621,7 @@ export function EntregaClient({
       const res = await fetch(`/api/entrega/${encodeURIComponent(paquete.code)}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ observaciones: obs, destinatario, destinatarioTelefono, destinatarioObservaciones: destinatarioObs }),
+        body: JSON.stringify({ observaciones: obs, quienRecogeNombre, quienRecogeTelefono, destinatarioObservaciones: destinatarioObs }),
       });
       const data = await res.json();
       if (!res.ok) {
@@ -1182,28 +1191,52 @@ export function EntregaClient({
                 </div>
               )}
 
-              <PanelColapsable titulo="Quien recoge" icono={User} abiertoInicial={!!(destinatario || destinatarioTelefono || destinatarioObs)}>
+              {/* DESTINATARIO ORIGINAL (Fase 4): solo lectura — registrado en
+                  Recepción/Envíos, nunca editable ni sobrescrito desde
+                  Entrega. Distinto de "Quién recoge" (abajo), que es quien
+                  se presenta físicamente a retirar el paquete. Nunca se
+                  muestran campos vacíos sin contexto: si no hay nada
+                  registrado, se dice explícitamente. */}
+              <div className="rounded-xl border border-gray-100 dark:border-gray-800 p-4">
+                <p className="mb-2 flex items-center gap-1.5 text-sm font-medium text-ink dark:text-gray-100">
+                  <User className="h-4 w-4 text-gray-400" /> Destinatario
+                </p>
+                {paquete.destinatario || paquete.destinatarioTelefono ? (
+                  <div className="grid grid-cols-1 gap-1 text-sm sm:grid-cols-2">
+                    <p className="text-ink dark:text-gray-100">{paquete.destinatario || '—'}</p>
+                    {paquete.destinatarioTelefono && (
+                      <p className="flex items-center gap-1.5 text-ink-soft dark:text-gray-400">
+                        <Phone className="h-3.5 w-3.5" /> {paquete.destinatarioTelefono}
+                      </p>
+                    )}
+                  </div>
+                ) : (
+                  <p className="text-sm text-gray-400 dark:text-gray-500">Sin destinatario registrado</p>
+                )}
+              </div>
+
+              <PanelColapsable titulo="Quien recoge" icono={User} abiertoInicial={!!(quienRecogeNombre || quienRecogeTelefono || destinatarioObs)}>
                 <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                   <div className="space-y-1">
-                    <Label htmlFor="destinatario">Nombre</Label>
+                    <Label htmlFor="quien-recoge-nombre">Nombre</Label>
                     <div className="relative">
                       <Input
-                        id="destinatario"
-                        value={destinatario}
-                        onChange={(e) => setDestinatario(e.target.value)}
+                        id="quien-recoge-nombre"
+                        value={quienRecogeNombre}
+                        onChange={(e) => setQuienRecogeNombre(e.target.value)}
                         disabled={!puedeEditarCampos}
                         placeholder="Nombre de quien recoge"
                         className="pr-11"
                       />
-                      {puedeEditarCampos && <VoiceInputButton onResult={setDestinatario} className="absolute right-1 top-1/2 -translate-y-1/2" />}
+                      {puedeEditarCampos && <VoiceInputButton onResult={setQuienRecogeNombre} className="absolute right-1 top-1/2 -translate-y-1/2" />}
                     </div>
                   </div>
                   <div className="space-y-1">
-                    <Label htmlFor="telefono">Celular</Label>
+                    <Label htmlFor="quien-recoge-telefono">Celular</Label>
                     <Input
-                      id="telefono"
-                      value={destinatarioTelefono}
-                      onChange={(e) => setDestinatarioTelefono(e.target.value)}
+                      id="quien-recoge-telefono"
+                      value={quienRecogeTelefono}
+                      onChange={(e) => setQuienRecogeTelefono(e.target.value)}
                       disabled={!puedeEditarCampos}
                       placeholder="Celular de contacto"
                     />
@@ -1274,8 +1307,8 @@ export function EntregaClient({
                         // Descarta cualquier cambio sin guardar, volviendo a
                         // los valores reales del paquete antes de cerrar.
                         setObs(paquete.observaciones ?? '');
-                        setDestinatario(paquete.destinatario ?? '');
-                        setDestinatarioTelefono(paquete.destinatarioTelefono ?? '');
+                        setQuienRecogeNombre(paquete.quienRecogeNombre ?? '');
+                        setQuienRecogeTelefono(paquete.quienRecogeTelefono ?? '');
                         setDestinatarioObs(paquete.destinatarioObservaciones ?? '');
                         setEditandoEntregado(false);
                       }}
@@ -1284,6 +1317,31 @@ export function EntregaClient({
                       <X className="h-4 w-4" /> Cancelar
                     </Button>
                   )}
+                </div>
+              )}
+
+              {/* Fase 4: identidad intersucursal PERSISTENTE — a diferencia de
+                  la tarjeta ámbar de bloqueo (solo mientras enTransito,
+                  CERRADO), esta se sigue mostrando también después de
+                  RECIBIDO, para que un paquete transferido nunca "parezca
+                  un paquete normal" ni siquiera una vez disponible para
+                  entrega. Origen/destino vienen siempre de la
+                  configuración real de la sucursal (Company.
+                  sucursalNombre / SucursalDestino) — nunca un nombre fijo. */}
+              {paquete.envioInfo && (
+                <div className="space-y-1.5 rounded-xl border border-blue-200 dark:border-blue-900/50 bg-blue-50 dark:bg-blue-500/10 p-4">
+                  <p className="flex items-center gap-2 text-sm font-semibold text-blue-800 dark:text-blue-300">
+                    <Container className="h-4 w-4 shrink-0" /> Paquete intersucursal
+                  </p>
+                  <p className="flex flex-wrap items-center gap-2 text-sm text-blue-800 dark:text-blue-300">
+                    <span>{paquete.envioInfo.origenNombre ?? 'Esta instalación'}</span>
+                    <ArrowRight className="h-3.5 w-3.5 shrink-0 text-blue-400" />
+                    <span>{paquete.envioInfo.destinoNombre}</span>
+                  </p>
+                  <p className="text-xs text-blue-700 dark:text-blue-400">
+                    Enviado desde {paquete.envioInfo.origenNombre ?? 'esta instalación'} · envío {paquete.envioInfo.envioCodigo} ·{' '}
+                    {paquete.envioInfo.estado === 'RECIBIDO' ? 'RECIBIDO EN DESTINO — disponible para entrega' : 'EN TRÁNSITO'}
+                  </p>
                 </div>
               )}
 

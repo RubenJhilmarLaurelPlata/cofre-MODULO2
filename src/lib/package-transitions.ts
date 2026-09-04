@@ -324,8 +324,17 @@ export async function entregarPaquete(
     observaciones?: string;
     montoCobrado?: number;
     motivoCobro?: string;
-    destinatario?: string;
-    destinatarioTelefono?: string;
+    // Fase 4 (auditoría Envíos/Recepción/Buscador/Entrega): "quién
+    // recoge" — la persona que se presenta físicamente a retirar el
+    // paquete, capturada en el momento de la entrega. Deliberadamente
+    // distinta de "destinatario"/"destinatarioTelefono" (el registro
+    // original de Recepción/Envíos, ver Package en el schema) — antes
+    // esta función escribía sobre esos mismos campos, sobrescribiendo el
+    // dato original sin dejar ningún respaldo; ahora usa columnas propias
+    // (Package.quienRecogeNombre/quienRecogeTelefono) y nunca toca
+    // destinatario/destinatarioTelefono.
+    quienRecogeNombre?: string;
+    quienRecogeTelefono?: string;
     destinatarioObservaciones?: string;
   }
 ): Promise<Package> {
@@ -341,8 +350,8 @@ export async function entregarPaquete(
     {
       entregaAt: now,
       ...(opts?.observaciones !== undefined ? { observaciones: opts.observaciones } : {}),
-      ...(opts?.destinatario !== undefined ? { destinatario: opts.destinatario || null } : {}),
-      ...(opts?.destinatarioTelefono !== undefined ? { destinatarioTelefono: opts.destinatarioTelefono || null } : {}),
+      ...(opts?.quienRecogeNombre !== undefined ? { quienRecogeNombre: opts.quienRecogeNombre || null } : {}),
+      ...(opts?.quienRecogeTelefono !== undefined ? { quienRecogeTelefono: opts.quienRecogeTelefono || null } : {}),
       ...(opts?.destinatarioObservaciones !== undefined ? { destinatarioObservaciones: opts.destinatarioObservaciones || null } : {}),
     },
     undefined,

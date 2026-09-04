@@ -147,6 +147,92 @@ export async function getReservaActivaDePaquete(
   return item ? { envioId: item.envioId, envioCodigo: item.envio.codigo, destinoNombre: item.envio.destino.nombre } : null;
 }
 
+export interface InfoEnvioPaqueteDTO {
+  envioId: string;
+  envioCodigo: string;
+  estado: 'CERRADO' | 'RECIBIDO';
+  origenCodigo: string | null;
+  origenNombre: string | null;
+  destinoCodigo: string;
+  destinoNombre: string;
+}
+
+/**
+ * Fase 4 (auditoría Envíos/Recepción/Buscador/Entrega): a diferencia de
+ * getReservaActivaDePaquete() (arriba) — que es CERRADO-only y es la
+ * única función con mandato de SEGURIDAD (bloquear entrega/depósito/
+ * denegar, ver package-transitions.ts) — esta es puramente informativa:
+ * "¿este paquete viajó alguna vez por un envío ya despachado?", incluye
+ * también RECIBIDO para poder seguir mostrando "Enviado desde X → Y" de
+ * forma persistente después de que el destino confirmó la recepción (sin
+ * esto, la identidad intersucursal del paquete desaparecía visualmente
+ * apenas se recibía, aunque siguiera siendo la misma transferencia).
+ * Nunca se usa para decidir si algo se puede entregar — eso sigue siendo
+ * exclusivo de getReservaActivaDePaquete().
+ *
+ * origen/destino se derivan de Company.sucursalCodigo/sucursalNombre y
+ * SucursalDestino (nunca un valor fijo) — mismo criterio que
+ * getEnvioDetalle(). BORRADOR/CANCELADO nunca aparecen aquí: un envío
+ * BORRADOR no salió todavía, uno CANCELADO nunca llegó a salir.
+ */
+export async function getInfoEnvioDePaquete(packageId: string): Promise<InfoEnvioPaqueteDTO | null> {
+  const [item, company] = await Promise.all([
+    prisma.envioItem.findFirst({
+      where: { packageId, envio: { estado: { in: ['CERRADO', 'RECIBIDO'] } } },
+      select: { envioId: true, envio: { select: { codigo: true, estado: true, destino: { select: { codigo: true, nombre: true } } } } },
+      orderBy: { createdAt: 'desc' },
+    }),
+    getCompanyConfig(),
+  ]);
+  if (!item) return null;
+  return {
+    envioId: item.envioId,
+    envioCodigo: item.envio.codigo,
+    estado: item.envio.estado as 'CERRADO' | 'RECIBIDO',
+    origenCodigo: company.sucursalCodigo,
+    origenNombre: company.sucursalNombre,
+    destinoCodigo: item.envio.destino.codigo,
+    destinoNombre: item.envio.destino.nombre,
+  };
+}
+
+/**
+ * Igual que getInfoEnvioDePaquete() pero en lote — una sola consulta
+ * agrupada para varios paquetes, en vez de una por fila (mismo criterio
+ * ya usado en getFondosPendientesPorDestino()) — así Buscador puede
+ * mostrar "Origen → Destino" en una lista de resultados sin convertirla
+ * en un N+1.
+ */
+export async function getInfoEnvioParaPaquetes(packageIds: string[]): Promise<Map<string, InfoEnvioPaqueteDTO>> {
+  if (packageIds.length === 0) return new Map();
+  const [items, company] = await Promise.all([
+    prisma.envioItem.findMany({
+      where: { packageId: { in: packageIds }, envio: { estado: { in: ['CERRADO', 'RECIBIDO'] } } },
+      select: { envioId: true, packageId: true, createdAt: true, envio: { select: { codigo: true, estado: true, destino: { select: { codigo: true, nombre: true } } } } },
+      orderBy: { createdAt: 'desc' },
+    }),
+    getCompanyConfig(),
+  ]);
+
+  const porPaquete = new Map<string, InfoEnvioPaqueteDTO>();
+  for (const item of items) {
+    // orderBy desc + "solo la primera vez que se ve este packageId":
+    // si un paquete tuviera más de un EnvioItem histórico (no debería en
+    // el flujo normal), se queda con el más reciente.
+    if (porPaquete.has(item.packageId)) continue;
+    porPaquete.set(item.packageId, {
+      envioId: item.envioId,
+      envioCodigo: item.envio.codigo,
+      estado: item.envio.estado as 'CERRADO' | 'RECIBIDO',
+      origenCodigo: company.sucursalCodigo,
+      origenNombre: company.sucursalNombre,
+      destinoCodigo: item.envio.destino.codigo,
+      destinoNombre: item.envio.destino.nombre,
+    });
+  }
+  return porPaquete;
+}
+
 // crypto.randomUUID() es un global de Node/Edge (sin import de
 // "node:crypto"): evita que este archivo arrastre un modulo built-in de
 // Node hacia el bundle del cliente cuando se importa transitivamente
@@ -443,6 +529,48 @@ export async function actualizarPagoItem(envioId: string, packageId: string, pag
   }, TRANSACTION_OPTS);
 
   await registrarAuditoria({ userId, accion: 'ENVIO_PAGO_ACTUALIZADO', modulo: 'envios', valorNuevo: { envio: envioCodigo, paquete: packageCode, estadoPago, montoPagado } });
+
+  return getEnvioDetalle(envioId);
+}
+
+/**
+ * Corrige el destinatario original (nombre/teléfono de quien recogerá)
+ * de un paquete ya agregado, mientras el envío sigue en BORRADOR — mismo
+ * guard que actualizarPagoItem(). Fase 4 (auditoría): arregla la causa
+ * raíz real de "los datos de quien recoge desaparecen" — un lector físico
+ * puede disparar agregarPaquete() en Enter antes de que el operador
+ * termine de escribir nombre/teléfono (o el código ya existía, caso en el
+ * que agregarPaquete() a propósito NUNCA sobrescribe datos ya guardados —
+ * ver su comentario), y hasta ahora no había ninguna forma explícita de
+ * corregirlo sin quitar y volver a agregar el paquete. Escribe
+ * directamente en Package.destinatario/destinatarioTelefono — son las
+ * columnas correctas para esto (el destinatario ORIGINAL, distinto de
+ * "quién recoge" en Entrega — ver Package.quienRecogeNombre/
+ * quienRecogeTelefono en el schema, que Envíos nunca toca).
+ */
+export async function actualizarDatosRecogidaItem(
+  envioId: string,
+  packageId: string,
+  datos: Pick<CamposExtraRegistro, 'destinatario' | 'destinatarioTelefono'>,
+  userId: string
+): Promise<EnvioDetalleDTO> {
+  const destinatario = datos.destinatario?.trim() || null;
+  const destinatarioTelefono = datos.destinatarioTelefono?.trim() || null;
+
+  const { envioCodigo, packageCode } = await prisma.$transaction(async (tx) => {
+    const envio = await tx.envio.findUnique({ where: { id: envioId } });
+    if (!envio) throw new EnvioNoEncontradoError();
+    if (envio.estado !== 'BORRADOR') throw new ItemNoEditableError();
+
+    const item = await tx.envioItem.findUnique({ where: { envioId_packageId: { envioId, packageId } }, include: { package: { select: { code: true } } } });
+    if (!item) throw new PaqueteNoEnEsteEnvioError();
+
+    await tx.package.update({ where: { id: packageId }, data: { destinatario, destinatarioTelefono } });
+
+    return { envioCodigo: envio.codigo, packageCode: item.package.code };
+  }, TRANSACTION_OPTS);
+
+  await registrarAuditoria({ userId, accion: 'ENVIO_DESTINATARIO_ACTUALIZADO', modulo: 'envios', valorNuevo: { envio: envioCodigo, paquete: packageCode, destinatario, destinatarioTelefono } });
 
   return getEnvioDetalle(envioId);
 }

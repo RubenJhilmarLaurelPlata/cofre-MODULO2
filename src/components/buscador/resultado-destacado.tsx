@@ -8,7 +8,7 @@
 // campo inventado — "operador de la entrega" y "motivo de denegacion"
 // puntuales quedan en el boton "Historial", que ya los muestra con su
 // propia consulta, para no duplicar esa logica aqui).
-import { Boxes, Archive, ArrowDownToLine, CheckCircle2, Ban } from 'lucide-react';
+import { Boxes, Archive, ArrowDownToLine, CheckCircle2, Ban, Container, ArrowRight } from 'lucide-react';
 import type { PackageStatus } from '@/types';
 import type { PackageDetailDTO } from '@/lib/package-detail';
 
@@ -71,6 +71,17 @@ export function ResultadoDestacado({ p }: { p: PackageDetailDTO }) {
           <p className="mt-1.5 truncate font-mono text-2xl font-bold text-ink dark:text-gray-100">{p.code}</p>
         </div>
       </div>
+
+      {/* Fase 4: identidad intersucursal, persiste tambien despues de RECIBIDO — ver getInfoEnvioDePaquete(). */}
+      {p.envioInfo && (
+        <div className="mt-3 flex flex-wrap items-center gap-2 rounded-lg bg-blue-50 dark:bg-blue-500/10 px-3 py-2 text-sm text-blue-800 dark:text-blue-300">
+          <Container className="h-4 w-4 shrink-0" />
+          <span>{p.envioInfo.origenNombre ?? 'Origen'}</span>
+          <ArrowRight className="h-3.5 w-3.5 shrink-0 text-blue-400" />
+          <span>{p.envioInfo.destinoNombre}</span>
+          <span className="ml-auto font-semibold">{p.envioInfo.estado === 'RECIBIDO' ? 'Disponible en destino' : 'En tránsito'}</span>
+        </div>
+      )}
 
       <dl className="mt-4 grid grid-cols-2 gap-x-4 gap-y-2.5 border-t border-black/5 dark:border-white/5 pt-4 text-sm sm:grid-cols-3">
         {(p.destinatario || p.cliente?.nombre) && (

@@ -7,7 +7,7 @@ import { prisma } from '@/lib/prisma';
 import { getCompanyConfig, getHolidaySet } from '@/lib/config';
 import { calcularCosto } from '@/lib/pricing';
 import { normalizarCodigo } from '@/lib/codigo';
-import { getReservaActivaDePaquete } from '@/lib/envios';
+import { getReservaActivaDePaquete, getInfoEnvioDePaquete, getInfoEnvioParaPaquetes, type InfoEnvioPaqueteDTO } from '@/lib/envios';
 import type { Package, Company, Prisma } from '@prisma/client';
 import type { PackageStatus, PaymentStatus } from '@/types';
 
@@ -46,8 +46,19 @@ export interface PackageDetailDTO {
   descripcion: string | null;
   remitente: string | null;
   remitenteTelefono: string | null;
+  // DESTINATARIO ORIGINAL (Fase 4): registrado en Recepción/Envíos al
+  // crear el paquete. A partir de la separación destinatario/quién
+  // recoge, Entrega ya NUNCA escribe estos dos campos — son de solo
+  // lectura desde el punto de vista de la entrega. Ver
+  // quienRecogeNombre/quienRecogeTelefono más abajo para la persona que
+  // se presenta físicamente a retirar el paquete.
   destinatario: string | null;
   destinatarioTelefono: string | null;
+  // QUIEN RECOGE (Fase 4): capturado únicamente por Entrega al momento
+  // de la entrega — columnas propias, independientes de destinatario/
+  // destinatarioTelefono (ver Package.quienRecogeNombre en el schema).
+  quienRecogeNombre: string | null;
+  quienRecogeTelefono: string | null;
   destinatarioObservaciones: string | null;
   // "IMPORTACION" si la entrega se marco mediante una importacion
   // administrativa (Fase 2), null si fue una entrega normal por
@@ -79,6 +90,14 @@ export interface PackageDetailDTO {
   // getPackageDetail) — nunca en toPackageDetailDTOList(), para no
   // convertir cada lista (Reportes/Dashboard) en un N+1.
   enTransito: EnTransitoDTO | null;
+  // Fase 4: a diferencia de "enTransito" (solo mientras CERRADO, con
+  // mandato de SEGURIDAD — ver getReservaActivaDePaquete()), esto es
+  // puramente informativo y persiste también en RECIBIDO: "este paquete
+  // llegó/salió alguna vez por una transferencia entre sucursales", para
+  // que Buscador/Entrega puedan mostrar "Enviado desde X → Y" incluso
+  // después de que el destino ya confirmó la recepción. null si el
+  // paquete nunca viajó por Envíos.
+  envioInfo: InfoEnvioPaqueteDTO | null;
 }
 
 /**
@@ -113,7 +132,14 @@ type ClienteRelacionado = { nombre: string | null; emprendimiento: string | null
  * cliente asociado es opcional: las vistas de lista (reportes, dashboard)
  * no lo necesitan y así evitan un JOIN/consulta extra por paquete.
  */
-function buildPackageDetailDTO(pkg: Package, company: Company, feriados: Set<string>, cliente?: ClienteRelacionado, enTransito: EnTransitoDTO | null = null): PackageDetailDTO {
+function buildPackageDetailDTO(
+  pkg: Package,
+  company: Company,
+  feriados: Set<string>,
+  cliente?: ClienteRelacionado,
+  enTransito: EnTransitoDTO | null = null,
+  envioInfo: InfoEnvioPaqueteDTO | null = null
+): PackageDetailDTO {
   const costo = calcularCosto(
     pkg.ingresoAt,
     fechaReferencia(pkg),
@@ -148,6 +174,8 @@ function buildPackageDetailDTO(pkg: Package, company: Company, feriados: Set<str
     remitenteTelefono: pkg.remitenteTelefono,
     destinatario: pkg.destinatario,
     destinatarioTelefono: pkg.destinatarioTelefono,
+    quienRecogeNombre: pkg.quienRecogeNombre,
+    quienRecogeTelefono: pkg.quienRecogeTelefono,
     destinatarioObservaciones: pkg.destinatarioObservaciones,
     origenEntrega: pkg.origenEntrega,
     dias: costo.dias,
@@ -160,23 +188,40 @@ function buildPackageDetailDTO(pkg: Package, company: Company, feriados: Set<str
     saldoPendiente,
     origenNombre: company.sucursalNombre,
     enTransito,
+    envioInfo,
   };
 }
 
 export async function toPackageDetailDTO(pkg: Package): Promise<PackageDetailDTO> {
-  const [company, feriados, cliente, enTransito] = await Promise.all([
+  const [company, feriados, cliente, enTransito, envioInfo] = await Promise.all([
     getCompanyConfig(),
     getHolidaySet(),
     pkg.clienteId ? prisma.cliente.findUnique({ where: { id: pkg.clienteId } }) : Promise.resolve(null),
     getReservaActivaDePaquete(pkg.id),
+    getInfoEnvioDePaquete(pkg.id),
   ]);
-  return buildPackageDetailDTO(pkg, company, feriados, cliente, enTransito);
+  return buildPackageDetailDTO(pkg, company, feriados, cliente, enTransito, envioInfo);
 }
 
-/** Igual que toPackageDetailDTO pero trayendo la config de empresa y los feriados una sola vez para toda la lista, en vez de una vez por paquete. No incluye datos de cliente (no se usa en vistas de lista) ni "enTransito" (requeriría una consulta extra por fila — ver comentario en PackageDetailDTO — las vistas de lista que usan esto, ej. Reportes/Dashboard, no ofrecen acciones de entrega/depósito). */
+/**
+ * Igual que toPackageDetailDTO pero trayendo la config de empresa y los
+ * feriados una sola vez para toda la lista, en vez de una vez por
+ * paquete. No incluye datos de cliente (no se usa en vistas de lista) ni
+ * "enTransito" (requeriría una consulta extra por fila — ver comentario
+ * en PackageDetailDTO — las vistas de lista que usan esto, ej. Reportes/
+ * Dashboard, no ofrecen acciones de entrega/depósito). SÍ incluye
+ * "envioInfo" (Fase 4): se resuelve con UNA sola consulta agrupada para
+ * toda la lista (getInfoEnvioParaPaquetes()), nunca N+1 — así Buscador
+ * puede mostrar "Enviado desde X → Y" en sus resultados sin el costo que
+ * tendría "enTransito".
+ */
 export async function toPackageDetailDTOList(pkgs: Package[]): Promise<PackageDetailDTO[]> {
-  const [company, feriados] = await Promise.all([getCompanyConfig(), getHolidaySet()]);
-  return pkgs.map((pkg) => buildPackageDetailDTO(pkg, company, feriados));
+  const [company, feriados, envioInfoPorPaquete] = await Promise.all([
+    getCompanyConfig(),
+    getHolidaySet(),
+    getInfoEnvioParaPaquetes(pkgs.map((p) => p.id)),
+  ]);
+  return pkgs.map((pkg) => buildPackageDetailDTO(pkg, company, feriados, undefined, null, envioInfoPorPaquete.get(pkg.id) ?? null));
 }
 
 export async function getPackageDetail(codeRaw: string): Promise<PackageDetailDTO | null> {

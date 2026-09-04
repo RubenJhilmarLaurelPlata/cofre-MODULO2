@@ -16,9 +16,12 @@ import {
   buscarEnvioParaRecibir,
   getEnvioDetalle,
   actualizarPagoItem,
+  actualizarDatosRecogidaItem,
   getFondosPendientesPorDestino,
   registrarLiquidacion,
   listarLiquidaciones,
+  getInfoEnvioDePaquete,
+  getInfoEnvioParaPaquetes,
   DestinoNoEncontradoError,
   DestinoInactivoError,
   EnvioNoModificableError,
@@ -839,6 +842,130 @@ describe('Fase 3 — catálogo de permisos', () => {
     const claves = CATALOGO_PERMISOS.filter((p) => p.modulo === 'envios').map((p) => p.key);
     expect(claves).toContain('envios.ver_fondos');
     expect(claves).toContain('envios.liquidar');
+  });
+});
+
+describe('Fase 4 — auditoría Envíos/Recepción/Buscador/Entrega', () => {
+  test('A/B/C. destinatario/teléfono registrados desde Envíos sobreviven a cerrar y a recibir', async () => {
+    await prisma.packageSeries.upsert({ where: { inicial: 'X' }, update: {}, create: { inicial: 'X', descripcion: 'Prueba' } });
+    const envio = await crearEnvio(destinoId, userId);
+    const codigo = 'X1T-F4-ABC';
+    await agregarPaquete(envio.id, codigo, userId, branchId, { destinatario: 'Juan Pérez', destinatarioTelefono: '71234567' });
+
+    const trasAgregar = await prisma.package.findFirst({ where: { code: codigo } });
+    expect(trasAgregar!.destinatario).toBe('Juan Pérez');
+    expect(trasAgregar!.destinatarioTelefono).toBe('71234567');
+
+    await cerrarEnvio(envio.id, userId);
+    const trasCerrar = await prisma.package.findFirst({ where: { code: codigo } });
+    expect(trasCerrar!.destinatario).toBe('Juan Pérez');
+    expect(trasCerrar!.destinatarioTelefono).toBe('71234567');
+
+    await recibirEnvio(envio.id, userId);
+    const trasRecibir = await prisma.package.findFirst({ where: { code: codigo } });
+    expect(trasRecibir!.destinatario).toBe('Juan Pérez');
+    expect(trasRecibir!.destinatarioTelefono).toBe('71234567');
+  });
+
+  test('D/E. el destinatario se encuentra en Buscador/Entrega (getPackageDetail) después de recibir', async () => {
+    await prisma.packageSeries.upsert({ where: { inicial: 'X' }, update: {}, create: { inicial: 'X', descripcion: 'Prueba' } });
+    const envio = await crearEnvio(destinoId, userId);
+    const codigo = 'X1T-F4-DE';
+    await agregarPaquete(envio.id, codigo, userId, branchId, { destinatario: 'María López', destinatarioTelefono: '76543210' });
+    await cerrarEnvio(envio.id, userId);
+    await recibirEnvio(envio.id, userId);
+
+    const detalle = await getPackageDetail(codigo);
+    expect(detalle?.destinatario).toBe('María López');
+    expect(detalle?.destinatarioTelefono).toBe('76543210');
+    // Todavía nadie lo entregó: "quién recoge" sigue vacío, y son campos
+    // independientes de "destinatario" — nunca el mismo dato duplicado.
+    expect(detalle?.quienRecogeNombre).toBeNull();
+    expect(detalle?.quienRecogeTelefono).toBeNull();
+  });
+
+  test('F. entregarPaquete() con quienRecogeNombre/quienRecogeTelefono nunca toca destinatario/destinatarioTelefono (no se confunden)', async () => {
+    const pkg = await crearPaqueteDePrueba();
+    await prisma.package.update({ where: { id: pkg.id }, data: { destinatario: 'Destinatario original', destinatarioTelefono: '60000000' } });
+
+    await entregarPaquete(pkg.code, userId, { quienRecogeNombre: 'Pedro Quien-Recoge', quienRecogeTelefono: '69999999' });
+
+    const despues = await prisma.package.findUnique({ where: { id: pkg.id } });
+    expect(despues!.status).toBe('ENTREGADO');
+    expect(despues!.quienRecogeNombre).toBe('Pedro Quien-Recoge');
+    expect(despues!.quienRecogeTelefono).toBe('69999999');
+    // El destinatario ORIGINAL no se pierde ni se sobrescribe.
+    expect(despues!.destinatario).toBe('Destinatario original');
+    expect(despues!.destinatarioTelefono).toBe('60000000');
+  });
+
+  test('actualizarDatosRecogidaItem corrige el destinatario mientras BORRADOR (arregla la causa raíz de la carrera de escaneo), y se rechaza una vez CERRADO', async () => {
+    const envio = await crearEnvio(destinoId, userId);
+    const pkg = await crearPaqueteDePrueba();
+    // Simula el escaneo físico que dispara agregarPaquete() antes de que
+    // el operador termine de escribir nombre/teléfono: se agrega sin datos.
+    await agregarPaquete(envio.id, pkg.code, userId);
+    const antes = await prisma.package.findUnique({ where: { id: pkg.id } });
+    expect(antes!.destinatario).toBeNull();
+
+    const corregido = await actualizarDatosRecogidaItem(envio.id, pkg.id, { destinatario: 'Corregido después', destinatarioTelefono: '71112223' }, userId);
+    const item = corregido.items.find((i) => i.packageId === pkg.id)!;
+    expect(item.destinatario).toBe('Corregido después');
+    expect(item.destinatarioTelefono).toBe('71112223');
+
+    await cerrarEnvio(envio.id, userId);
+    await expect(actualizarDatosRecogidaItem(envio.id, pkg.id, { destinatario: 'Ya no debería poder', destinatarioTelefono: '70000000' }, userId)).rejects.toThrow(
+      ItemNoEditableError
+    );
+  });
+
+  test('N. getInfoEnvioDePaquete/getInfoEnvioParaPaquetes representan origen/destino correctamente, sin hardcodear nombres de sucursal', async () => {
+    await prisma.company.upsert({
+      where: { id: 1 },
+      update: { sucursalCodigo: 'F4O', sucursalNombre: 'Cofre Express Origen de Prueba' },
+      create: { id: 1, sucursalCodigo: 'F4O', sucursalNombre: 'Cofre Express Origen de Prueba' },
+    });
+    const destino = await prisma.sucursalDestino.create({ data: { codigo: 'F4D', nombre: 'Cofre Express Destino de Prueba' } });
+
+    const envio = await crearEnvio(destino.id, userId);
+    const pkg = await crearPaqueteDePrueba();
+    await agregarPaquete(envio.id, pkg.code, userId);
+
+    // BORRADOR: todavía no "salió", no debe aparecer.
+    expect(await getInfoEnvioDePaquete(pkg.id)).toBeNull();
+
+    await cerrarEnvio(envio.id, userId);
+    const infoCerrado = await getInfoEnvioDePaquete(pkg.id);
+    expect(infoCerrado).toMatchObject({
+      estado: 'CERRADO',
+      origenCodigo: 'F4O',
+      origenNombre: 'Cofre Express Origen de Prueba',
+      destinoCodigo: 'F4D',
+      destinoNombre: 'Cofre Express Destino de Prueba',
+    });
+
+    await recibirEnvio(envio.id, userId);
+    const infoRecibido = await getInfoEnvioDePaquete(pkg.id);
+    expect(infoRecibido?.estado).toBe('RECIBIDO');
+    expect(infoRecibido?.destinoNombre).toBe('Cofre Express Destino de Prueba');
+
+    // En lote (Buscador): misma información, sin N+1 (una sola consulta agrupada).
+    const otroPkg = await crearPaqueteDePrueba();
+    const mapa = await getInfoEnvioParaPaquetes([pkg.id, otroPkg.id]);
+    expect(mapa.get(pkg.id)?.destinoNombre).toBe('Cofre Express Destino de Prueba');
+    expect(mapa.has(otroPkg.id)).toBe(false); // nunca viajó por Envíos
+
+    await prisma.company.update({ where: { id: 1 }, data: { sucursalCodigo: null, sucursalNombre: null } });
+  });
+
+  test('N. un envío CANCELADO nunca aparece en getInfoEnvioDePaquete (nunca llegó a salir)', async () => {
+    const destino = await prisma.sucursalDestino.create({ data: { codigo: 'F4CANC', nombre: 'Destino cancelado F4' } });
+    const envio = await crearEnvio(destino.id, userId);
+    const pkg = await crearPaqueteDePrueba();
+    await agregarPaquete(envio.id, pkg.code, userId);
+    await cancelarEnvio(envio.id, userId);
+
+    expect(await getInfoEnvioDePaquete(pkg.id)).toBeNull();
   });
 });
 

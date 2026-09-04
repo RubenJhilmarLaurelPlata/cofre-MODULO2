@@ -11,8 +11,10 @@ const bodySchema = z.object({
   observaciones: z.string().max(500).optional(),
   montoCobrado: z.number().finite().optional(),
   motivoCobro: z.string().max(200).optional(),
-  destinatario: z.string().max(120).optional(),
-  destinatarioTelefono: z.string().max(30).optional(),
+  // Fase 4: "quién recoge" — nunca "destinatario" (ver comentario en
+  // entregarPaquete(), src/lib/package-transitions.ts).
+  quienRecogeNombre: z.string().max(120).optional(),
+  quienRecogeTelefono: z.string().max(30).optional(),
   destinatarioObservaciones: z.string().max(500).optional(),
 });
 
@@ -26,7 +28,7 @@ export async function POST(req: Request, { params }: { params: { code: string } 
   const parsed = bodySchema.safeParse(json);
   const opts = parsed.success
     ? parsed.data
-    : { observaciones: undefined, montoCobrado: undefined, motivoCobro: undefined, destinatario: undefined, destinatarioTelefono: undefined, destinatarioObservaciones: undefined };
+    : { observaciones: undefined, montoCobrado: undefined, motivoCobro: undefined, quienRecogeNombre: undefined, quienRecogeTelefono: undefined, destinatarioObservaciones: undefined };
 
   try {
     const code = params.code.trim().toUpperCase();

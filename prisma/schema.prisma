@@ -345,8 +345,24 @@ model Package {
 
   remitente                 String?
   remitenteTelefono         String?
+  // DESTINATARIO ORIGINAL: la persona registrada para recoger el paquete
+  // al momento de la recepcion/creacion (Recepcion o Envios — ver
+  // registrarPaqueteBasico() en src/lib/paquete-registro.ts). Fase 4
+  // (auditoria Envios/Recepcion/Buscador/Entrega): a partir de aqui es
+  // estrictamente de solo lectura para Entrega — Entrega NUNCA vuelve a
+  // escribir estos dos campos (antes si lo hacia, confundiendo "quien fue
+  // registrado originalmente" con "quien se presento fisicamente a
+  // recoger", ver quienRecogeNombre/quienRecogeTelefono mas abajo).
   destinatario              String?
   destinatarioTelefono      String?
+  // QUIEN RECOGE: persona que fisicamente se presenta a retirar el
+  // paquete, capturada SOLO por Entrega al momento de la entrega (Fase 4)
+  // — deliberadamente separada de destinatario/destinatarioTelefono de
+  // arriba, que son el registro original y nunca se tocan desde aqui. Si
+  // coincide con el destinatario original, Entrega puede copiarlo, pero
+  // son columnas independientes: cambiar una nunca cambia la otra.
+  quienRecogeNombre         String?
+  quienRecogeTelefono       String?
   // Observaciones especificas de quien RECOGE el paquete (Paso B),
   // distintas de "observaciones" (notas operativas generales tipo
   // "cliente llamó") y de las observaciones del remitente en Cliente.

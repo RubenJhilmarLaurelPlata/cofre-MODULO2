@@ -26,12 +26,17 @@ export async function GET(_req: Request, { params }: { params: { code: string } 
 const patchSchema = z
   .object({
     observaciones: z.string().max(500).optional(),
-    destinatario: z.string().max(120).optional(),
-    destinatarioTelefono: z.string().max(30).optional(),
+    // Fase 4: "quién recoge" — nunca "destinatario" (ver comentario en
+    // entregarPaquete(), src/lib/package-transitions.ts). Esta ruta
+    // NUNCA debe volver a escribir Package.destinatario/
+    // destinatarioTelefono — esos son el registro original de
+    // Recepción/Envíos, de solo lectura desde Entrega.
+    quienRecogeNombre: z.string().max(120).optional(),
+    quienRecogeTelefono: z.string().max(30).optional(),
     destinatarioObservaciones: z.string().max(500).optional(),
   })
   .refine(
-    (v) => v.observaciones !== undefined || v.destinatario !== undefined || v.destinatarioTelefono !== undefined || v.destinatarioObservaciones !== undefined,
+    (v) => v.observaciones !== undefined || v.quienRecogeNombre !== undefined || v.quienRecogeTelefono !== undefined || v.destinatarioObservaciones !== undefined,
     { message: 'No se envió ningún campo para actualizar.' }
   );
 
@@ -52,13 +57,13 @@ export async function PATCH(req: Request, { params }: { params: { code: string }
   const pkg = await prisma.package.findUnique({ where: { codigoNormalizado: normalizarCodigo(params.code) } });
   if (!pkg) return NextResponse.json({ error: `No se encontró ningún paquete con el código "${params.code.trim().toUpperCase()}".` }, { status: 404 });
 
-  const { observaciones, destinatario, destinatarioTelefono, destinatarioObservaciones } = parsed.data;
+  const { observaciones, quienRecogeNombre, quienRecogeTelefono, destinatarioObservaciones } = parsed.data;
   await prisma.package.update({
     where: { code: pkg.code },
     data: {
       ...(observaciones !== undefined ? { observaciones } : {}),
-      ...(destinatario !== undefined ? { destinatario } : {}),
-      ...(destinatarioTelefono !== undefined ? { destinatarioTelefono } : {}),
+      ...(quienRecogeNombre !== undefined ? { quienRecogeNombre } : {}),
+      ...(quienRecogeTelefono !== undefined ? { quienRecogeTelefono } : {}),
       ...(destinatarioObservaciones !== undefined ? { destinatarioObservaciones } : {}),
     },
   });

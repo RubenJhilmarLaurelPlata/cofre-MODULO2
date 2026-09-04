@@ -12,7 +12,7 @@
 // propio ni almacenamiento de audio).
 import * as React from 'react';
 import Link from 'next/link';
-import { ArrowLeft, Container, ScanLine, Trash2, CheckCircle2, XCircle, Lock, Ban, RefreshCw, QrCode, PackageCheck, Keyboard, Camera as CameraIcon, UserRound, Phone, Wallet, RotateCcw } from 'lucide-react';
+import { ArrowLeft, Container, ScanLine, Trash2, CheckCircle2, XCircle, Lock, Ban, RefreshCw, QrCode, PackageCheck, Keyboard, Camera as CameraIcon, UserRound, Phone, Wallet, RotateCcw, Pencil, Save, X } from 'lucide-react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -176,6 +176,44 @@ export function EnvioDetalleClient({ envioId }: { envioId: string }) {
       return;
     }
     setEnvio(data);
+  }
+
+  /**
+   * Corrige el destinatario/teléfono de un paquete ya agregado (Fase 4):
+   * arregla la causa raíz de "los datos de quien recoge desaparecen" — un
+   * lector físico puede disparar agregar() en Enter antes de que el
+   * operador termine de escribir nombre/teléfono, y hasta ahora no había
+   * ninguna forma de corregirlo sin quitar y volver a agregar el paquete.
+   */
+  const [editandoItem, setEditandoItem] = React.useState<string | null>(null);
+  const [editDestinatario, setEditDestinatario] = React.useState('');
+  const [editTelefono, setEditTelefono] = React.useState('');
+  const [guardandoEdicion, setGuardandoEdicion] = React.useState(false);
+
+  function abrirEdicionItem(it: EnvioItemDTO) {
+    setEditandoItem(it.packageId);
+    setEditDestinatario(it.destinatario ?? '');
+    setEditTelefono(it.destinatarioTelefono ?? '');
+  }
+
+  async function guardarEdicionItem(packageId: string) {
+    setGuardandoEdicion(true);
+    try {
+      const res = await fetch(`/api/envios/${envioId}/paquetes/${packageId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ destinatario: editDestinatario, destinatarioTelefono: editTelefono }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setError(data.error ?? 'No se pudo actualizar el destinatario.');
+        return;
+      }
+      setEnvio(data);
+      setEditandoItem(null);
+    } finally {
+      setGuardandoEdicion(false);
+    }
   }
 
   async function cerrar() {
@@ -452,31 +490,65 @@ export function EnvioDetalleClient({ envioId }: { envioId: string }) {
                 <p className="py-6 text-center text-sm text-gray-400 dark:text-gray-500">Todavía no se agregó ningún paquete.</p>
               ) : (
                 <div className="divide-y divide-gray-100 dark:divide-gray-800">
-                  {envio.items.map((it) => (
-                    <div key={it.id} className="flex flex-wrap items-center justify-between gap-2 py-2.5 text-sm">
-                      <div className="min-w-0 space-y-0.5">
-                        <span className="flex items-center gap-2 font-mono font-medium text-ink dark:text-gray-100">
+                  {envio.items.map((it) =>
+                    editandoItem === it.packageId ? (
+                      <div key={it.id} className="space-y-2 py-3">
+                        <p className="flex items-center gap-2 font-mono text-sm font-medium text-ink dark:text-gray-100">
                           <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-500" /> {it.code}
-                        </span>
-                        {it.destinatario && (
-                          <p className="truncate pl-6 text-xs text-gray-400 dark:text-gray-500">
-                            {it.destinatario}
-                            {it.destinatarioTelefono && ` · ${it.destinatarioTelefono}`}
-                          </p>
-                        )}
-                      </div>
-                      <div className="flex shrink-0 items-center gap-2">
-                        <Badge variant={it.estadoPago === 'PAGADO' ? 'success' : 'warning'}>
-                          {it.estadoPago === 'PAGADO' ? `Pagado Bs ${it.montoPagado.toFixed(2)}` : 'Pendiente'}
-                        </Badge>
-                        {esBorrador && (
-                          <Button variant="ghost" size="sm" onClick={() => quitar(it)}>
-                            <Trash2 className="h-3.5 w-3.5 text-red-500" />
+                        </p>
+                        <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                          <Input value={editDestinatario} onChange={(e) => setEditDestinatario(e.target.value)} placeholder="Nombre" className="h-10 text-sm" />
+                          <Input
+                            value={editTelefono}
+                            onChange={(e) => setEditTelefono(e.target.value)}
+                            placeholder="Celular"
+                            type="tel"
+                            inputMode="tel"
+                            className="h-10 text-sm"
+                          />
+                        </div>
+                        <div className="flex gap-2">
+                          <Button size="sm" onClick={() => guardarEdicionItem(it.packageId)} loading={guardandoEdicion}>
+                            <Save className="h-3.5 w-3.5" /> Guardar
                           </Button>
-                        )}
+                          <Button size="sm" variant="secondary" onClick={() => setEditandoItem(null)}>
+                            <X className="h-3.5 w-3.5" /> Cancelar
+                          </Button>
+                        </div>
                       </div>
-                    </div>
-                  ))}
+                    ) : (
+                      <div key={it.id} className="flex flex-wrap items-center justify-between gap-2 py-2.5 text-sm">
+                        <div className="min-w-0 space-y-0.5">
+                          <span className="flex items-center gap-2 font-mono font-medium text-ink dark:text-gray-100">
+                            <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-500" /> {it.code}
+                          </span>
+                          {it.destinatario ? (
+                            <p className="truncate pl-6 text-xs text-gray-400 dark:text-gray-500">
+                              {it.destinatario}
+                              {it.destinatarioTelefono && ` · ${it.destinatarioTelefono}`}
+                            </p>
+                          ) : (
+                            esBorrador && <p className="pl-6 text-xs text-gray-300 dark:text-gray-600">Sin datos de quien recoge</p>
+                          )}
+                        </div>
+                        <div className="flex shrink-0 items-center gap-2">
+                          <Badge variant={it.estadoPago === 'PAGADO' ? 'success' : 'warning'}>
+                            {it.estadoPago === 'PAGADO' ? `Pagado Bs ${it.montoPagado.toFixed(2)}` : 'Pendiente'}
+                          </Badge>
+                          {esBorrador && (
+                            <>
+                              <Button variant="ghost" size="sm" onClick={() => abrirEdicionItem(it)}>
+                                <Pencil className="h-3.5 w-3.5 text-gray-400" />
+                              </Button>
+                              <Button variant="ghost" size="sm" onClick={() => quitar(it)}>
+                                <Trash2 className="h-3.5 w-3.5 text-red-500" />
+                              </Button>
+                            </>
+                          )}
+                        </div>
+                      </div>
+                    )
+                  )}
                 </div>
               )}
             </CardContent>
