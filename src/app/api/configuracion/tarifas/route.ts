@@ -6,13 +6,14 @@
 import { NextResponse } from 'next/server';
 import { z } from 'zod';
 import { getSession } from '@/lib/auth';
+import { tienePermiso } from '@/lib/permisos';
 import { getCompanyConfig } from '@/lib/config';
 import { prisma } from '@/lib/prisma';
 import { registrarAuditoria, extraerContextoRequest } from '@/lib/auditoria';
 
 export async function GET() {
   const session = await getSession();
-  if (!session || session.role !== 'ADMIN') {
+  if (!session || !(await tienePermiso(session, 'admin.tarifas'))) {
     return NextResponse.json({ error: 'No tienes permiso para esta acción' }, { status: 403 });
   }
   const company = await getCompanyConfig();
@@ -51,7 +52,7 @@ const bodySchema = z.object({
 
 export async function PATCH(req: Request) {
   const session = await getSession();
-  if (!session || session.role !== 'ADMIN') {
+  if (!session || !(await tienePermiso(session, 'admin.tarifas'))) {
     return NextResponse.json({ error: 'No tienes permiso para esta acción' }, { status: 403 });
   }
 

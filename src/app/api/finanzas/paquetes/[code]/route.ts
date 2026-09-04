@@ -4,16 +4,15 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { getSession } from '@/lib/auth';
+import { tienePermiso } from '@/lib/permisos';
 import { normalizarCodigo } from '@/lib/codigo';
 import { getPackageDetail } from '@/lib/package-detail';
 import { listarPagosPaquete } from '@/lib/finanzas';
-import type { Role } from '@/types';
 
-const ROLES_PERMITIDOS: Role[] = ['ADMIN', 'SUPERVISOR'];
 
 export async function GET(_req: Request, { params }: { params: { code: string } }) {
   const session = await getSession();
-  if (!session || !ROLES_PERMITIDOS.includes(session.role)) {
+  if (!session || !(await tienePermiso(session, 'finanzas.ver_caja'))) {
     return NextResponse.json({ error: 'No tienes permiso para esta acción' }, { status: 403 });
   }
 

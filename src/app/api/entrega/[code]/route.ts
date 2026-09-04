@@ -3,6 +3,7 @@ import { NextResponse } from 'next/server';
 import { z } from 'zod';
 import { prisma } from '@/lib/prisma';
 import { getSession } from '@/lib/auth';
+import { tienePermiso } from '@/lib/permisos';
 import { getPackageDetail } from '@/lib/package-detail';
 import { conLoteImportacion } from '@/lib/entrega-lote';
 import { normalizarCodigo } from '@/lib/codigo';
@@ -13,7 +14,7 @@ function sinPermiso() {
 
 export async function GET(_req: Request, { params }: { params: { code: string } }) {
   const session = await getSession();
-  if (!session || !['ADMIN', 'ENTREGA', 'ADMIN_CAJA'].includes(session.role)) return sinPermiso();
+  if (!session || !(await tienePermiso(session, 'entrega.buscar'))) return sinPermiso();
 
   const detalle = await getPackageDetail(params.code);
   if (!detalle) {
@@ -36,7 +37,7 @@ const patchSchema = z
 
 export async function PATCH(req: Request, { params }: { params: { code: string } }) {
   const session = await getSession();
-  if (!session || !['ADMIN', 'ENTREGA', 'ADMIN_CAJA'].includes(session.role)) return sinPermiso();
+  if (!session || !(await tienePermiso(session, 'entrega.buscar'))) return sinPermiso();
 
   const json = await req.json().catch(() => null);
   const parsed = patchSchema.safeParse(json);

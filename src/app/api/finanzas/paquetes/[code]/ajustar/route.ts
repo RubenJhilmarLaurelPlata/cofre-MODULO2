@@ -6,12 +6,11 @@ import { NextResponse } from 'next/server';
 import { z } from 'zod';
 import { prisma } from '@/lib/prisma';
 import { getSession } from '@/lib/auth';
+import { tienePermiso } from '@/lib/permisos';
 import { normalizarCodigo } from '@/lib/codigo';
 import { ajustarCobroPaquete } from '@/lib/finanzas';
 import { getPackageDetail } from '@/lib/package-detail';
-import type { Role } from '@/types';
 
-const ROLES_PERMITIDOS: Role[] = ['ADMIN', 'SUPERVISOR'];
 
 const bodySchema = z.object({
   montoDelta: z.number().finite().refine((v) => v !== 0, 'El ajuste no puede ser 0'),
@@ -20,7 +19,7 @@ const bodySchema = z.object({
 
 export async function POST(req: Request, { params }: { params: { code: string } }) {
   const session = await getSession();
-  if (!session || !ROLES_PERMITIDOS.includes(session.role)) {
+  if (!session || !(await tienePermiso(session, 'finanzas.registrar_cobros'))) {
     return NextResponse.json({ error: 'No tienes permiso para esta acción' }, { status: 403 });
   }
 

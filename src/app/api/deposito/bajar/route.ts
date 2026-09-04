@@ -2,11 +2,9 @@
 import { NextResponse } from 'next/server';
 import { z } from 'zod';
 import { getSession } from '@/lib/auth';
+import { tienePermiso } from '@/lib/permisos';
 import { bajarDeDeposito, TransicionInvalidaError, PaqueteNoEncontradoError } from '@/lib/package-transitions';
 import { getPackageDetail } from '@/lib/package-detail';
-import type { Role } from '@/types';
-
-const ROLES_PERMITIDOS: Role[] = ['ADMIN', 'ENTREGA', 'RECEPCION', 'ADMIN_CAJA'];
 
 const bodySchema = z.object({
   code: z.string().trim().min(1, 'El código no puede estar vacío').max(40),
@@ -14,7 +12,7 @@ const bodySchema = z.object({
 
 export async function POST(req: Request) {
   const session = await getSession();
-  if (!session || !ROLES_PERMITIDOS.includes(session.role)) {
+  if (!session || !(await tienePermiso(session, 'deposito.bajar'))) {
     return NextResponse.json({ error: 'No tienes permiso para esta acción' }, { status: 403 });
   }
 

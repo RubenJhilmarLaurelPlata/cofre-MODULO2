@@ -1,12 +1,13 @@
 // src/app/api/entrega/[code]/solicitar-bajar/route.ts
 import { NextResponse } from 'next/server';
 import { getSession } from '@/lib/auth';
+import { tienePermiso } from '@/lib/permisos';
 import { solicitarBajarDeposito, TransicionInvalidaError, PaqueteNoEncontradoError } from '@/lib/package-transitions';
 import { getPackageDetail } from '@/lib/package-detail';
 
 export async function POST(_req: Request, { params }: { params: { code: string } }) {
   const session = await getSession();
-  if (!session || !['ADMIN', 'ENTREGA', 'ADMIN_CAJA'].includes(session.role)) {
+  if (!session || !(await tienePermiso(session, 'entrega.solicitar_bajar_deposito'))) {
     return NextResponse.json({ error: 'No tienes permiso para esta acción' }, { status: 403 });
   }
 

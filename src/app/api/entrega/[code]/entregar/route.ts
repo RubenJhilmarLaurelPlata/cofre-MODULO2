@@ -2,7 +2,8 @@
 import { NextResponse } from 'next/server';
 import { z } from 'zod';
 import { getSession } from '@/lib/auth';
-import { entregarPaquete, TransicionInvalidaError, PaqueteNoEncontradoError } from '@/lib/package-transitions';
+import { tienePermiso } from '@/lib/permisos';
+import { entregarPaquete, TransicionInvalidaError, PaqueteNoEncontradoError, PaqueteEnEnvioError } from '@/lib/package-transitions';
 import { getPackageDetail } from '@/lib/package-detail';
 import { conLoteImportacion } from '@/lib/entrega-lote';
 
@@ -17,7 +18,7 @@ const bodySchema = z.object({
 
 export async function POST(req: Request, { params }: { params: { code: string } }) {
   const session = await getSession();
-  if (!session || !['ADMIN', 'ENTREGA', 'ADMIN_CAJA'].includes(session.role)) {
+  if (!session || !(await tienePermiso(session, 'entrega.entregar'))) {
     return NextResponse.json({ error: 'No tienes permiso para esta acción' }, { status: 403 });
   }
 
@@ -34,6 +35,7 @@ export async function POST(req: Request, { params }: { params: { code: string } 
     return NextResponse.json(detalle ? await conLoteImportacion(detalle.code, detalle) : detalle);
   } catch (err) {
     if (err instanceof PaqueteNoEncontradoError) return NextResponse.json({ error: err.message }, { status: 404 });
+    if (err instanceof PaqueteEnEnvioError) return NextResponse.json({ error: err.message }, { status: 409 });
     if (err instanceof TransicionInvalidaError) return NextResponse.json({ error: err.message }, { status: 400 });
     console.error('Error entregando paquete:', err);
     return NextResponse.json({ error: 'Ocurrió un error al registrar la entrega.' }, { status: 500 });

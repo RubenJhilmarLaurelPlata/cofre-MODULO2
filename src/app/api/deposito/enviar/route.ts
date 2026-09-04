@@ -2,11 +2,9 @@
 import { NextResponse } from 'next/server';
 import { z } from 'zod';
 import { getSession } from '@/lib/auth';
-import { enviarADeposito, TransicionInvalidaError, PaqueteNoEncontradoError } from '@/lib/package-transitions';
+import { tienePermiso } from '@/lib/permisos';
+import { enviarADeposito, TransicionInvalidaError, PaqueteNoEncontradoError, PaqueteEnEnvioError } from '@/lib/package-transitions';
 import { getPackageDetail } from '@/lib/package-detail';
-import type { Role } from '@/types';
-
-const ROLES_PERMITIDOS: Role[] = ['ADMIN', 'ENTREGA', 'RECEPCION', 'ADMIN_CAJA'];
 
 const bodySchema = z.object({
   code: z.string().trim().min(1, 'El código no puede estar vacío').max(40),
@@ -14,7 +12,7 @@ const bodySchema = z.object({
 
 export async function POST(req: Request) {
   const session = await getSession();
-  if (!session || !ROLES_PERMITIDOS.includes(session.role)) {
+  if (!session || !(await tienePermiso(session, 'deposito.enviar'))) {
     return NextResponse.json({ error: 'No tienes permiso para esta acción' }, { status: 403 });
   }
 
@@ -31,6 +29,7 @@ export async function POST(req: Request) {
     return NextResponse.json(await getPackageDetail(code));
   } catch (err) {
     if (err instanceof PaqueteNoEncontradoError) return NextResponse.json({ error: err.message }, { status: 404 });
+    if (err instanceof PaqueteEnEnvioError) return NextResponse.json({ error: err.message }, { status: 409 });
     if (err instanceof TransicionInvalidaError) return NextResponse.json({ error: err.message }, { status: 400 });
     console.error('Error enviando paquete a depósito:', err);
     return NextResponse.json({ error: 'Ocurrió un error al enviar el paquete a depósito.' }, { status: 500 });

@@ -6,6 +6,7 @@ import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { z } from 'zod';
 import { getSession } from '@/lib/auth';
+import { tienePermiso } from '@/lib/permisos';
 import { prisma } from '@/lib/prisma';
 import {
   getReportePaquetes,
@@ -23,9 +24,7 @@ import {
 import { construirPdfReporte, construirExcelReporte, construirCsvReporte } from '@/lib/reportes-export';
 import { registrarAuditoria, extraerContextoRequest } from '@/lib/auditoria';
 import { PACKAGE_STATUSES } from '@/types';
-import type { Role } from '@/types';
 
-const ROLES_PERMITIDOS: Role[] = ['ADMIN', 'SUPERVISOR'];
 
 const TITULOS: Record<TipoReporte, string> = {
   PAQUETES: 'Reporte de Paquetes',
@@ -82,7 +81,7 @@ async function describirFiltros(filtros: FiltrosReporte): Promise<string[]> {
 
 export async function POST(req: Request) {
   const session = await getSession();
-  if (!session || !ROLES_PERMITIDOS.includes(session.role)) {
+  if (!session || !(await tienePermiso(session, 'reportes.exportar'))) {
     return NextResponse.json({ error: 'No tienes permiso para esta acción' }, { status: 403 });
   }
 

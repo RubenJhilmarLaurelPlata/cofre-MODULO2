@@ -2,10 +2,9 @@
 import { NextResponse } from 'next/server';
 import { z } from 'zod';
 import { getSession } from '@/lib/auth';
+import { tienePermiso } from '@/lib/permisos';
 import { cerrarCajaSesion } from '@/lib/finanzas';
-import type { Role } from '@/types';
 
-const ROLES_PERMITIDOS: Role[] = ['ADMIN', 'SUPERVISOR'];
 
 const bodySchema = z.object({
   efectivoDeclarado: z.number().finite().min(0).max(10_000_000).optional(),
@@ -13,7 +12,7 @@ const bodySchema = z.object({
 
 export async function POST(req: Request) {
   const session = await getSession();
-  if (!session || !ROLES_PERMITIDOS.includes(session.role)) {
+  if (!session || !(await tienePermiso(session, 'finanzas.cerrar_caja'))) {
     return NextResponse.json({ error: 'No tienes permiso para esta acción' }, { status: 403 });
   }
 

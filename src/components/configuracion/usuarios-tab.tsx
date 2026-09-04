@@ -2,7 +2,7 @@
 
 // src/components/configuracion/usuarios-tab.tsx
 import * as React from 'react';
-import { Search, UserPlus, Pencil, Lock, Unlock, UserX, UserCheck, KeyRound, X, Save, CheckCircle2, XCircle, Trash2 } from 'lucide-react';
+import { Search, UserPlus, Pencil, Lock, Unlock, UserX, UserCheck, KeyRound, X, Save, CheckCircle2, XCircle, Trash2, ShieldCheck } from 'lucide-react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Input, Label } from '@/components/ui/input';
@@ -54,6 +54,84 @@ export function UsuariosTab() {
   const [reseteandoId, setReseteandoId] = React.useState<string | null>(null);
   const [nuevaPassword, setNuevaPassword] = React.useState('');
   const [accionEnCurso, setAccionEnCurso] = React.useState<string | null>(null);
+
+  // "Personalizar permisos" (Fase 2): excepciones puntuales sobre los
+  // permisos del rol de un usuario — ver GET/PUT
+  // /api/configuracion/usuarios/[id]/permisos. deRol es de solo lectura
+  // (lo que YA tiene por su rol); extra/revocados son las excepciones que
+  // este panel edita. El efectivo mostrado siempre se deriva de los tres,
+  // nunca se guarda por separado.
+  const [personalizandoId, setPersonalizandoId] = React.useState<string | null>(null);
+  const [permisosCatalogo, setPermisosCatalogo] = React.useState<Array<{ key: string; modulo: string; nombre: string; descripcion: string }>>([]);
+  const [gruposCatalogo, setGruposCatalogo] = React.useState<Array<{ modulo: string; label: string }>>([]);
+  const [deRol, setDeRol] = React.useState<Set<string>>(new Set());
+  const [extras, setExtras] = React.useState<Set<string>>(new Set());
+  const [revocados, setRevocados] = React.useState<Set<string>>(new Set());
+  const [guardandoPermisos, setGuardandoPermisos] = React.useState(false);
+
+  async function abrirPermisos(id: string) {
+    setPersonalizandoId(id);
+    if (permisosCatalogo.length === 0) {
+      const rolesRes = await fetch('/api/configuracion/roles');
+      const rolesData = await rolesRes.json();
+      setPermisosCatalogo(rolesData.permisos);
+      setGruposCatalogo(rolesData.grupos);
+    }
+    const res = await fetch(`/api/configuracion/usuarios/${id}/permisos`);
+    const efectivos: Array<{ key: string; deRol: boolean; extra: boolean; revocado: boolean }> = await res.json();
+    setDeRol(new Set(efectivos.filter((e) => e.deRol).map((e) => e.key)));
+    setExtras(new Set(efectivos.filter((e) => e.extra).map((e) => e.key)));
+    setRevocados(new Set(efectivos.filter((e) => e.revocado).map((e) => e.key)));
+  }
+
+  function esEfectivo(key: string): boolean {
+    return (deRol.has(key) || extras.has(key)) && !revocados.has(key);
+  }
+
+  function toggleEfectivo(key: string) {
+    const activoAhora = esEfectivo(key);
+    if (activoAhora) {
+      // Apagarlo: si venia del rol, hay que revocarlo explicitamente; si
+      // era un extra agregado, alcanza con quitarlo de extras.
+      if (deRol.has(key)) setRevocados((prev) => new Set(prev).add(key));
+      setExtras((prev) => {
+        const next = new Set(prev);
+        next.delete(key);
+        return next;
+      });
+    } else {
+      // Prenderlo: si el rol ya lo da pero estaba revocado, alcanza con
+      // quitar la revocacion; si el rol nunca lo dio, hay que agregarlo.
+      if (deRol.has(key)) {
+        setRevocados((prev) => {
+          const next = new Set(prev);
+          next.delete(key);
+          return next;
+        });
+      } else {
+        setExtras((prev) => new Set(prev).add(key));
+      }
+    }
+  }
+
+  async function guardarPermisos(id: string) {
+    setGuardandoPermisos(true);
+    try {
+      const res = await fetch(`/api/configuracion/usuarios/${id}/permisos`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ permisosExtra: [...extras], permisosRevocados: [...revocados] }),
+      });
+      if (!res.ok) {
+        const data = await res.json();
+        setError(data.error ?? 'No se pudieron guardar los permisos.');
+        return;
+      }
+      setPersonalizandoId(null);
+    } finally {
+      setGuardandoPermisos(false);
+    }
+  }
 
   const buscar = React.useCallback(async () => {
     setCargando(true);
@@ -377,6 +455,9 @@ export function UsuariosTab() {
                     <Button size="sm" variant="secondary" onClick={() => setReseteandoId(u.id)}>
                       <KeyRound className="h-3.5 w-3.5" /> Restablecer contraseña
                     </Button>
+                    <Button size="sm" variant="secondary" onClick={() => (personalizandoId === u.id ? setPersonalizandoId(null) : abrirPermisos(u.id))}>
+                      <ShieldCheck className="h-3.5 w-3.5" /> Personalizar permisos
+                    </Button>
                     {u.estado === 'BLOQUEADO' ? (
                       <Button size="sm" variant="secondary" loading={accionEnCurso === u.id} onClick={() => ejecutarAccion(u.id, 'desbloquear')}>
                         <Unlock className="h-3.5 w-3.5" /> Desbloquear
@@ -422,6 +503,43 @@ export function UsuariosTab() {
                     >
                       <Trash2 className="h-3.5 w-3.5" /> Eliminar
                     </Button>
+                  </div>
+                )}
+
+                {personalizandoId === u.id && (
+                  <div className="space-y-4 border-t border-gray-100 dark:border-gray-800/60 pt-3">
+                    <p className="text-xs text-ink-soft dark:text-gray-400">
+                      PERMISO DEL ROL <ShieldCheck className="inline h-3 w-3" /> · marcado aquí = efectivo para {u.nombre}. Desmarcar un permiso que da el rol lo{' '}
+                      <strong>revoca</strong> solo para este usuario; marcar uno que el rol no da lo <strong>agrega</strong> como excepción.
+                    </p>
+                    <div className="max-h-96 space-y-4 overflow-y-auto pr-1">
+                      {gruposCatalogo.map((grupo) => {
+                        const delGrupo = permisosCatalogo.filter((p) => p.modulo === grupo.modulo);
+                        if (delGrupo.length === 0) return null;
+                        return (
+                          <div key={grupo.modulo}>
+                            <p className="mb-1 text-xs font-semibold uppercase tracking-wide text-ink-soft dark:text-gray-400">{grupo.label}</p>
+                            <div className="space-y-0.5">
+                              {delGrupo.map((p) => (
+                                <label key={p.key} className="flex cursor-pointer items-center gap-2 rounded-md px-1.5 py-1 text-sm hover:bg-gray-50 dark:hover:bg-gray-800/40">
+                                  <input type="checkbox" className="h-4 w-4 rounded border-gray-300 dark:border-gray-700 text-brand-600" checked={esEfectivo(p.key)} onChange={() => toggleEfectivo(p.key)} />
+                                  <span className="text-ink dark:text-gray-100">{p.nombre}</span>
+                                  {deRol.has(p.key) && <span className="text-[10px] text-gray-400 dark:text-gray-500">(del rol)</span>}
+                                </label>
+                              ))}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                    <div className="flex gap-2">
+                      <Button size="sm" onClick={() => guardarPermisos(u.id)} loading={guardandoPermisos}>
+                        <Save className="h-3.5 w-3.5" /> Guardar permisos personalizados
+                      </Button>
+                      <Button size="sm" variant="ghost" onClick={() => setPersonalizandoId(null)}>
+                        Cerrar
+                      </Button>
+                    </div>
                   </div>
                 )}
               </CardContent>

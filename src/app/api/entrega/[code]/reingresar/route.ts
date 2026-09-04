@@ -7,6 +7,7 @@
 import { NextResponse } from 'next/server';
 import { z } from 'zod';
 import { getSession } from '@/lib/auth';
+import { tienePermiso } from '@/lib/permisos';
 import { reingresarPaquete, TransicionInvalidaError, PaqueteNoEncontradoError } from '@/lib/package-transitions';
 import { getPackageDetail } from '@/lib/package-detail';
 import { conLoteImportacion } from '@/lib/entrega-lote';
@@ -15,7 +16,7 @@ const bodySchema = z.object({ motivo: z.string().trim().max(300).optional() });
 
 export async function POST(req: Request, { params }: { params: { code: string } }) {
   const session = await getSession();
-  if (!session || !['ADMIN', 'ENTREGA', 'ADMIN_CAJA'].includes(session.role)) {
+  if (!session || !(await tienePermiso(session, 'entrega.reingresar'))) {
     return NextResponse.json({ error: 'No tienes permiso para esta acción' }, { status: 403 });
   }
 

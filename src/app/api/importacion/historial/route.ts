@@ -2,11 +2,12 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { getSession } from '@/lib/auth';
+import { tienePermiso } from '@/lib/permisos';
 import { getLotesEliminables } from '@/lib/importacion';
 
 export async function GET() {
   const session = await getSession();
-  if (!session || session.role !== 'ADMIN') {
+  if (!session || !(await tienePermiso(session, 'admin.importacion'))) {
     return NextResponse.json({ error: 'No tienes permiso para esta acción' }, { status: 403 });
   }
 

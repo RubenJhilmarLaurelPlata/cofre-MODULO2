@@ -5,12 +5,13 @@
 // src/lib/importacion.ts para el detalle de qué es y no es reversible.
 import { NextResponse } from 'next/server';
 import { getSession } from '@/lib/auth';
+import { tienePermiso } from '@/lib/permisos';
 import { previsualizarReversion, revertirLoteImportacion, LoteNoEncontradoError, LoteYaRevertidoError, LoteSinEfectoParaRevertirError } from '@/lib/importacion';
 
 /** Vista previa (sin escribir nada) para el diálogo de confirmación fuerte del frontend. */
 export async function GET(_req: Request, { params }: { params: { id: string } }) {
   const session = await getSession();
-  if (!session || session.role !== 'ADMIN') {
+  if (!session || !(await tienePermiso(session, 'admin.importacion'))) {
     return NextResponse.json({ error: 'No tienes permiso para esta acción' }, { status: 403 });
   }
 
@@ -29,7 +30,7 @@ export async function GET(_req: Request, { params }: { params: { id: string } })
 /** Ejecuta la reversión — transaccional, ver revertirLoteImportacion(). */
 export async function POST(_req: Request, { params }: { params: { id: string } }) {
   const session = await getSession();
-  if (!session || session.role !== 'ADMIN') {
+  if (!session || !(await tienePermiso(session, 'admin.importacion'))) {
     return NextResponse.json({ error: 'No tienes permiso para esta acción' }, { status: 403 });
   }
 

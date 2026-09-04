@@ -64,6 +64,17 @@ model User {
   createdAt        DateTime  @default(now())
   updatedAt        DateTime  @updatedAt
 
+  // Excepciones de permisos individuales (Fase 2 — modulo Envios y
+  // permisos configurables): JSON de string[] con claves del catalogo fijo
+  // de src/lib/permisos.ts. Ambas nullable — null es el estado de TODOS
+  // los usuarios existentes hoy (ninguno tiene excepciones), y significa
+  // exactamente el comportamiento actual: el usuario tiene solo los
+  // permisos de su rol (ver RolePermiso), sin mas ni menos. El calculo
+  // real (rol + extra - revocados) vive en tienePermiso() (permisos.ts),
+  // nunca duplicado aqui.
+  permisosExtra     String?
+  permisosRevocados String?
+
   paquetesRegistrados     Package[]        @relation("PackageRegistradoPor")
   historialAcciones       PackageHistory[]
   lotesGenerados          LabelBatch[]
@@ -77,6 +88,8 @@ model User {
   importacionesRevertidas ImportLog[]      @relation("ImportLogRevertidoPor")
   cajasAbiertas           CajaSesion[]     @relation("CajaAbiertaPor")
   cajasCerradas           CajaSesion[]     @relation("CajaCerradaPor")
+  enviosCreados           Envio[]          @relation("EnvioCreadoPor")
+  enviosCerrados          Envio[]          @relation("EnvioCerradoPor")
 
   @@index([role])
   @@index([branchId])
@@ -376,6 +389,11 @@ model Package {
 
   historial PackageHistory[]
   pagos     Pago[]
+  // Fase 2 (modulo Envios): en que EnvioItem(s) aparecio este paquete a lo
+  // largo del tiempo. Un paquete "reservado" para transferencia hoy es el
+  // que tiene un EnvioItem cuyo Envio.estado esta en BORRADOR o CERRADO
+  // (ver src/lib/envios.ts) — Package.status NUNCA cambia por esto.
+  enviosItems EnvioItem[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -697,4 +715,112 @@ model Backup {
   createdAt     DateTime @default(now())
 
   @@index([createdAt])
+}
+
+// ---------------------------------------------------------------------
+// Envios (Fase 2): transferencias de paquetes entre instalaciones.
+// SOLO la mitad local (crear, agregar/quitar paquetes, cerrar, cancelar).
+// La comunicacion real entre servidores (LPZ <-> ELA), la recepcion
+// remota y el tracking publico son fases futuras — ver auditoria de
+// arquitectura multi-sucursal. Ningun modelo de aqui asume ni hardcodea
+// que sucursal existe: el destino es siempre una fila de
+// SucursalDestino creada por un administrador.
+// ---------------------------------------------------------------------
+
+// Catalogo de sucursales/destinos a los que ESTA instalacion puede
+// enviar paquetes. Nace vacio — nunca se pre-carga con LPZ/ELA ni con
+// ningun otro valor asumido; lo llena un administrador desde
+// Configuracion. Branch (arriba) NO sirve para esto: fue pensado para
+// varias sucursales dentro de UNA base compartida, mientras que en la
+// arquitectura real cada instalacion tiene su propia base — un destino
+// aqui es, por definicion, una sucursal EXTERNA a esta base de datos.
+model SucursalDestino {
+  id        String   @id @default(cuid())
+  codigo    String   @unique
+  nombre    String
+  ciudad    String?
+  direccion String?
+  activa    Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  envios Envio[]
+
+  @@index([activa])
+}
+
+// Valores permitidos de "estado": BORRADOR | CERRADO | CANCELADO (ver
+// nota sobre enums en SQLite, arriba). Un envio agrupa paquetes locales
+// que van a transferirse a otra sucursal. Package.status NUNCA cambia
+// por pertenecer a un Envio (ver comentario en EnvioItem y en
+// Package.enviosItems) — la exclusividad de "este paquete ya esta
+// reservado" la da la relacion con EnvioItem, verificada
+// transaccionalmente en src/lib/envios.ts, no un estado nuevo de
+// Package. codigo se genera al CREAR (nunca cambia despues); qrToken
+// se genera una unica vez al CERRAR y tampoco cambia despues — ninguna
+// funcion de este sistema ofrece editarlos.
+model Envio {
+  id     String @id @default(cuid())
+  codigo String @unique
+
+  destinoId String
+  destino   SucursalDestino @relation(fields: [destinoId], references: [id])
+
+  estado String @default("BORRADOR")
+
+  qrToken String? @unique
+
+  creadoPorId String?
+  creadoPor   User?   @relation("EnvioCreadoPor", fields: [creadoPorId], references: [id])
+
+  cerradoPorId String?
+  cerradoPor   User?   @relation("EnvioCerradoPor", fields: [cerradoPorId], references: [id])
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  cerradoAt DateTime?
+
+  items EnvioItem[]
+
+  @@index([destinoId])
+  @@index([estado])
+  @@index([createdAt])
+}
+
+// Un paquete dentro de un envio. Sin campo de "baja logica": mientras el
+// Envio esta en BORRADOR, quitar un paquete es un DELETE real de esta
+// fila (nunca hubo un evento de negocio que preservar — ver Parte C del
+// diseño: los eventos de auditoria de Envios viven en AuditLog, no aqui
+// ni en PackageHistory). Una vez que el Envio pasa a CERRADO o
+// CANCELADO, ninguna funcion vuelve a tocar estas filas.
+model EnvioItem {
+  id String @id @default(cuid())
+
+  envioId String
+  envio   Envio  @relation(fields: [envioId], references: [id], onDelete: Cascade)
+
+  packageId String
+  package   Package @relation(fields: [packageId], references: [id])
+
+  createdAt DateTime @default(now())
+
+  @@unique([envioId, packageId])
+  @@index([packageId])
+  @@index([envioId])
+}
+
+// Catalogo de PERMISOS en si (la clave, su nombre y descripcion legibles)
+// vive fijo en codigo — src/lib/permisos.ts — porque solo cambia cuando
+// se despliega una funcionalidad nueva, no algo que un administrador
+// cree. Lo que SI debe persistir y ser editable desde la UI (Fase 2,
+// punto 20 del pedido) es la ASIGNACION rol -> permiso: cada fila de
+// aqui dice "este rol tiene este permiso". Ausencia de fila = no lo
+// tiene. Ver tienePermiso()/getPermisosDeRol() en permisos.ts.
+model RolePermiso {
+  id      String @id @default(cuid())
+  role    String
+  permiso String
+
+  @@unique([role, permiso])
+  @@index([role])
 }

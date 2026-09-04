@@ -7,6 +7,7 @@ import { NextResponse } from 'next/server';
 import { z } from 'zod';
 import { prisma } from '@/lib/prisma';
 import { getSession } from '@/lib/auth';
+import { tienePermiso } from '@/lib/permisos';
 import { construirPdfEtiquetas } from '@/lib/etiquetas-pdf';
 import { MAX_CANTIDAD_TOTAL } from '@/lib/etiquetas';
 
@@ -24,7 +25,7 @@ const bodySchema = z.object({
 
 export async function POST(req: Request) {
   const session = await getSession();
-  if (!session || !['ADMIN', 'RECEPCION'].includes(session.role)) {
+  if (!session || !(await tienePermiso(session, 'etiquetas.ver'))) {
     return NextResponse.json({ error: 'No tienes permiso para esta acción' }, { status: 403 });
   }
 

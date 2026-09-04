@@ -8,6 +8,7 @@ import { NextResponse } from 'next/server';
 import { randomUUID } from 'crypto';
 import { prisma } from '@/lib/prisma';
 import { getSession } from '@/lib/auth';
+import { tienePermiso } from '@/lib/permisos';
 import { getCompanyConfig } from '@/lib/config';
 import {
   parseCSV,
@@ -52,7 +53,7 @@ const TIPOS_VALIDOS: TipoImportacion[] = ['SOLO_REGISTRAR', 'MARCAR_ENTREGADOS',
 
 export async function POST(req: Request) {
   const session = await getSession();
-  if (!session || session.role !== 'ADMIN') {
+  if (!session || !(await tienePermiso(session, 'admin.importacion'))) {
     return NextResponse.json({ error: 'No tienes permiso para esta acción' }, { status: 403 });
   }
 

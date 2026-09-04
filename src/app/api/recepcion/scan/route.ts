@@ -4,6 +4,7 @@ import { z } from 'zod';
 import { Prisma } from '@prisma/client';
 import { prisma, TRANSACTION_OPTS } from '@/lib/prisma';
 import { getSession } from '@/lib/auth';
+import { tienePermiso } from '@/lib/permisos';
 import { getCompanyConfig, getHolidaySet } from '@/lib/config';
 import { calcularCosto } from '@/lib/pricing';
 import { normalizarCodigo, canonicalizarSeparadores } from '@/lib/codigo';
@@ -55,7 +56,7 @@ export async function POST(req: NextRequest) {
   // nuevo aqui (defensa en profundidad: esta API nunca debe confiar
   // unicamente en el middleware).
   const session = await getSession();
-  if (!session || !['ADMIN', 'RECEPCION', 'ADMIN_CAJA'].includes(session.role)) {
+  if (!session || !(await tienePermiso(session, 'recepcion.registrar'))) {
     return NextResponse.json({ error: 'No tienes permiso para esta acción' }, { status: 403 });
   }
 

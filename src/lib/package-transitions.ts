@@ -9,6 +9,7 @@ import { normalizarCodigo } from '@/lib/codigo';
 import { getCompanyConfig, getHolidaySet } from '@/lib/config';
 import { calcularCosto } from '@/lib/pricing';
 import { fechaReferencia } from '@/lib/package-detail';
+import { getReservaActivaDePaquete } from '@/lib/envios';
 import type { Package, Prisma } from '@prisma/client';
 import type { PackageStatus, PaymentStatus, MotivoEntregaExcepcional } from '@/types';
 import { MOTIVO_ENTREGA_EXCEPCIONAL_LABEL } from '@/types';
@@ -27,6 +28,19 @@ export class PaqueteNoEncontradoError extends Error {
   }
 }
 
+// Fase 2 (modulo Envios): un paquete reservado en un envio en BORRADOR o
+// ya CERRADO no puede entregarse/denegarse/enviarse a deposito desde
+// aqui — evita el bug operativo real de procesar localmente un paquete
+// que ya salio (o esta por salir) hacia otra sucursal. Un envio
+// CANCELADO nunca bloquea (sus paquetes ya quedaron libres). Ver
+// getReservaActivaDePaquete() en src/lib/envios.ts.
+export class PaqueteEnEnvioError extends Error {
+  constructor(envioCodigo: string) {
+    super(`Este paquete está en el envío ${envioCodigo} hacia otra sucursal y no puede procesarse aquí. Quítalo del envío primero si corresponde.`);
+    this.name = 'PaqueteEnEnvioError';
+  }
+}
+
 async function buscarOFallar(code: string): Promise<Package> {
   const pkg = await prisma.package.findUnique({ where: { codigoNormalizado: normalizarCodigo(code) } });
   if (!pkg) throw new PaqueteNoEncontradoError(code);
@@ -38,11 +52,23 @@ async function transicionar(
   nuevoEstado: PackageStatus,
   userId: string,
   camposExtra: Record<string, unknown>,
-  nota?: string
+  nota?: string,
+  verificarSinReservaEnvio = false
 ): Promise<Package> {
   const now = new Date();
   const estadoAnterior = pkg.status;
   const actualizado = await prisma.$transaction(async (tx) => {
+    // Chequeo de reserva de Envíos DENTRO de la misma transacción que la
+    // transición de estado (nunca antes, en una consulta aparte): así el
+    // "¿está reservado?" y el "cambiar status" son una sola operación
+    // atómica bajo connection_limit=1, sin ventana donde otra request
+    // pueda colar un agregarPaquete() entre ambos pasos. Ver comentario
+    // de getReservaActivaDePaquete() en src/lib/envios.ts.
+    if (verificarSinReservaEnvio) {
+      const reserva = await getReservaActivaDePaquete(pkg.id, tx);
+      if (reserva) throw new PaqueteEnEnvioError(reserva.envioCodigo);
+    }
+
     // "where: status: estadoAnterior" es la protección contra doble
     // entrega/doble transición: si dos requests casi simultáneas leyeron
     // el mismo paquete "En Paquetería" y ambas intentan entregarlo, solo
@@ -308,13 +334,20 @@ export async function entregarPaquete(
     throw new TransicionInvalidaError('Solo se pueden entregar paquetes en estado "En Paquetería".');
   }
   const now = new Date();
-  const entregado = await transicionar(pkg, 'ENTREGADO', userId, {
-    entregaAt: now,
-    ...(opts?.observaciones !== undefined ? { observaciones: opts.observaciones } : {}),
-    ...(opts?.destinatario !== undefined ? { destinatario: opts.destinatario || null } : {}),
-    ...(opts?.destinatarioTelefono !== undefined ? { destinatarioTelefono: opts.destinatarioTelefono || null } : {}),
-    ...(opts?.destinatarioObservaciones !== undefined ? { destinatarioObservaciones: opts.destinatarioObservaciones || null } : {}),
-  });
+  const entregado = await transicionar(
+    pkg,
+    'ENTREGADO',
+    userId,
+    {
+      entregaAt: now,
+      ...(opts?.observaciones !== undefined ? { observaciones: opts.observaciones } : {}),
+      ...(opts?.destinatario !== undefined ? { destinatario: opts.destinatario || null } : {}),
+      ...(opts?.destinatarioTelefono !== undefined ? { destinatarioTelefono: opts.destinatarioTelefono || null } : {}),
+      ...(opts?.destinatarioObservaciones !== undefined ? { destinatarioObservaciones: opts.destinatarioObservaciones || null } : {}),
+    },
+    undefined,
+    true
+  );
 
   if (opts?.montoCobrado !== undefined && opts.montoCobrado !== 0) {
     return registrarPago(entregado, 'COBRO_ENTREGA', opts.montoCobrado, userId, opts.motivoCobro);
@@ -327,7 +360,7 @@ export async function denegarPaquete(code: string, userId: string): Promise<Pack
   if (pkg.status === 'ENTREGADO' || pkg.status === 'DENEGADO') {
     throw new TransicionInvalidaError('El paquete ya fue entregado o denegado.');
   }
-  return transicionar(pkg, 'DENEGADO', userId, { denegadoAt: new Date() });
+  return transicionar(pkg, 'DENEGADO', userId, { denegadoAt: new Date() }, undefined, true);
 }
 
 export async function enviarADeposito(code: string, userId: string): Promise<Package> {
@@ -335,7 +368,7 @@ export async function enviarADeposito(code: string, userId: string): Promise<Pac
   if (pkg.status !== 'EN_PAQUETERIA') {
     throw new TransicionInvalidaError('Solo paquetes en estado "En Paquetería" pueden enviarse a depósito.');
   }
-  return transicionar(pkg, 'EN_DEPOSITO', userId, { depositoAt: new Date() });
+  return transicionar(pkg, 'EN_DEPOSITO', userId, { depositoAt: new Date() }, undefined, true);
 }
 
 export async function solicitarBajarDeposito(code: string, userId: string): Promise<Package> {

@@ -15,6 +15,7 @@ import { NextResponse } from 'next/server';
 import { z } from 'zod';
 import { prisma } from '@/lib/prisma';
 import { getSession } from '@/lib/auth';
+import { tienePermiso } from '@/lib/permisos';
 import { getCompanyConfig } from '@/lib/config';
 import {
   calcularFechasLote,
@@ -75,7 +76,7 @@ const bodySchema = z
 
 export async function POST(req: Request) {
   const session = await getSession();
-  if (!session || session.role !== 'ADMIN') {
+  if (!session || !(await tienePermiso(session, 'etiquetas.generar'))) {
     return NextResponse.json({ error: 'Solo el administrador puede generar etiquetas.' }, { status: 403 });
   }
 

@@ -5,12 +5,13 @@
 // reimplementarlo.
 import { NextResponse } from 'next/server';
 import { getSession } from '@/lib/auth';
+import { tienePermiso } from '@/lib/permisos';
 import { ejecutarBackupReal, listarRespaldosOracle } from '@/lib/backup-oracle';
 import { registrarAuditoria, extraerContextoRequest } from '@/lib/auditoria';
 
 export async function GET() {
   const session = await getSession();
-  if (!session || session.role !== 'ADMIN') {
+  if (!session || !(await tienePermiso(session, 'admin.respaldos'))) {
     return NextResponse.json({ error: 'No tienes permiso para esta acción' }, { status: 403 });
   }
   const resultado = await listarRespaldosOracle();
@@ -19,7 +20,7 @@ export async function GET() {
 
 export async function POST(req: Request) {
   const session = await getSession();
-  if (!session || session.role !== 'ADMIN') {
+  if (!session || !(await tienePermiso(session, 'admin.respaldos'))) {
     return NextResponse.json({ error: 'No tienes permiso para esta acción' }, { status: 403 });
   }
 

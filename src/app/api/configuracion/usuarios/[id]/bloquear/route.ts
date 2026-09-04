@@ -2,6 +2,7 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { getSession } from '@/lib/auth';
+import { tienePermiso } from '@/lib/permisos';
 import { registrarAuditoria, extraerContextoRequest } from '@/lib/auditoria';
 import { toUsuarioDTO } from '@/lib/usuarios';
 
@@ -10,7 +11,7 @@ const BLOQUEO_MANUAL_HASTA = new Date('2999-12-31T00:00:00Z');
 
 export async function POST(req: Request, { params }: { params: { id: string } }) {
   const session = await getSession();
-  if (!session || session.role !== 'ADMIN') {
+  if (!session || !(await tienePermiso(session, 'admin.usuarios'))) {
     return NextResponse.json({ error: 'No tienes permiso para esta acción' }, { status: 403 });
   }
   if (params.id === session.id) {

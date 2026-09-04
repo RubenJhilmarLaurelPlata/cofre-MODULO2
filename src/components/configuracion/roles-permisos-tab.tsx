@@ -1,91 +1,169 @@
 'use client';
 
 // src/components/configuracion/roles-permisos-tab.tsx
-// Puramente informativo: muestra los 5 roles existentes y que modulos
-// puede ver cada uno, leyendo directamente de PERMISOS_POR_MODULO
-// (types/index.ts) — la misma fuente de verdad que usa el middleware.
-// No permite modificar permisos individuales, tal como se pidio.
-import { Check, Info } from 'lucide-react';
+// Ya NO es informativo: cada checkbox persiste en RolePermiso via
+// PUT /api/configuracion/roles/[role]/permisos (ver ese archivo) — deja
+// de depender de un Record hardcodeado en TypeScript.
+import * as React from 'react';
+import { CheckCircle2, XCircle, ShieldCheck, Save } from 'lucide-react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { ROLES, ROLE_LABELS, PERMISOS_POR_MODULO, type Role } from '@/types';
+import { Button } from '@/components/ui/button';
+import { cn } from '@/lib/utils';
+import { ROLES, ROLE_LABELS, type Role } from '@/types';
 
-const MODULO_LABELS: Record<keyof typeof PERMISOS_POR_MODULO, string> = {
-  dashboard: 'Dashboard',
-  recepcion: 'Recepción',
-  entrega: 'Entrega',
-  deposito: 'Depósito',
-  buscador: 'Buscador',
-  etiquetas: 'Etiquetas',
-  reportes: 'Reportes',
-  finanzas: 'Finanzas',
-  importacion: 'Importación',
-  configuracion: 'Configuración',
-};
+interface PermisoDef {
+  key: string;
+  modulo: string;
+  nombre: string;
+  descripcion: string;
+}
+interface GrupoDef {
+  modulo: string;
+  label: string;
+}
+interface RolConPermisos {
+  role: Role;
+  label: string;
+  permisos: string[];
+}
 
 export function RolesPermisosTab() {
-  const modulos = Object.keys(PERMISOS_POR_MODULO) as Array<keyof typeof PERMISOS_POR_MODULO>;
+  const [grupos, setGrupos] = React.useState<GrupoDef[]>([]);
+  const [permisos, setPermisos] = React.useState<PermisoDef[]>([]);
+  const [roles, setRoles] = React.useState<RolConPermisos[]>([]);
+  const [rolActivo, setRolActivo] = React.useState<Role>('ADMIN');
+  const [seleccion, setSeleccion] = React.useState<Set<string>>(new Set());
+  const [cargando, setCargando] = React.useState(true);
+  const [guardando, setGuardando] = React.useState(false);
+  const [feedback, setFeedback] = React.useState<{ ok: boolean; mensaje: string } | null>(null);
+
+  const cargar = React.useCallback(async () => {
+    setCargando(true);
+    try {
+      const res = await fetch('/api/configuracion/roles');
+      const data = await res.json();
+      setGrupos(data.grupos);
+      setPermisos(data.permisos);
+      setRoles(data.roles);
+      const rol = data.roles.find((r: RolConPermisos) => r.role === rolActivo) ?? data.roles[0];
+      setSeleccion(new Set<string>(rol?.permisos ?? []));
+    } finally {
+      setCargando(false);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  React.useEffect(() => {
+    cargar();
+  }, [cargar]);
+
+  function cambiarRol(role: Role) {
+    setRolActivo(role);
+    setFeedback(null);
+    const rol = roles.find((r) => r.role === role);
+    setSeleccion(new Set<string>(rol?.permisos ?? []));
+  }
+
+  function toggle(key: string) {
+    setSeleccion((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  }
+
+  async function guardar() {
+    setGuardando(true);
+    setFeedback(null);
+    try {
+      const res = await fetch(`/api/configuracion/roles/${rolActivo}/permisos`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ permisos: [...seleccion] }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setFeedback({ ok: false, mensaje: data.error ?? 'No se pudo guardar.' });
+        return;
+      }
+      setRoles((prev) => prev.map((r) => (r.role === rolActivo ? { ...r, permisos: [...seleccion] } : r)));
+      setFeedback({ ok: true, mensaje: `Permisos de ${ROLE_LABELS[rolActivo]} actualizados.` });
+    } catch {
+      setFeedback({ ok: false, mensaje: 'Error de conexión. Intenta de nuevo.' });
+    } finally {
+      setGuardando(false);
+    }
+  }
+
+  if (cargando) return <p className="py-8 text-center text-sm text-gray-400 dark:text-gray-500">Cargando…</p>;
 
   return (
-    <div className="space-y-5">
-      <Card>
-        <CardHeader>
-          <CardTitle>Roles del sistema</CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-2">
-          {ROLES.map((r) => (
-            <div key={r} className="flex items-center justify-between border-b border-gray-100 dark:border-gray-800/60 py-2 text-sm last:border-0">
-              <span className="font-medium text-ink dark:text-gray-100">{ROLE_LABELS[r]}</span>
-              <span className="font-mono text-xs text-gray-400 dark:text-gray-500">{r}</span>
-            </div>
-          ))}
-        </CardContent>
-      </Card>
-
-      <Card>
-        <CardHeader>
-          <div className="flex items-center justify-between">
-            <CardTitle>Permisos por módulo</CardTitle>
-            <span className="flex items-center gap-1 text-xs text-gray-400 dark:text-gray-500">
-              <Info className="h-3.5 w-3.5" /> Solo informativo
+    <Card>
+      <CardHeader>
+        <div className="flex items-center justify-between">
+          <CardTitle>Roles y permisos</CardTitle>
+          {feedback && (
+            <span className={cn('flex items-center gap-1 text-xs', feedback.ok ? 'text-emerald-600 dark:text-emerald-400' : 'text-red-600 dark:text-red-400')}>
+              {feedback.ok ? <CheckCircle2 className="h-3.5 w-3.5" /> : <XCircle className="h-3.5 w-3.5" />}
+              {feedback.mensaje}
             </span>
-          </div>
-        </CardHeader>
-        <CardContent>
-          <p className="mb-4 text-xs text-ink-soft dark:text-gray-400">
-            Los permisos los administra el sistema y no se pueden editar individualmente desde aquí — para cambiar el rol de un usuario, ve a
-            la pestaña Usuarios.
-          </p>
-          <div className="scrollbar-thin overflow-x-auto rounded-lg border border-gray-100 dark:border-gray-800/60">
-            <table className="w-full min-w-[560px] text-left text-sm">
-              <thead>
-                <tr className="border-b border-gray-100 dark:border-gray-800/60 bg-gray-50 dark:bg-gray-800/40">
-                  <th className="px-3 py-2 text-xs font-semibold text-ink-soft dark:text-gray-400">Módulo</th>
-                  {ROLES.map((r) => (
-                    <th key={r} className="px-3 py-2 text-center text-xs font-semibold text-ink-soft dark:text-gray-400">
-                      {ROLE_LABELS[r]}
-                    </th>
+          )}
+        </div>
+      </CardHeader>
+      <CardContent className="space-y-5">
+        <div className="flex flex-wrap gap-1 rounded-lg bg-gray-100 dark:bg-gray-800 p-1">
+          {ROLES.map((role) => (
+            <button
+              key={role}
+              onClick={() => cambiarRol(role)}
+              className={cn(
+                'rounded-md px-3 py-1.5 text-xs font-medium transition-colors',
+                rolActivo === role ? 'bg-white dark:bg-gray-900 text-ink dark:text-gray-100 shadow-sm' : 'text-ink-soft dark:text-gray-400 hover:text-ink dark:hover:text-gray-100'
+              )}
+            >
+              {ROLE_LABELS[role]}
+            </button>
+          ))}
+        </div>
+
+        <p className="flex items-center gap-1.5 text-xs text-gray-400 dark:text-gray-500">
+          <ShieldCheck className="h-3.5 w-3.5" />
+          Marca lo que puede hacer <strong className="text-ink dark:text-gray-200">{ROLE_LABELS[rolActivo]}</strong>. Los cambios se aplican de inmediato, sin reiniciar el sistema.
+        </p>
+
+        <div className="space-y-5">
+          {grupos.map((grupo) => {
+            const delGrupo = permisos.filter((p) => p.modulo === grupo.modulo);
+            if (delGrupo.length === 0) return null;
+            return (
+              <div key={grupo.modulo}>
+                <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-ink-soft dark:text-gray-400">{grupo.label}</p>
+                <div className="space-y-1 rounded-lg border border-gray-100 dark:border-gray-800/60 p-2">
+                  {delGrupo.map((p) => (
+                    <label key={p.key} className="flex cursor-pointer items-start gap-3 rounded-md px-2 py-1.5 hover:bg-gray-50 dark:hover:bg-gray-800/40">
+                      <input
+                        type="checkbox"
+                        className="mt-0.5 h-4 w-4 shrink-0 rounded border-gray-300 dark:border-gray-700 text-brand-600 focus:ring-brand-500"
+                        checked={seleccion.has(p.key)}
+                        onChange={() => toggle(p.key)}
+                      />
+                      <span>
+                        <span className="block text-sm font-medium text-ink dark:text-gray-100">{p.nombre}</span>
+                        <span className="block text-xs text-gray-400 dark:text-gray-500">{p.descripcion}</span>
+                      </span>
+                    </label>
                   ))}
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-gray-100 dark:divide-gray-800">
-                {modulos.map((m) => (
-                  <tr key={m}>
-                    <td className="px-3 py-2 font-medium text-ink dark:text-gray-100">{MODULO_LABELS[m]}</td>
-                    {ROLES.map((r) => {
-                      const permitido = (PERMISOS_POR_MODULO[m] as readonly Role[]).includes(r);
-                      return (
-                        <td key={r} className="px-3 py-2 text-center">
-                          {permitido ? <Check className="mx-auto h-4 w-4 text-emerald-500" /> : <span className="text-gray-300 dark:text-gray-600">—</span>}
-                        </td>
-                      );
-                    })}
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </CardContent>
-      </Card>
-    </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+
+        <Button onClick={guardar} loading={guardando}>
+          <Save className="h-4 w-4" /> Guardar permisos de {ROLE_LABELS[rolActivo]}
+        </Button>
+      </CardContent>
+    </Card>
   );
 }

@@ -7,6 +7,7 @@
 // src/app/api/importacion/route.ts, "No quiero errores 504 por diseño").
 import type { NextRequest } from 'next/server';
 import { getSession } from '@/lib/auth';
+import { tienePermiso } from '@/lib/permisos';
 import { obtenerJob } from '@/lib/importacion-jobs';
 
 export const runtime = 'nodejs';
@@ -15,7 +16,7 @@ const INTERVALO_MS = 400;
 
 export async function GET(req: NextRequest, { params }: { params: { jobId: string } }) {
   const session = await getSession();
-  if (!session || session.role !== 'ADMIN') {
+  if (!session || !(await tienePermiso(session, 'admin.importacion'))) {
     return new Response('No tienes permiso para esta acción', { status: 403 });
   }
 

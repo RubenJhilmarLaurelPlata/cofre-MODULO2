@@ -1,14 +1,13 @@
 // src/app/api/reportes/operadores/route.ts
 import { NextResponse } from 'next/server';
 import { getSession } from '@/lib/auth';
+import { tienePermiso } from '@/lib/permisos';
 import { getReporteOperadores, parseFiltrosReporte } from '@/lib/reportes';
-import type { Role } from '@/types';
 
-const ROLES_PERMITIDOS: Role[] = ['ADMIN', 'SUPERVISOR'];
 
 export async function GET(req: Request) {
   const session = await getSession();
-  if (!session || !ROLES_PERMITIDOS.includes(session.role)) {
+  if (!session || !(await tienePermiso(session, 'reportes.ver'))) {
     return NextResponse.json({ error: 'No tienes permiso para esta acción' }, { status: 403 });
   }
 

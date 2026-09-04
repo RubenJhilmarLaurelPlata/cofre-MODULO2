@@ -1,11 +1,12 @@
 // src/app/api/configuracion/auditoria/route.ts
 import { NextResponse } from 'next/server';
 import { getSession } from '@/lib/auth';
+import { tienePermiso } from '@/lib/permisos';
 import { buscarAuditoria } from '@/lib/auditoria';
 
 export async function GET(req: Request) {
   const session = await getSession();
-  if (!session || session.role !== 'ADMIN') {
+  if (!session || !(await tienePermiso(session, 'admin.auditoria'))) {
     return NextResponse.json({ error: 'No tienes permiso para esta acción' }, { status: 403 });
   }
 

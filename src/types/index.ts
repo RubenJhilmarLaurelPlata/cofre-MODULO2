@@ -54,6 +54,11 @@ export interface SessionUser {
 export const PERMISOS_POR_MODULO = {
   dashboard: ['ADMIN', 'SUPERVISOR', 'RECEPCION', 'ENTREGA', 'CONSULTA'],
   recepcion: ['ADMIN', 'RECEPCION', 'ADMIN_CAJA'],
+  // Fase 2: filtro grueso "¿puede este rol abrir el módulo?" — quién
+  // puede ejecutar cada acción puntual (crear/agregar/cerrar/cancelar) lo
+  // decide el catálogo granular de src/lib/permisos.ts (RolePermiso),
+  // consultado dentro de cada ruta.
+  envios: ['ADMIN', 'RECEPCION', 'ADMIN_CAJA'],
   entrega: ['ADMIN', 'ENTREGA', 'ADMIN_CAJA'],
   deposito: ['ADMIN', 'ENTREGA', 'RECEPCION', 'ADMIN_CAJA'],
   buscador: ['ADMIN', 'SUPERVISOR', 'ENTREGA', 'CONSULTA', 'ADMIN_CAJA'],
@@ -81,6 +86,7 @@ export function puedeAcceder(role: Role, modulo: Modulo): boolean {
 const ORDEN_MODULOS_PREFERIDO: readonly Modulo[] = [
   'dashboard',
   'recepcion',
+  'envios',
   'entrega',
   'deposito',
   'buscador',

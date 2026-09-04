@@ -2,6 +2,7 @@
 import { NextResponse } from 'next/server';
 import { z } from 'zod';
 import { getSession } from '@/lib/auth';
+import { tienePermiso } from '@/lib/permisos';
 import { resolverCodigosReimpresion, EtiquetasError } from '@/lib/etiquetas';
 import { registrarAuditoria, extraerContextoRequest } from '@/lib/auditoria';
 
@@ -13,7 +14,7 @@ const bodySchema = z.union([
 
 export async function POST(req: Request) {
   const session = await getSession();
-  if (!session || !['ADMIN', 'RECEPCION'].includes(session.role)) {
+  if (!session || !(await tienePermiso(session, 'etiquetas.reimprimir'))) {
     return NextResponse.json({ error: 'No tienes permiso para esta acción' }, { status: 403 });
   }
 

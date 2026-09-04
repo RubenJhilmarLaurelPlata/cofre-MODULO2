@@ -8,6 +8,7 @@
 import { NextResponse } from 'next/server';
 import { z } from 'zod';
 import { getSession } from '@/lib/auth';
+import { tienePermiso } from '@/lib/permisos';
 import { restaurarDesdeOracle } from '@/lib/backup-oracle';
 import { registrarAuditoria, extraerContextoRequest } from '@/lib/auditoria';
 
@@ -15,7 +16,7 @@ const bodySchema = z.object({ nombreArchivo: z.string().trim().min(1).max(300) }
 
 export async function POST(req: Request) {
   const session = await getSession();
-  if (!session || session.role !== 'ADMIN') {
+  if (!session || !(await tienePermiso(session, 'admin.respaldos'))) {
     return NextResponse.json({ error: 'No tienes permiso para esta acción' }, { status: 403 });
   }
 

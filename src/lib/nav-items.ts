@@ -2,6 +2,7 @@
 import {
   LayoutDashboard,
   PackagePlus,
+  Send,
   Truck,
   Archive,
   Search,
@@ -36,6 +37,7 @@ export interface NavItem {
 export const NAV_ITEMS: NavItem[] = [
   { href: '/dashboard', label: 'Dashboard', icon: LayoutDashboard, modulo: 'dashboard', grupo: 'operacion' },
   { href: '/recepcion', label: 'Recepción', icon: PackagePlus, modulo: 'recepcion', grupo: 'operacion' },
+  { href: '/envios', label: 'Envíos', icon: Send, modulo: 'envios', grupo: 'operacion' },
   { href: '/entrega', label: 'Entrega', icon: Truck, modulo: 'entrega', grupo: 'operacion' },
   { href: '/deposito', label: 'Depósito', icon: Archive, modulo: 'deposito', grupo: 'operacion' },
   { href: '/buscador', label: 'Buscador', icon: Search, modulo: 'buscador', grupo: 'operacion' },

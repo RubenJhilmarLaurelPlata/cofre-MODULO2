@@ -1,14 +1,12 @@
 // src/app/api/buscador/[code]/historial/route.ts
 import { NextResponse } from 'next/server';
 import { getSession } from '@/lib/auth';
+import { tienePermiso } from '@/lib/permisos';
 import { getPackageHistorial } from '@/lib/package-detail';
-import type { Role } from '@/types';
-
-const ROLES_PERMITIDOS: Role[] = ['ADMIN', 'SUPERVISOR', 'ENTREGA', 'CONSULTA', 'ADMIN_CAJA'];
 
 export async function GET(_req: Request, { params }: { params: { code: string } }) {
   const session = await getSession();
-  if (!session || !ROLES_PERMITIDOS.includes(session.role)) {
+  if (!session || !(await tienePermiso(session, 'buscador.ver_historial'))) {
     return NextResponse.json({ error: 'No tienes permiso para esta acción' }, { status: 403 });
   }
 

@@ -2,11 +2,12 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { getSession } from '@/lib/auth';
+import { tienePermiso } from '@/lib/permisos';
 import { eliminarLoteEtiquetas, LoteEtiquetasNoEncontradoError, LoteEtiquetasConCodigosUsadosError } from '@/lib/etiquetas';
 
 export async function GET(_req: Request, { params }: { params: { id: string } }) {
   const session = await getSession();
-  if (!session || !['ADMIN', 'RECEPCION'].includes(session.role)) {
+  if (!session || !(await tienePermiso(session, 'etiquetas.ver'))) {
     return NextResponse.json({ error: 'No tienes permiso para esta acción' }, { status: 403 });
   }
 
@@ -44,7 +45,7 @@ export async function GET(_req: Request, { params }: { params: { id: string } })
  */
 export async function DELETE(_req: Request, { params }: { params: { id: string } }) {
   const session = await getSession();
-  if (!session || session.role !== 'ADMIN') {
+  if (!session || !(await tienePermiso(session, 'etiquetas.eliminar_lote'))) {
     return NextResponse.json({ error: 'No tienes permiso para esta acción' }, { status: 403 });
   }
 

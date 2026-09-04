@@ -2,12 +2,13 @@
 import { NextResponse } from 'next/server';
 import { z } from 'zod';
 import { getSession } from '@/lib/auth';
+import { tienePermiso } from '@/lib/permisos';
 import { getMonthLetters, setMonthLetters } from '@/lib/etiquetas';
 import { registrarAuditoria, extraerContextoRequest } from '@/lib/auditoria';
 
 export async function GET() {
   const session = await getSession();
-  if (!session || !['ADMIN', 'RECEPCION'].includes(session.role)) {
+  if (!session || !(await tienePermiso(session, 'etiquetas.ver'))) {
     return NextResponse.json({ error: 'No tienes permiso para esta acción' }, { status: 403 });
   }
   return NextResponse.json(await getMonthLetters());
@@ -32,7 +33,7 @@ const bodySchema = z.object({
 
 export async function PUT(req: Request) {
   const session = await getSession();
-  if (!session || session.role !== 'ADMIN') {
+  if (!session || !(await tienePermiso(session, 'etiquetas.configurar_meses'))) {
     return NextResponse.json({ error: 'Solo el administrador puede configurar la letra de los meses.' }, { status: 403 });
   }
 

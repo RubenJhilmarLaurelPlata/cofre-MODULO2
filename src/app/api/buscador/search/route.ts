@@ -7,12 +7,11 @@ import { z } from 'zod';
 import type { Prisma } from '@prisma/client';
 import { prisma } from '@/lib/prisma';
 import { getSession } from '@/lib/auth';
+import { tienePermiso } from '@/lib/permisos';
 import { toPackageDetailDTOList, construirFiltroTextoPaquete } from '@/lib/package-detail';
 import { getLotesPorPackageId } from '@/lib/importacion';
 import { PACKAGE_STATUSES } from '@/types';
-import type { Role } from '@/types';
 
-const ROLES_PERMITIDOS: Role[] = ['ADMIN', 'SUPERVISOR', 'ENTREGA', 'CONSULTA', 'ADMIN_CAJA'];
 const RESULT_LIMIT = 60;
 
 const querySchema = z.object({
@@ -24,7 +23,7 @@ const querySchema = z.object({
 
 export async function GET(req: Request) {
   const session = await getSession();
-  if (!session || !ROLES_PERMITIDOS.includes(session.role)) {
+  if (!session || !(await tienePermiso(session, 'buscador.buscar'))) {
     return NextResponse.json({ error: 'No tienes permiso para esta acción' }, { status: 403 });
   }
 

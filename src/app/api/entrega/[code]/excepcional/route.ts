@@ -8,6 +8,7 @@
 import { NextResponse } from 'next/server';
 import { z } from 'zod';
 import { getSession } from '@/lib/auth';
+import { tienePermiso } from '@/lib/permisos';
 import { getCompanyConfig } from '@/lib/config';
 import { prisma } from '@/lib/prisma';
 import { canonicalizarSeparadores } from '@/lib/codigo';
@@ -15,9 +16,9 @@ import { entregaExcepcional, TransicionInvalidaError, SerieNoConfiguradaError } 
 import { getPackageDetail } from '@/lib/package-detail';
 import { MOTIVOS_ENTREGA_EXCEPCIONAL, type Role } from '@/types';
 
-const ROLES_PERMITIDOS: Role[] = ['ADMIN', 'ADMIN_CAJA'];
 // Exonerar un cobro (Bs0 deliberado) es mas sensible que la entrega
-// excepcional en si — requiere ADMIN, no basta ADMIN_CAJA.
+// excepcional en si — requiere ADMIN, no basta ADMIN_CAJA. Es una regla
+// de negocio fija, no una dimension del catalogo de permisos.
 const ROLES_EXONERACION: Role[] = ['ADMIN'];
 
 // Entero, finito, positivo: nunca centavos, nunca negativo, y NUNCA Bs0
@@ -61,7 +62,7 @@ const bodySchema = z
 
 export async function POST(req: Request, { params }: { params: { code: string } }) {
   const session = await getSession();
-  if (!session || !ROLES_PERMITIDOS.includes(session.role)) {
+  if (!session || !(await tienePermiso(session, 'entrega.excepcional'))) {
     return NextResponse.json({ error: 'No tienes permiso para realizar una entrega excepcional.' }, { status: 403 });
   }
 

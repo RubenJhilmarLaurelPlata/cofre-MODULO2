@@ -7,13 +7,14 @@
 import { NextResponse, type NextRequest } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { getSession } from '@/lib/auth';
+import { tienePermiso } from '@/lib/permisos';
 import { eliminarLoteImportacion, LoteNoEncontradoError, LoteConEfectoRealError, ESTADOS_CON_EFECTO_REAL } from '@/lib/importacion';
 
 const TAMANO_PAGINA = 100;
 
 export async function GET(req: NextRequest, { params }: { params: { id: string } }) {
   const session = await getSession();
-  if (!session || session.role !== 'ADMIN') {
+  if (!session || !(await tienePermiso(session, 'admin.importacion'))) {
     return NextResponse.json({ error: 'No tienes permiso para esta acción' }, { status: 403 });
   }
 
@@ -90,7 +91,7 @@ export async function GET(req: NextRequest, { params }: { params: { id: string }
 /** Elimina un lote completo — solo si ninguna de sus filas tuvo efecto real (ver eliminarLoteImportacion en src/lib/importacion.ts). Transaccional; nunca toca Package/Pago/PackageHistory. */
 export async function DELETE(_req: Request, { params }: { params: { id: string } }) {
   const session = await getSession();
-  if (!session || session.role !== 'ADMIN') {
+  if (!session || !(await tienePermiso(session, 'admin.importacion'))) {
     return NextResponse.json({ error: 'No tienes permiso para esta acción' }, { status: 403 });
   }
 

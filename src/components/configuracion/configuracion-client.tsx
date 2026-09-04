@@ -6,6 +6,7 @@ import {
   Building2,
   Users,
   ShieldCheck,
+  Send,
   Wallet,
   CalendarDays,
   Type,
@@ -22,6 +23,7 @@ import { cn } from '@/lib/utils';
 import { EmpresaTab } from '@/components/configuracion/empresa-tab';
 import { UsuariosTab } from '@/components/configuracion/usuarios-tab';
 import { RolesPermisosTab } from '@/components/configuracion/roles-permisos-tab';
+import { DestinosTab } from '@/components/configuracion/destinos-tab';
 import { TarifasTab } from '@/components/configuracion/tarifas-tab';
 import { LectorTab } from '@/components/configuracion/lector-tab';
 import { FeriadosTab } from '@/components/configuracion/feriados-tab';
@@ -38,6 +40,7 @@ type TabId =
   | 'empresa'
   | 'usuarios'
   | 'roles'
+  | 'destinos'
   | 'tarifas'
   | 'lector'
   | 'feriados'
@@ -54,6 +57,7 @@ const TABS: Array<{ id: TabId; label: string; icon: typeof Building2 }> = [
   { id: 'empresa', label: 'Empresa', icon: Building2 },
   { id: 'usuarios', label: 'Usuarios', icon: Users },
   { id: 'roles', label: 'Roles y permisos', icon: ShieldCheck },
+  { id: 'destinos', label: 'Destinos', icon: Send },
   { id: 'tarifas', label: 'Tarifas', icon: Wallet },
   { id: 'lector', label: 'Lector S700', icon: ScanLine },
   { id: 'feriados', label: 'Feriados', icon: CalendarDays },
@@ -90,6 +94,7 @@ export function ConfiguracionClient() {
       {tab === 'empresa' && <EmpresaTab />}
       {tab === 'usuarios' && <UsuariosTab />}
       {tab === 'roles' && <RolesPermisosTab />}
+      {tab === 'destinos' && <DestinosTab />}
       {tab === 'tarifas' && <TarifasTab />}
       {tab === 'lector' && <LectorTab />}
       {tab === 'feriados' && <FeriadosTab />}

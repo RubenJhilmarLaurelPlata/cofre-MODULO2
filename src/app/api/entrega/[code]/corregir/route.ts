@@ -10,6 +10,7 @@ import { NextResponse } from 'next/server';
 import { z } from 'zod';
 import { prisma } from '@/lib/prisma';
 import { getSession } from '@/lib/auth';
+import { tienePermiso } from '@/lib/permisos';
 import { corregirCobroAbsoluto } from '@/lib/package-transitions';
 import { registrarAuditoria, extraerContextoRequest } from '@/lib/auditoria';
 import { getPackageDetail } from '@/lib/package-detail';
@@ -37,7 +38,7 @@ const bodySchema = z
 
 export async function PATCH(req: Request, { params }: { params: { code: string } }) {
   const session = await getSession();
-  if (!session || session.role !== 'ADMIN') {
+  if (!session || !(await tienePermiso(session, 'entrega.corregir'))) {
     return NextResponse.json({ error: 'Solo el administrador puede corregir datos después de la entrega.' }, { status: 403 });
   }
 

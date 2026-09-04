@@ -6,11 +6,12 @@
 // "continuar" nunca debe arrastrar el numero de otro dia.
 import { NextResponse } from 'next/server';
 import { getSession } from '@/lib/auth';
+import { tienePermiso } from '@/lib/permisos';
 import { obtenerUltimoConsecutivoDelDia } from '@/lib/etiquetas';
 
 export async function GET(req: Request) {
   const session = await getSession();
-  if (!session || session.role !== 'ADMIN') {
+  if (!session || !(await tienePermiso(session, 'etiquetas.generar'))) {
     return NextResponse.json({ error: 'No tienes permiso para esta acción' }, { status: 403 });
   }
 
