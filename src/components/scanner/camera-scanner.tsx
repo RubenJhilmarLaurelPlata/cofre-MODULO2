@@ -12,17 +12,25 @@
 // 4 llamadores existentes no pasan este prop, asi que su comportamiento
 // no cambia en absoluto.
 //
-// Estrategia de deteccion (en ese orden):
-//   1. BarcodeDetector nativo del navegador, si existe y declara soporte
-//      para "code_128" — es la via mas rapida y liviana (no descarga
-//      ninguna libreria), disponible hoy en Chrome/Edge de escritorio y
-//      Android. Se consulta getSupportedFormats() en vez de asumirlo.
-//   2. @zxing/library como respaldo universal — necesario en iOS
-//      Safari/Chrome (donde BarcodeDetector no existe) y en cualquier
-//      navegador donde el nativo no soporte Code128.
-// Ambas vias terminan en la MISMA funcion de aceptacion (normalizacion,
-// cooldown anti-repeticion, callback) — nunca hay dos logicas distintas
-// de "que hacer con el texto detectado".
+// Estrategia de deteccion:
+//   - Android (ver src/lib/scanner/plataforma.ts): @zxing/library
+//     DIRECTO desde el arranque. Confirmado en dispositivo real (Infinix
+//     + Chrome, Fase 4.2): BarcodeDetector.getSupportedFormats() declara
+//     soporte, pero detect() nunca encuentra el QR real en cuadro y
+//     nunca lanza ninguna excepcion — asi que ni siquiera el watchdog de
+//     iniciarNativo() (pensado para EXCEPCIONES repetidas) llega a notar
+//     que deberia pasar a zxing. En vez de esperar eso, en Android se va
+//     directo a la via que SI funciona.
+//   - Cualquier otro navegador (desktop Chrome/Edge, y cualquiera que no
+//     sea Android): BarcodeDetector nativo si existe y declara soporte
+//     del formato pedido (mas rapido, no descarga ninguna libreria), con
+//     @zxing/library como respaldo — necesario en iOS Safari/Chrome
+//     (donde BarcodeDetector no existe) y en cualquier navegador donde
+//     el nativo no soporte el formato pedido, o dejo de detectar tras
+//     MAX_FALLOS_NATIVO_CONSECUTIVOS excepciones seguidas.
+// Todas las vias terminan en la MISMA funcion de aceptacion
+// (normalizacion, cooldown anti-repeticion, callback) — nunca hay dos
+// logicas distintas de "que hacer con el texto detectado".
 //
 // Arranca la camara automaticamente al montarse (autoStart, por defecto
 // true): el operador no debe pulsar un boton aparte para "activarla"
@@ -32,6 +40,7 @@ import * as React from 'react';
 import { Camera, CameraOff, AlertCircle, ScanLine, RotateCcw, QrCode } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { setCameraActiva } from '@/lib/scanner/camera-provider';
+import { esAndroid } from '@/lib/scanner/plataforma';
 import { normalizarEntradaEscaneo } from '@/lib/codigo';
 import { playSound, desbloquearAudio } from '@/lib/sound';
 import { vibrar } from '@/lib/haptics';
@@ -280,23 +289,35 @@ export function CameraScanner({ onDetect, cooldownMs = 1800, autoStart = true, f
         throw Object.assign(new Error('Contexto no seguro'), { name: 'InsecureContextError' });
       }
 
-      const BarcodeDetectorCtor = (window as unknown as { BarcodeDetector?: new (opts: { formats: string[] }) => { detect(s: CanvasImageSource): Promise<Array<{ rawValue: string }>> } }).BarcodeDetector;
       let usoNativo = false;
-      if (BarcodeDetectorCtor) {
-        try {
-          const formatosSoportados: string[] = await (
-            window as unknown as { BarcodeDetector: { getSupportedFormats(): Promise<string[]> } }
-          ).BarcodeDetector.getSupportedFormats();
-          if (formats.every((f) => formatosSoportados.includes(f))) {
-            await iniciarNativo(BarcodeDetectorCtor);
-            usoNativo = true;
-          }
-        } catch {
-          // Si el nativo falla al consultarse/arrancar, se sigue de largo al respaldo zxing — nunca se deja al operador sin camara por esto.
-        }
-      }
-      if (!usoNativo) {
+      // Fase 4.2 (causa raiz confirmada en dispositivo real: Infinix +
+      // Chrome — la camara abre y encuadra el QR, pero detect() nunca
+      // encuentra nada, sin lanzar ninguna excepcion que el watchdog de
+      // iniciarNativo() pueda contar): en Android se usa zxing como via
+      // PRINCIPAL desde el arranque, sin pasar primero por
+      // BarcodeDetector. BarcodeDetector NO se elimina — sigue siendo la
+      // via principal para cualquier otro navegador (desktop Chrome/Edge
+      // y cualquiera que no sea Android), exactamente igual que antes.
+      if (esAndroid()) {
         await iniciarZxing();
+      } else {
+        const BarcodeDetectorCtor = (window as unknown as { BarcodeDetector?: new (opts: { formats: string[] }) => { detect(s: CanvasImageSource): Promise<Array<{ rawValue: string }>> } }).BarcodeDetector;
+        if (BarcodeDetectorCtor) {
+          try {
+            const formatosSoportados: string[] = await (
+              window as unknown as { BarcodeDetector: { getSupportedFormats(): Promise<string[]> } }
+            ).BarcodeDetector.getSupportedFormats();
+            if (formats.every((f) => formatosSoportados.includes(f))) {
+              await iniciarNativo(BarcodeDetectorCtor);
+              usoNativo = true;
+            }
+          } catch {
+            // Si el nativo falla al consultarse/arrancar, se sigue de largo al respaldo zxing — nunca se deja al operador sin camara por esto.
+          }
+        }
+        if (!usoNativo) {
+          await iniciarZxing();
+        }
       }
 
       // Ultimo chequeo antes de marcar la camara como activa: si el
