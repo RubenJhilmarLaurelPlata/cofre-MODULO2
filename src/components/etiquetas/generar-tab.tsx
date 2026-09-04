@@ -9,6 +9,7 @@ import { Input, Label } from '@/components/ui/input';
 import { cn } from '@/lib/utils';
 import { LabelPreview } from '@/components/etiquetas/label-preview';
 import { MesLetrasConfig } from '@/components/etiquetas/mes-letras-config';
+import { mananaStr } from '@/lib/etiquetas-fechas-cliente';
 import type { LabelDescriptor, LoteDTO } from '@/lib/etiquetas';
 
 export interface SerieInfo {
@@ -80,6 +81,7 @@ export function GenerarTab({
 
   const [ultimoLote, setUltimoLote] = React.useState<LoteDTO | null>(null);
   const [cargandoUltimoLote, setCargandoUltimoLote] = React.useState(false);
+  const [cargandoContinuar, setCargandoContinuar] = React.useState(false);
 
   const [generando, setGenerando] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
@@ -128,9 +130,30 @@ export function GenerarTab({
     };
   }, [inicial]);
 
-  function continuarLote() {
-    const base = ultimoLote?.ultimoConsecutivo ?? serieExistente?.correlativo ?? 0;
-    setConsecutivoInicial(base + 1);
+  // La numeración es por DÍA + SERIE (ver generarLote en
+  // src/lib/etiquetas.ts): "Continuar lote" solo tiene sentido para un
+  // único día (agregar más etiquetas a un día que ya tiene algunas
+  // impresas) — nunca debe arrastrar el consecutivo de OTRO día. Antes
+  // usaba `ultimoLote.ultimoConsecutivo` (el lote más reciente de esta
+  // inicial, sin importar qué día era) como base, lo que hacía que
+  // "continuar" hoy con el número de ayer terminara pasándose de 210 a
+  // 211+ dentro del mismo día. Ahora consulta el consecutivo real ya
+  // usado PARA EL DÍA elegido en el formulario (obtenerUltimoConsecutivoDelDia).
+  const diaUnico = modo === 'hoy' ? hoyStr() : modo === 'manana' ? mananaStr() : modo === 'especifica' ? fecha : null;
+
+  async function continuarLote() {
+    if (!inicial.trim() || !diaUnico || cargandoContinuar) return;
+    setCargandoContinuar(true);
+    try {
+      const res = await fetch(`/api/etiquetas/ultimo-consecutivo?inicial=${encodeURIComponent(inicial.trim().toUpperCase())}&fecha=${diaUnico}`);
+      const data = await res.json();
+      const base = res.ok ? (data.ultimoConsecutivo ?? 0) : 0;
+      setConsecutivoInicial(base + 1);
+    } catch {
+      // Sin conexión: deja el consecutivo como estaba, no adivina.
+    } finally {
+      setCargandoContinuar(false);
+    }
   }
 
   function nuevoLote() {
@@ -361,13 +384,25 @@ export function GenerarTab({
             </div>
 
             <div className="flex flex-wrap items-center gap-2">
-              <Button variant="secondary" size="sm" onClick={continuarLote} disabled={cargandoUltimoLote}>
+              <Button
+                variant="secondary"
+                size="sm"
+                onClick={continuarLote}
+                loading={cargandoContinuar}
+                disabled={!diaUnico || !inicial.trim()}
+                title={diaUnico ? undefined : 'Solo disponible para Hoy, Mañana o Fecha específica — en Semana completa y Rango cada día siempre reinicia en 1.'}
+              >
                 <ArrowRight className="h-3.5 w-3.5" /> Continuar lote
               </Button>
               <Button variant="ghost" size="sm" onClick={nuevoLote}>
                 <RotateCcw className="h-3.5 w-3.5" /> Nuevo lote
               </Button>
             </div>
+            {!diaUnico && (
+              <p className="text-xs text-gray-400 dark:text-gray-500">
+                &quot;Continuar lote&quot; no aplica a Semana completa/Rango: cada día siempre empieza en 1, sin importar lo generado antes.
+              </p>
+            )}
 
             {cargandoUltimoLote ? (
               <p className="text-xs text-gray-400 dark:text-gray-500">Buscando el último lote de &quot;{inicial}&quot;…</p>

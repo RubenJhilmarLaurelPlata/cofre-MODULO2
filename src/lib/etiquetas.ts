@@ -5,9 +5,10 @@
 // de datos real que ningun codigo se repita.
 
 import { prisma } from '@/lib/prisma';
-import type { Prisma } from '@prisma/client';
+import { Prisma } from '@prisma/client';
 import { MESES_LABELS } from '@/lib/meses';
 import { canonicalizarSeparadores } from '@/lib/codigo';
+import { registrarAuditoria } from '@/lib/auditoria';
 
 export { MESES_LABELS };
 
@@ -33,6 +34,10 @@ export interface LoteDTO {
   observaciones: string;
   generadoPor: string;
   createdAt: string;
+  // Agregado por la ruta (GET /api/etiquetas/lotes), no por buscarLotes():
+  // ver getLotesEtiquetasEliminables() — true solo cuando NINGÚN código de
+  // este lote fue usado. Ausente para quien no sea ADMIN.
+  puedeEliminarse?: boolean;
 }
 
 export interface LoteDetalleDTO extends LoteDTO {
@@ -157,9 +162,21 @@ export async function setMonthLetters(letras: Array<{ mes: number; letra: string
   return getMonthLetters();
 }
 
-/** Arma el codigo de una etiqueta: {inicial}{dia 2 digitos}{letra del mes}{separador}{consecutivo}. Ej: M24J-1. */
+/**
+ * Arma el codigo de una etiqueta: {inicial}{dia}{letra del mes}{separador}{consecutivo}.
+ * Ej: M3T-1 (dia 3), M10T-1 (dia 10) — NUNCA con cero a la izquierda en el
+ * dia (antes: `fecha.slice(8, 10)` tomaba el dia tal cual viene en el
+ * string ISO "YYYY-MM-DD", que siempre trae 2 digitos ("03"), y ese "03"
+ * quedaba grabado tal cual en el codigo real — bug confirmado en
+ * produccion, "M03T-11" en vez de "M3T-11". `Number(...)` descarta el
+ * cero de formato sin tocar el valor real del dia. Esta es la UNICA
+ * representacion del codigo (no existe una version "interna" con cero y
+ * otra "visual" sin el): lo que sale de aqui es lo que se guarda en
+ * GeneratedCode.code/Package.code, lo que se imprime, y lo que se
+ * codifica en el barcode.
+ */
 export function construirCodigo(inicial: string, fecha: string, letraMes: string, separador: string, consecutivo: number): string {
-  const dia = fecha.slice(8, 10);
+  const dia = Number(fecha.slice(8, 10));
   return `${inicial}${dia}${letraMes}${separador}${consecutivo}`;
 }
 
@@ -184,11 +201,29 @@ export interface GenerarLoteParams {
 export interface GenerarLoteResultado {
   batchId: string;
   codigos: LabelDescriptor[];
+  // Rango de consecutivo usado en CADA dia del lote (ver comentario mas
+  // abajo) — NO un maximo acumulado de todo el lote. Para un lote de un
+  // solo dia esto es, ademas, el unico rango que existe.
   primerConsecutivo: number;
   ultimoConsecutivo: number;
 }
 
-/** Genera un lote nuevo de etiquetas de forma atomica, verificando siempre contra la base de datos real que ningun codigo se repita. */
+/**
+ * Genera un lote nuevo de etiquetas de forma atomica, verificando siempre
+ * contra la base de datos real que ningun codigo se repita.
+ *
+ * La numeracion es por DIA + SERIE: el consecutivo se REINICIA en
+ * `consecutivoInicial` al empezar cada fecha de `fechas` — nunca continua
+ * acumulandose de un dia al siguiente. Antes, una unica variable
+ * `consecutivo` se incrementaba a lo largo de TODO el loop sin importar
+ * cuantas fechas hubiera (bug confirmado en produccion: "Semana completa"
+ * generaba consecutivos 1..210 el primer dia, 211..420 el segundo,
+ * 421..630 el tercero, etc., en vez de 1..210 cada dia). Con el fix, dos
+ * dias distintos pueden perfectamente compartir el mismo consecutivo
+ * (ej. M3T-1 y M4T-1) sin colisionar nunca entre si, porque el dia forma
+ * parte del codigo (construirCodigo) — la unicidad real de GeneratedCode
+ * sigue siendo por "code" completo, nunca por el consecutivo aislado.
+ */
 export async function generarLote(params: GenerarLoteParams): Promise<GenerarLoteResultado> {
   const { inicial, fechas, cantidadPorDia, consecutivoInicial, separador, userId } = params;
 
@@ -202,19 +237,18 @@ export async function generarLote(params: GenerarLoteParams): Promise<GenerarLot
   const monthLetters = await getMonthLetters();
 
   const descriptores: LabelDescriptor[] = [];
-  let consecutivo = consecutivoInicial;
   for (const fecha of fechas) {
     const mes = Number(fecha.slice(5, 7));
     const letraMes = monthLetters[mes];
     if (!letraMes) {
       throw new EtiquetasError(`No hay una letra configurada para el mes ${MESES_LABELS[mes - 1] ?? mes}.`);
     }
+    // Reinicia en consecutivoInicial en CADA fecha — ver comentario de la funcion.
     for (let i = 0; i < cantidadPorDia; i++) {
-      descriptores.push({ code: construirCodigo(inicial, fecha, letraMes, separador, consecutivo), fecha });
-      consecutivo++;
+      descriptores.push({ code: construirCodigo(inicial, fecha, letraMes, separador, consecutivoInicial + i), fecha });
     }
   }
-  const ultimoConsecutivo = consecutivo - 1;
+  const ultimoConsecutivo = consecutivoInicial + cantidadPorDia - 1;
   const codes = descriptores.map((d) => d.code);
 
   const [enGenerados, enPaquetes] = await Promise.all([
@@ -265,6 +299,33 @@ export async function generarLote(params: GenerarLoteParams): Promise<GenerarLot
   });
 
   return { batchId: batch.id, codigos: descriptores, primerConsecutivo: consecutivoInicial, ultimoConsecutivo };
+}
+
+/**
+ * Ultimo consecutivo ya usado para esta inicial EN ESTE DIA especifico
+ * (0 si todavia no hay ninguno) — a diferencia de
+ * `PackageSeries.correlativo` (un maximo global, sin importar el dia,
+ * pensado para otros flujos que no son por-dia como Codigos
+ * personalizados), esto es lo que "Continuar lote" debe usar ahora: el
+ * dia siguiente SIEMPRE vuelve a 1, asi que "continuar" solo tiene
+ * sentido dentro del mismo dia (agregar mas etiquetas a un dia que ya
+ * tiene algunas impresas), nunca arrastrando el numero de otro dia. Lee
+ * directo de GeneratedCode.fechaGenerado (guardado por cada etiqueta real,
+ * ver generarLote) en vez de confiar en ningun campo agregado de
+ * LabelBatch, asi que es correcto incluso si el dia tuvo varios lotes
+ * generados por separado.
+ */
+export async function obtenerUltimoConsecutivoDelDia(inicial: string, fecha: string): Promise<number> {
+  const codigos = await prisma.generatedCode.findMany({
+    where: { inicial, fechaGenerado: fecha },
+    select: { code: true },
+  });
+  let max = 0;
+  for (const { code } of codigos) {
+    const parsed = parseConsecutivo(code);
+    if (parsed && parsed.consecutivo > max) max = parsed.consecutivo;
+  }
+  return max;
 }
 
 export interface GenerarCodigosPersonalizadosParams {
@@ -548,4 +609,93 @@ export async function getLotesActivos(limit = 10): Promise<LoteActivoDTO[]> {
       };
     })
     .filter((l) => l.usados < l.cantidad);
+}
+
+// ---------------------------------------------------------------------
+// Eliminar un lote de etiquetas
+// ---------------------------------------------------------------------
+//
+// Un LabelBatch/GeneratedCode representa UNICAMENTE una generacion/
+// impresion de etiquetas — nunca un paquete real (ver Package en
+// schema.prisma: no tiene ninguna columna ni relacion hacia GeneratedCode
+// ni LabelBatch, solo coincide con el mismo texto de "code" si ese codigo
+// llego a escanearse). Por eso borrar un lote nunca puede tocar Package/
+// Pago/PackageHistory/ImportLog — estructuralmente no hay como, ademas de
+// que este codigo nunca los toca.
+//
+// La unica pregunta real es si algun codigo del lote YA FUE USADO
+// (GeneratedCode.usado=true, lo marca Recepcion al escanearlo — ver
+// src/app/api/recepcion/scan/route.ts): en ese caso el codigo SI se
+// convirtio en un paquete real, y borrar su GeneratedCode perderia el
+// rastro de auditoria de esa etiqueta (cuando se genero, cuantas veces se
+// reimprimio) sin ganar nada a cambio — se bloquea. Si NINGUN codigo del
+// lote fue usado, es 100% seguro: se borran los GeneratedCode (liberando
+// esos codigos para poder regenerarlos si hace falta) y el LabelBatch.
+export class LoteEtiquetasNoEncontradoError extends Error {
+  constructor(id: string) {
+    super(`No se encontró ningún lote de etiquetas con el id "${id}".`);
+    this.name = 'LoteEtiquetasNoEncontradoError';
+  }
+}
+
+export class LoteEtiquetasConCodigosUsadosError extends Error {
+  constructor(public readonly codigosUsados: number) {
+    super(
+      `Este lote tiene ${codigosUsados} código(s) que ya fueron usados para recibir un paquete real, así que no puede eliminarse — se perdería el rastro de esa(s) etiqueta(s). Los paquetes reales nunca se ven afectados de todas formas.`
+    );
+    this.name = 'LoteEtiquetasConCodigosUsadosError';
+  }
+}
+
+/** Ids de LabelBatch que SÍ pueden eliminarse (cero códigos usados) — para marcar el botón en listados sin una consulta por fila. */
+export async function getLotesEtiquetasEliminables(batchIds: string[]): Promise<Set<string>> {
+  if (batchIds.length === 0) return new Set();
+  const conUso = await prisma.generatedCode.findMany({
+    where: { batchId: { in: batchIds }, usado: true },
+    select: { batchId: true },
+    distinct: ['batchId'],
+  });
+  const idsConUso = new Set(conUso.map((c) => c.batchId));
+  return new Set(batchIds.filter((id) => !idsConUso.has(id)));
+}
+
+/**
+ * Elimina un lote de etiquetas completo (LabelBatch + sus GeneratedCode) —
+ * solo si NINGUNO de sus códigos fue usado (ver comentario arriba).
+ * Transaccional: el conteo de usados se vuelve a hacer DENTRO de la misma
+ * transacción justo antes de borrar (no confía en un chequeo hecho unos
+ * milisegundos antes — mismo criterio que eliminarLoteImportacion() en
+ * src/lib/importacion.ts), y si hay aunque sea uno, se revierte todo.
+ * Nunca toca Package/Pago/PackageHistory/PackageSeries.
+ */
+export async function eliminarLoteEtiquetas(id: string, userId: string): Promise<{ inicial: string; cantidad: number; fechaInicio: string; fechaFin: string }> {
+  const lote = await prisma.labelBatch.findUnique({ where: { id } });
+  if (!lote) throw new LoteEtiquetasNoEncontradoError(id);
+
+  try {
+    await prisma.$transaction(async (tx) => {
+      const usados = await tx.generatedCode.count({ where: { batchId: id, usado: true } });
+      if (usados > 0) throw new LoteEtiquetasConCodigosUsadosError(usados);
+      await tx.generatedCode.deleteMany({ where: { batchId: id } });
+      await tx.labelBatch.delete({ where: { id } });
+    });
+  } catch (err) {
+    if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2025') {
+      // Carrera entre dos DELETE simultaneos sobre el mismo lote — igual
+      // criterio que eliminarLoteImportacion(): la segunda solicitud
+      // encuentra el registro ya borrado por la primera, se traduce al
+      // mismo 404 limpio en vez de un 500 generico.
+      throw new LoteEtiquetasNoEncontradoError(id);
+    }
+    throw err;
+  }
+
+  await registrarAuditoria({
+    userId,
+    accion: 'ETIQUETAS_LOTE_ELIMINADO',
+    modulo: 'etiquetas',
+    valorAnterior: { id, inicial: lote.inicial, cantidad: lote.cantidad, fechaInicio: lote.fechaInicio, fechaFin: lote.fechaFin },
+  });
+
+  return { inicial: lote.inicial, cantidad: lote.cantidad, fechaInicio: lote.fechaInicio, fechaFin: lote.fechaFin };
 }

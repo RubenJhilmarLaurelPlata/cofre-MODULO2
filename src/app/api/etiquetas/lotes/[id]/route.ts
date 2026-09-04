@@ -2,6 +2,7 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { getSession } from '@/lib/auth';
+import { eliminarLoteEtiquetas, LoteEtiquetasNoEncontradoError, LoteEtiquetasConCodigosUsadosError } from '@/lib/etiquetas';
 
 export async function GET(_req: Request, { params }: { params: { id: string } }) {
   const session = await getSession();
@@ -33,4 +34,31 @@ export async function GET(_req: Request, { params }: { params: { id: string } })
     usados: lote.codigos.filter((c) => c.usado).length,
     codigos: lote.codigos.map((c) => ({ code: c.code, fecha: c.fechaGenerado, usado: c.usado })),
   });
+}
+
+/**
+ * Elimina un lote de etiquetas — solo si ninguno de sus códigos fue usado
+ * (ver eliminarLoteEtiquetas en src/lib/etiquetas.ts). Nunca toca
+ * Package/Pago/PackageHistory: un lote es solo una generación de
+ * etiquetas, no tiene ninguna relación real hacia paquetes.
+ */
+export async function DELETE(_req: Request, { params }: { params: { id: string } }) {
+  const session = await getSession();
+  if (!session || session.role !== 'ADMIN') {
+    return NextResponse.json({ error: 'No tienes permiso para esta acción' }, { status: 403 });
+  }
+
+  try {
+    const eliminado = await eliminarLoteEtiquetas(params.id, session.id);
+    return NextResponse.json({ ok: true, ...eliminado });
+  } catch (err) {
+    if (err instanceof LoteEtiquetasNoEncontradoError) {
+      return NextResponse.json({ error: err.message }, { status: 404 });
+    }
+    if (err instanceof LoteEtiquetasConCodigosUsadosError) {
+      return NextResponse.json({ error: err.message }, { status: 409 });
+    }
+    console.error('Error eliminando lote de etiquetas:', err);
+    return NextResponse.json({ error: 'Ocurrió un error al eliminar el lote.' }, { status: 500 });
+  }
 }

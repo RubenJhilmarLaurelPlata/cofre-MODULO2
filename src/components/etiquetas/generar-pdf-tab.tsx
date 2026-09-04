@@ -2,21 +2,25 @@
 
 // src/components/etiquetas/generar-pdf-tab.tsx
 // Pantalla "Etiquetas -> Generar PDF" (Fase 5): el administrador arma una
-// lista de series (M 200, S 200, Q 120...) con una unica fecha de
-// ingreso, ve una vista previa fiel al PDF real, y al generar obtiene
-// SIEMPRE un unico PDF con todas las series juntas, en el mismo orden en
-// que las escribio. Reutiliza generarLote() en el servidor (una llamada
-// por serie, mismo motor atomico de siempre) y el mismo endpoint
-// /api/etiquetas/pdf que ya arma un PDF a partir de cualquier lista de
-// codigos — aqui no se inventa un generador de PDF nuevo, solo se
-// concatenan los codigos de todas las series antes de pedirlo.
+// lista de series (M 200, S 200, Q 120...) para uno o varios dias (Hoy /
+// Mañana / Fecha específica / Semana completa / Rango — mismos 5 modos
+// que la pestaña "Avanzado"), ve una vista previa fiel al PDF real, y al
+// generar obtiene SIEMPRE un unico PDF con todo junto, en el mismo orden
+// en que escribio las series. Reutiliza generarLote() en el servidor (una
+// llamada por serie, que ya reinicia el consecutivo en cada dia — ver
+// src/lib/etiquetas.ts) y el mismo endpoint /api/etiquetas/pdf que ya
+// arma un PDF a partir de cualquier lista de codigos — aqui no se
+// inventa un generador de PDF nuevo, solo se concatenan los codigos de
+// todas las series/dias antes de pedirlo.
 import * as React from 'react';
 import { FileText, Plus, Trash2, Download, CheckCircle2, XCircle, AlertTriangle } from 'lucide-react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Input, Label } from '@/components/ui/input';
+import { cn } from '@/lib/utils';
 import { EtiquetaPreviewCard } from '@/components/etiquetas/etiqueta-preview-card';
 import { COLS, ROWS, ETIQUETAS_POR_HOJA, posicionEnHoja } from '@/lib/etiquetas-layout';
+import { hoyStr, calcularFechasCliente, type ModoFechaCliente } from '@/lib/etiquetas-fechas-cliente';
 import type { LabelDescriptor } from '@/lib/etiquetas';
 import type { SerieInfo } from '@/components/etiquetas/generar-tab';
 
@@ -45,11 +49,6 @@ interface FilaSerie {
 // alcanza a ver el patron completo.
 const PREVIEW_LIMIT = ETIQUETAS_POR_HOJA;
 
-function hoyStr(): string {
-  const d = new Date();
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-}
-
 function fmtFechaCorta(fecha: string): string {
   const [y, m, d] = fecha.split('-');
   return `${d}/${m}/${y}`;
@@ -61,43 +60,72 @@ function nuevaFila(inicial = '', cantidad = 100): FilaSerie {
   return { id: `fila-${filaIdSeq}`, inicial, cantidad, consecutivoInicial: '' };
 }
 
+const MODOS: Array<{ id: ModoFechaCliente; label: string }> = [
+  { id: 'hoy', label: 'Hoy' },
+  { id: 'manana', label: 'Mañana' },
+  { id: 'especifica', label: 'Fecha específica' },
+  { id: 'semana', label: 'Semana completa' },
+  { id: 'rango', label: 'Rango de fechas' },
+];
+
 export function GenerarPdfTab({ series, monthLetters, separadorDefault, onCorrelativoActualizado }: GenerarPdfTabProps) {
+  const [modo, setModo] = React.useState<ModoFechaCliente>('hoy');
   const [fecha, setFecha] = React.useState(hoyStr());
+  const [fechaReferencia, setFechaReferencia] = React.useState(hoyStr());
+  const [fechaInicio, setFechaInicio] = React.useState(hoyStr());
+  const [fechaFin, setFechaFin] = React.useState(hoyStr());
   const [filas, setFilas] = React.useState<FilaSerie[]>([nuevaFila()]);
   const [generando, setGenerando] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
   const [resultado, setResultado] = React.useState<{ resumen: string; total: number; nombreArchivo: string } | null>(null);
 
-  const correlativoPorInicial = React.useMemo(() => new Map(series.map((s) => [s.inicial, s.correlativo])), [series]);
+  // Lista completa de dias que va a cubrir este trabajo (1 dia para Hoy/
+  // Mañana/Fecha específica, 7 para Semana, N para Rango) — misma logica
+  // exacta que calcularFechasLote() del servidor, ver
+  // src/lib/etiquetas-fechas-cliente.ts. La generacion real siempre
+  // vuelve a calcularla en el servidor; esto es solo para la vista previa
+  // y para saber cuantos dias multiplican el total.
+  const fechas = React.useMemo(
+    () => calcularFechasCliente({ modo, fecha, fechaReferencia, fechaInicio, fechaFin }),
+    [modo, fecha, fechaReferencia, fechaInicio, fechaFin]
+  );
+  const primerFecha = fechas[0] ?? fecha;
 
-  const mes = Number(fecha.slice(5, 7)) || 0;
+  const mes = Number(primerFecha.slice(5, 7)) || 0;
   const letraMes = monthLetters[mes];
 
   const filasValidas = filas.filter((f) => f.inicial.trim().length > 0 && f.cantidad > 0);
-  const total = filasValidas.reduce((acc, f) => acc + f.cantidad, 0);
+  // "cantidad" en cada fila es POR DIA (ver serieSchema del backend): el
+  // total real multiplica por la cantidad de dias del trabajo.
+  const total = filasValidas.reduce((acc, f) => acc + f.cantidad, 0) * fechas.length;
 
-  // Vista previa: hasta una hoja completa (30) de etiquetas, calculadas
-  // del lado del cliente con el mismo formato que construirCodigo() del
-  // servidor, respetando el orden de las filas y el correlativo actual
-  // de cada serie. Es solo una vista previa — la generacion real vuelve
-  // a verificar todo contra la base de datos.
+  // Vista previa: hasta una hoja completa (30) de etiquetas del PRIMER
+  // día del trabajo, calculadas del lado del cliente con el mismo formato
+  // que construirCodigo() del servidor (incluido: sin cero a la
+  // izquierda en el día — ver esa función), respetando el orden de las
+  // filas. El consecutivo SIEMPRE arranca en 1 salvo que el administrador
+  // escriba un "Número inicial" explícito para esa fila — y, si el
+  // trabajo cubre varios días, ese mismo consecutivo se repite cada día
+  // (nunca se acumula) — ver "La numeración es por DÍA + SERIE". Es solo
+  // una vista previa — la generación real vuelve a verificar todo contra
+  // la base de datos.
   const preview: LabelDescriptor[] = React.useMemo(() => {
     if (!letraMes) return [];
-    const dia = fecha.slice(8, 10);
+    const dia = Number(primerFecha.slice(8, 10));
     const out: LabelDescriptor[] = [];
     for (const f of filasValidas) {
       if (out.length >= PREVIEW_LIMIT) break;
       const inicial = f.inicial.trim().toUpperCase();
       const consecutivoManual = Number(f.consecutivoInicial);
-      const consecutivoInicial = f.consecutivoInicial.trim() && consecutivoManual > 0 ? consecutivoManual : (correlativoPorInicial.get(inicial) ?? 0) + 1;
+      const consecutivoInicial = f.consecutivoInicial.trim() && consecutivoManual > 0 ? consecutivoManual : 1;
       const restante = PREVIEW_LIMIT - out.length;
       const cantidadPreview = Math.min(f.cantidad, restante);
       for (let i = 0; i < cantidadPreview; i++) {
-        out.push({ code: `${inicial}${dia}${letraMes}${separadorDefault}${consecutivoInicial + i}`, fecha });
+        out.push({ code: `${inicial}${dia}${letraMes}${separadorDefault}${consecutivoInicial + i}`, fecha: primerFecha });
       }
     }
     return out;
-  }, [filasValidas, fecha, letraMes, separadorDefault, correlativoPorInicial]);
+  }, [filasValidas, primerFecha, letraMes, separadorDefault]);
 
   function agregarFila() {
     setFilas((prev) => [...prev, nuevaFila()]);
@@ -117,8 +145,8 @@ export function GenerarPdfTab({ series, monthLetters, separadorDefault, onCorrel
     setError(null);
     setResultado(null);
     try {
-      const body = {
-        fecha,
+      const body: Record<string, unknown> = {
+        modo,
         series: filasValidas.map((f) => {
           const consecutivoManual = Number(f.consecutivoInicial);
           return {
@@ -128,6 +156,13 @@ export function GenerarPdfTab({ series, monthLetters, separadorDefault, onCorrel
           };
         }),
       };
+      if (modo === 'especifica') body.fecha = fecha;
+      if (modo === 'semana') body.fechaReferencia = fechaReferencia;
+      if (modo === 'rango') {
+        body.fechaInicio = fechaInicio;
+        body.fechaFin = fechaFin;
+      }
+
       const res = await fetch('/api/etiquetas/generar-pdf-lote', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -154,8 +189,11 @@ export function GenerarPdfTab({ series, monthLetters, separadorDefault, onCorrel
 
       const blob = await resPdf.blob();
       const url = URL.createObjectURL(blob);
-      const [y, m, d] = fecha.split('-');
-      const nombreArchivo = `cofre-express-etiquetas-${d}-${m}-${y}.pdf`;
+      const [y1, m1, d1] = fechas[0]!.split('-');
+      const nombreArchivo =
+        fechas.length > 1
+          ? `cofre-express-etiquetas-${d1}-${m1}-${y1}-a-${fechas[fechas.length - 1]!.split('-').reverse().join('-')}.pdf`
+          : `cofre-express-etiquetas-${d1}-${m1}-${y1}.pdf`;
       const a = document.createElement('a');
       a.href = url;
       a.download = nombreArchivo;
@@ -189,11 +227,53 @@ export function GenerarPdfTab({ series, monthLetters, separadorDefault, onCorrel
               <FileText className="h-4 w-4 text-brand-500" /> Fecha de ingreso
             </CardTitle>
           </CardHeader>
-          <CardContent>
-            <Input type="date" value={fecha} onChange={(e) => setFecha(e.target.value)} className="max-w-xs" />
+          <CardContent className="space-y-3">
+            <div className="flex flex-wrap gap-2">
+              {MODOS.map((m) => (
+                <button
+                  key={m.id}
+                  onClick={() => setModo(m.id)}
+                  className={cn(
+                    'rounded-lg border px-3 py-1.5 text-sm font-medium transition-colors',
+                    modo === m.id
+                      ? 'border-brand-500 bg-brand-50 dark:bg-brand-500/10 text-brand-700'
+                      : 'border-gray-200 dark:border-gray-800 text-ink-soft dark:text-gray-400 hover:text-ink dark:hover:text-gray-100'
+                  )}
+                >
+                  {m.label}
+                </button>
+              ))}
+            </div>
+
+            {modo === 'especifica' && <Input type="date" value={fecha} onChange={(e) => setFecha(e.target.value)} className="max-w-xs" />}
+            {modo === 'semana' && (
+              <div className="max-w-xs">
+                <Label htmlFor="fechaReferenciaPdf">Cualquier fecha de esa semana</Label>
+                <Input id="fechaReferenciaPdf" type="date" value={fechaReferencia} onChange={(e) => setFechaReferencia(e.target.value)} className="mt-1" />
+              </div>
+            )}
+            {modo === 'rango' && (
+              <div className="grid max-w-md grid-cols-2 gap-3">
+                <div>
+                  <Label htmlFor="fechaInicioPdf">Desde</Label>
+                  <Input id="fechaInicioPdf" type="date" value={fechaInicio} onChange={(e) => setFechaInicio(e.target.value)} className="mt-1" />
+                </div>
+                <div>
+                  <Label htmlFor="fechaFinPdf">Hasta</Label>
+                  <Input id="fechaFinPdf" type="date" value={fechaFin} onChange={(e) => setFechaFin(e.target.value)} min={fechaInicio} className="mt-1" />
+                </div>
+              </div>
+            )}
+
+            {fechas.length > 1 && (
+              <p className="text-xs text-ink-soft dark:text-gray-400">
+                {fechas.length} días — cada serie se repite completa (1..{filasValidas[0]?.cantidad ?? 'N'}) en cada uno, empezando siempre en 1.
+              </p>
+            )}
             {!letraMes && (
-              <p className="mt-2 flex items-center gap-1.5 text-xs text-amber-600">
-                <AlertTriangle className="h-3.5 w-3.5 shrink-0" /> No hay una letra configurada para este mes. Configúrala arriba en &quot;Generar&quot; antes de continuar.
+              <p className="flex items-center gap-1.5 text-xs text-amber-600">
+                <AlertTriangle className="h-3.5 w-3.5 shrink-0" /> No hay una letra configurada para el mes de {fechas.length > 1 ? 'alguno de estos días' : 'esta fecha'}. Configúrala arriba en
+                &quot;Avanzado&quot; antes de continuar.
               </p>
             )}
           </CardContent>
@@ -205,8 +285,8 @@ export function GenerarPdfTab({ series, monthLetters, separadorDefault, onCorrel
           </CardHeader>
           <CardContent className="space-y-3">
             <p className="text-xs text-ink-soft dark:text-gray-400">
-              &quot;Número inicial&quot; es opcional: dejalo vacío para continuar automáticamente desde el último código de esa serie, o escribí un número (ej. 1) para generar un rango puntual — el sistema
-              sigue validando que ningún código quede duplicado.
+              Cada serie empieza en <span className="font-mono">1</span> por día (nunca continúa el número de otro día). &quot;Número inicial&quot; es opcional: dejalo vacío para empezar en 1, o
+              escribí un número propio (ej. para agregar más etiquetas a un día que ya tiene algunas impresas) — el sistema sigue validando que ningún código quede duplicado.
             </p>
             {filas.map((f) => {
               const inicial = f.inicial.trim().toUpperCase();
@@ -225,7 +305,7 @@ export function GenerarPdfTab({ series, monthLetters, separadorDefault, onCorrel
                     />
                   </div>
                   <div className="w-28 min-w-0 flex-1 sm:flex-none">
-                    <Label htmlFor={`cantidad-${f.id}`}>Cantidad</Label>
+                    <Label htmlFor={`cantidad-${f.id}`}>{fechas.length > 1 ? 'Cantidad por día' : 'Cantidad'}</Label>
                     <Input
                       id={`cantidad-${f.id}`}
                       type="number"
@@ -245,11 +325,11 @@ export function GenerarPdfTab({ series, monthLetters, separadorDefault, onCorrel
                       value={f.consecutivoInicial}
                       onChange={(e) => actualizarFila(f.id, { consecutivoInicial: e.target.value })}
                       className="mt-1 font-mono"
-                      placeholder={serieExistente ? `${serieExistente.correlativo + 1} (auto)` : '1 (auto)'}
+                      placeholder="1 (auto)"
                     />
                   </div>
                   <p className="min-w-0 flex-1 truncate text-xs text-ink-soft dark:text-gray-400">
-                    {inicial ? (serieExistente ? `último: ${serieExistente.correlativo}` : 'serie nueva') : ''}
+                    {inicial ? (serieExistente ? `último global: ${serieExistente.correlativo}` : 'serie nueva') : ''}
                   </p>
                   <Button variant="ghost" size="icon" onClick={() => quitarFila(f.id)} disabled={filas.length === 1} aria-label="Eliminar serie">
                     <Trash2 className="h-4 w-4" />
@@ -307,8 +387,8 @@ export function GenerarPdfTab({ series, monthLetters, separadorDefault, onCorrel
             ) : (
               <>
                 <p className="mb-3 text-xs text-gray-400 dark:text-gray-500">
-                  Vista previa — primeras {preview.length} etiquetas de {total}, en el mismo orden físico que el PDF (columna por columna). Fecha:{' '}
-                  {fmtFechaCorta(fecha)}.
+                  Vista previa — primeras {preview.length} etiquetas de {total}, en el mismo orden físico que el PDF (columna por columna). Día 1{fechas.length > 1 ? ` de ${fechas.length}` : ''}:{' '}
+                  {fmtFechaCorta(primerFecha)}.
                 </p>
                 {/* Misma distribucion fisica que el PDF real: se usa la misma
                     funcion posicionEnHoja() (etiquetas-layout.ts) para ubicar

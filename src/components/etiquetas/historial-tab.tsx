@@ -2,10 +2,11 @@
 
 // src/components/etiquetas/historial-tab.tsx
 import * as React from 'react';
-import { Search, Printer, Copy, XCircle, User, Calendar } from 'lucide-react';
+import { Search, Printer, Copy, XCircle, CheckCircle2, User, Calendar, Trash2, Loader2 } from 'lucide-react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
+import { cn } from '@/lib/utils';
 import type { SerieInfo, PrefillDuplicado } from '@/components/etiquetas/generar-tab';
 import type { LoteDTO } from '@/lib/etiquetas';
 
@@ -36,6 +37,14 @@ export function HistorialTab({ esAdmin, series, onDuplicar }: HistorialTabProps)
   const [cargando, setCargando] = React.useState(true);
   const [error, setError] = React.useState<string | null>(null);
   const [reimprimiendo, setReimprimiendo] = React.useState<Record<string, boolean>>({});
+
+  // Eliminar lote (ver eliminarLoteEtiquetas en src/lib/etiquetas.ts):
+  // "eliminandoId" evita doble click sobre el mismo lote; "mensaje" es el
+  // aviso de éxito/error de la última operación. El servidor es quien
+  // decide de verdad si se puede eliminar (lote.puedeEliminarse solo
+  // deshabilita el botón de antemano, nunca se salta la validación real).
+  const [eliminandoId, setEliminandoId] = React.useState<string | null>(null);
+  const [mensaje, setMensaje] = React.useState<{ tipo: 'exito' | 'error'; texto: string } | null>(null);
 
   const debounceRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
   const primerRenderRef = React.useRef(true);
@@ -123,6 +132,32 @@ export function HistorialTab({ esAdmin, series, onDuplicar }: HistorialTabProps)
     }
   }
 
+  async function eliminarLote(lote: LoteDTO) {
+    if (eliminandoId) return;
+    const confirmado = window.confirm(
+      `¿Eliminar este lote?\n\n${lote.inicial}${lote.separador}${lote.primerConsecutivo} → ${lote.inicial}${lote.separador}${lote.ultimoConsecutivo} (${lote.cantidad} etiquetas)\n\n` +
+        'Esta acción eliminará únicamente el registro de generación de etiquetas. No eliminará paquetes, pagos ni entregas — solo se permite si ningún código de este lote fue usado todavía.'
+    );
+    if (!confirmado) return;
+
+    setEliminandoId(lote.id);
+    setMensaje(null);
+    try {
+      const res = await fetch(`/api/etiquetas/lotes/${lote.id}`, { method: 'DELETE' });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setMensaje({ tipo: 'error', texto: data.error ?? 'No se pudo eliminar el lote.' });
+        return;
+      }
+      setLotes((prev) => prev.filter((l) => l.id !== lote.id));
+      setMensaje({ tipo: 'exito', texto: `Lote "${lote.inicial}" eliminado correctamente.` });
+    } catch {
+      setMensaje({ tipo: 'error', texto: 'Error de conexión. Intenta de nuevo.' });
+    } finally {
+      setEliminandoId(null);
+    }
+  }
+
   return (
     <div className="space-y-5">
       <Card>
@@ -164,6 +199,20 @@ export function HistorialTab({ esAdmin, series, onDuplicar }: HistorialTabProps)
       {error && (
         <div className="flex items-center gap-2 rounded-xl border border-red-200 dark:border-red-900/50 bg-red-50 dark:bg-red-500/10 p-3 text-sm text-red-700 dark:text-red-400">
           <XCircle className="h-4 w-4 shrink-0" /> {error}
+        </div>
+      )}
+
+      {mensaje && (
+        <div
+          className={cn(
+            'flex items-center gap-2 rounded-xl border p-3 text-sm',
+            mensaje.tipo === 'exito'
+              ? 'border-emerald-200 dark:border-emerald-900/50 bg-emerald-50 dark:bg-emerald-500/10 text-emerald-700 dark:text-emerald-400'
+              : 'border-red-200 dark:border-red-900/50 bg-red-50 dark:bg-red-500/10 text-red-700 dark:text-red-400'
+          )}
+        >
+          {mensaje.tipo === 'exito' ? <CheckCircle2 className="h-4 w-4 shrink-0" /> : <XCircle className="h-4 w-4 shrink-0" />}
+          {mensaje.texto}
         </div>
       )}
 
@@ -212,6 +261,20 @@ export function HistorialTab({ esAdmin, series, onDuplicar }: HistorialTabProps)
                       onClick={() => onDuplicar({ inicial: lote.inicial, cantidadPorDia: lote.cantidadPorDia, observaciones: lote.observaciones })}
                     >
                       <Copy className="h-3.5 w-3.5" /> Duplicar
+                    </Button>
+                  )}
+                  {esAdmin && (
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      title={lote.puedeEliminarse ? 'Eliminar lote' : 'Este lote ya tiene códigos usados en paquetes reales y no puede eliminarse'}
+                      aria-label="Eliminar lote"
+                      disabled={!lote.puedeEliminarse || eliminandoId === lote.id}
+                      onClick={() => eliminarLote(lote)}
+                      className="ml-auto text-red-500 hover:bg-red-50 dark:hover:bg-red-500/10"
+                    >
+                      {eliminandoId === lote.id ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Trash2 className="h-3.5 w-3.5" />}
+                      Eliminar
                     </Button>
                   )}
                 </div>
