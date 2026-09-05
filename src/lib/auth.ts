@@ -23,6 +23,27 @@ function getSecretKey(): Uint8Array {
   return new TextEncoder().encode(secret);
 }
 
+/**
+ * Si la request llega realmente por HTTPS — para decidir el atributo
+ * `secure` de la cookie de sesion (ver login/route.ts). Cada instalacion
+ * de Cofre Express (La Paz, El Alto, futuras) corre detras de su propio
+ * Nginx, que termina TLS y reenvia a Next.js por HTTP interno agregando
+ * `X-Forwarded-Proto: $scheme` — Next.js en Node (a diferencia de
+ * Vercel) no reescribe el protocolo de la request con ese header por su
+ * cuenta, asi que hay que leerlo explicitamente. NUNCA se decide esto
+ * con NODE_ENV: una instalacion en produccion puede estar sirviendo
+ * temporalmente por HTTP plano (ej. El Alto mientras se configura su
+ * certificado) y NODE_ENV seguiria siendo "production" igual — forzar
+ * `secure: true` ahi hace que el navegador directamente descarte la
+ * cookie por HTTP, dejando el login "cargando" para siempre sin ningun
+ * error visible.
+ */
+export function esRequestSegura(req: Request): boolean {
+  const proto = req.headers.get('x-forwarded-proto');
+  if (proto) return proto.split(',')[0]!.trim().toLowerCase() === 'https';
+  return new URL(req.url).protocol === 'https:';
+}
+
 export async function hashPassword(plain: string): Promise<string> {
   return bcrypt.hash(plain, 10);
 }

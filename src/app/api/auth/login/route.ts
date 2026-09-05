@@ -2,7 +2,7 @@
 import { NextResponse, type NextRequest } from 'next/server';
 import { z } from 'zod';
 import { prisma } from '@/lib/prisma';
-import { verifyPassword, signSession, SESSION_COOKIE } from '@/lib/auth';
+import { verifyPassword, signSession, esRequestSegura, SESSION_COOKIE } from '@/lib/auth';
 import { getCompanyConfig } from '@/lib/config';
 import { registrarAuditoria, extraerContextoRequest } from '@/lib/auditoria';
 import type { Role } from '@/types';
@@ -96,7 +96,7 @@ export async function POST(req: NextRequest) {
     const res = NextResponse.json({ ok: true, user: sessionUser });
     res.cookies.set(SESSION_COOKIE, token, {
       httpOnly: true,
-      secure: process.env.NODE_ENV === 'production',
+      secure: esRequestSegura(req),
       sameSite: 'lax',
       path: '/',
       maxAge: duracionSegundos,
