@@ -70,6 +70,14 @@ function fmtFecha(iso: string | null): string {
   return new Intl.DateTimeFormat('es-BO', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' }).format(new Date(iso));
 }
 
+// Lote diario: un envío BORRADOR puede quedar abierto toda la jornada
+// (09:00, 12:00, 17:00...) y seguir recibiendo paquetes — mostrar solo la
+// hora de cada ítem (no la fecha completa, redundante casi siempre) deja
+// visible el timeline real del lote sin sobrecargar la lista.
+function fmtHora(iso: string): string {
+  return new Intl.DateTimeFormat('es-BO', { hour: '2-digit', minute: '2-digit' }).format(new Date(iso));
+}
+
 export function EnvioDetalleClient({ envioId }: { envioId: string }) {
   const [envio, setEnvio] = React.useState<EnvioDetalleDTO | null>(null);
   const [cargando, setCargando] = React.useState(true);
@@ -521,6 +529,7 @@ export function EnvioDetalleClient({ envioId }: { envioId: string }) {
                         <div className="min-w-0 space-y-0.5">
                           <span className="flex items-center gap-2 font-mono font-medium text-ink dark:text-gray-100">
                             <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-500" /> {it.code}
+                            <span className="font-sans text-xs font-normal text-gray-400 dark:text-gray-500">{fmtHora(it.createdAt)}</span>
                           </span>
                           {it.destinatario ? (
                             <p className="truncate pl-6 text-xs text-gray-400 dark:text-gray-500">

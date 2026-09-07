@@ -22,6 +22,12 @@ interface RespaldoOracleDTO {
   fecha: string | null;
 }
 
+interface ConfiguracionBackupOracleDTO {
+  bucket: string;
+  namespace: string;
+  scriptPath: string;
+}
+
 function fmtTamanio(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
@@ -37,6 +43,7 @@ function fmtFechaHora(iso: string): string {
 function OracleRespaldosTab() {
   const [conectado, setConectado] = React.useState<boolean | null>(null);
   const [objetos, setObjetos] = React.useState<RespaldoOracleDTO[]>([]);
+  const [configuracion, setConfiguracion] = React.useState<ConfiguracionBackupOracleDTO | null>(null);
   const [errorEstado, setErrorEstado] = React.useState<string | null>(null);
   const [cargando, setCargando] = React.useState(true);
   const [respaldando, setRespaldando] = React.useState(false);
@@ -51,6 +58,7 @@ function OracleRespaldosTab() {
       const data = await res.json();
       setConectado(!!data.ok);
       setObjetos(data.objetos ?? []);
+      setConfiguracion(data.configuracion ?? null);
       setErrorEstado(data.ok ? null : data.error ?? 'No se pudo conectar con Oracle Object Storage.');
     } finally {
       setCargando(false);
@@ -129,6 +137,12 @@ function OracleRespaldosTab() {
               </span>
             </div>
             {!conectado && errorEstado && <p className="text-xs text-red-600 dark:text-red-400">{errorEstado}</p>}
+
+            {configuracion && (
+              <p className="rounded-lg bg-gray-50 dark:bg-gray-800/40 p-2.5 font-mono text-[11px] text-ink-soft dark:text-gray-400">
+                bucket: {configuracion.bucket} · namespace: {configuracion.namespace} · script: {configuracion.scriptPath}
+              </p>
+            )}
 
             <div className="grid grid-cols-2 gap-3">
               <div className="rounded-lg bg-gray-50 dark:bg-gray-800/40 p-3">

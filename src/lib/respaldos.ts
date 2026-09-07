@@ -15,6 +15,26 @@ import { prisma } from '@/lib/prisma';
 
 const CARPETA_RESPALDOS = path.join(process.cwd(), 'data', 'backups');
 
+/**
+ * Timestamp para nombres de archivo de respaldo, en hora America/La_Paz
+ * (el proceso Node ya esta anclado a esa TZ — ver next.config.mjs, igual
+ * que dateKey() en src/lib/pricing.ts) en vez de .toISOString() (que
+ * siempre da UTC sin importar la TZ del proceso): evita que un respaldo
+ * hecho, por ejemplo, a las 21:00 hora Bolivia (01:00 UTC del día
+ * siguiente) quede con el nombre de un día que todavía no es "hoy" aquí.
+ * Se reutiliza también en backup-oracle.ts (restaurarDesdeOracle) para
+ * que ambos subsistemas de respaldo nombren sus archivos igual.
+ */
+export function timestampArchivoLocal(d: Date = new Date()): string {
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, '0');
+  const dd = String(d.getDate()).padStart(2, '0');
+  const hh = String(d.getHours()).padStart(2, '0');
+  const mi = String(d.getMinutes()).padStart(2, '0');
+  const ss = String(d.getSeconds()).padStart(2, '0');
+  return `${yyyy}-${mm}-${dd}T${hh}-${mi}-${ss}`;
+}
+
 function rutaBaseDeDatos(): string {
   const url = process.env.DATABASE_URL ?? 'file:./dev.db';
   const archivo = url.replace(/^file:/, '');
@@ -54,8 +74,7 @@ export async function listarRespaldos(): Promise<RespaldoDTO[]> {
 export async function crearRespaldo(userId: string): Promise<RespaldoDTO> {
   await mkdir(CARPETA_RESPALDOS, { recursive: true });
 
-  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const nombreArchivo = `cofre-express-${timestamp}.db`;
+  const nombreArchivo = `cofre-express-${timestampArchivoLocal()}.db`;
   const destino = path.join(CARPETA_RESPALDOS, nombreArchivo);
 
   let estado = 'COMPLETADO';

@@ -1,0 +1,19 @@
+# scripts/backup-cofre.timer
+#
+# Plantilla de referencia — dispara backup-cofre.service una vez por día.
+# Ajustar OnCalendar= si se prefiere otro horario (recomendado: fuera del
+# horario operativo, ver "hora de cierre automático" en Configuración >
+# Preferencias). La hora es la del sistema operativo del servidor — si el
+# servidor no tiene TZ=America/La_Paz configurado a nivel de sistema (ver
+# .env.example y next.config.mjs, que solo controlan el proceso Node, NO
+# systemd), ajustar la hora de abajo pensando en UTC o configurar
+# `timedatectl set-timezone America/La_Paz` en el servidor.
+[Unit]
+Description=Ejecuta el respaldo diario de Cofre Express
+
+[Timer]
+OnCalendar=*-*-* 02:30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

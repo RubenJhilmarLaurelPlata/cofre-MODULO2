@@ -5,7 +5,7 @@
 // los eventos que ameritan atencion (nunca duplica el dato). Sin
 // ventanas emergentes: solo esta lista.
 import * as React from 'react';
-import { AlertTriangle, HardDrive, Lock, KeyRound, Settings, Bell } from 'lucide-react';
+import { AlertTriangle, HardDrive, Lock, KeyRound, Settings, Bell, Cloud, RotateCcw } from 'lucide-react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 
 interface AuditLogDTO {
@@ -23,6 +23,9 @@ const CONFIG_ACCION: Record<string, { label: string; icon: typeof Bell; color: s
   USUARIO_BLOQUEADO_MANUAL: { label: 'Usuario bloqueado manualmente', icon: Lock, color: 'text-red-600 dark:text-red-400' },
   RESPALDO_CREADO: { label: 'Respaldo de base de datos creado', icon: HardDrive, color: 'text-emerald-600' },
   RESPALDO_ERROR: { label: 'Error al crear un respaldo', icon: AlertTriangle, color: 'text-red-600 dark:text-red-400' },
+  RESPALDO_ORACLE_EJECUTADO: { label: 'Respaldo subido a Oracle Object Storage', icon: Cloud, color: 'text-emerald-600' },
+  RESPALDO_ORACLE_ERROR: { label: 'Error al respaldar a Oracle Object Storage', icon: AlertTriangle, color: 'text-red-600 dark:text-red-400' },
+  RESPALDO_ORACLE_RESTAURADO: { label: 'Base de datos restaurada desde Oracle Object Storage', icon: RotateCcw, color: 'text-amber-600' },
   CONFIGURACION_EMPRESA_ACTUALIZADA: { label: 'Datos de la empresa actualizados', icon: Settings, color: 'text-blue-600' },
   TARIFAS_ACTUALIZADAS: { label: 'Tarifas actualizadas', icon: Settings, color: 'text-blue-600' },
   SEGURIDAD_ACTUALIZADA: { label: 'Configuración de seguridad actualizada', icon: Settings, color: 'text-blue-600' },

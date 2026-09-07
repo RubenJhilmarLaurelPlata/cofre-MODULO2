@@ -76,12 +76,38 @@ type EstrategiaDeteccion = 'nativo' | 'zxing' | null;
 // camara), pero mejora notablemente la nitidez en los que si lo soportan
 // (Chrome/Android). Mismas constraints para la via nativa y la via zxing,
 // para que ambas tengan la misma calidad de imagen de entrada.
-const VIDEO_CONSTRAINTS: MediaTrackConstraints = {
+//
+// Fase 4.3 (Recepcion/Entrega: el QR de Envios detecta bien, un Code128
+// real no) — auditoria comparada confirmo que ambos formatos comparten
+// exactamente los mismos hints/constraints hoy (ningun bug de routing),
+// asi que la diferencia real es que un codigo de barras lineal necesita
+// bastante mas resolucion horizontal efectiva que un QR del mismo tamaño
+// fisico para que zxing/BarcodeDetector puedan resolver sus barras mas
+// finas — 720p "ideal" alcanza para QR pero se queda corto para Code128
+// en la distancia de uso normal. Se sube la resolucion SOLO para
+// code_128 (nunca para qr_code, que ya esta confirmado funcionando en
+// produccion — no se toca su configuracion en absoluto).
+const VIDEO_CONSTRAINTS_QR: MediaTrackConstraints = {
   facingMode: { ideal: 'environment' },
   width: { ideal: 1280 },
   height: { ideal: 720 },
   advanced: [{ focusMode: 'continuous' } as MediaTrackConstraintSet],
 };
+const VIDEO_CONSTRAINTS_BARRAS: MediaTrackConstraints = {
+  facingMode: { ideal: 'environment' },
+  width: { ideal: 1920 },
+  height: { ideal: 1080 },
+  advanced: [{ focusMode: 'continuous' } as MediaTrackConstraintSet],
+};
+
+// Fase 4.3: zxing reintenta decodificar cada `timeBetweenScansMillis`
+// (por defecto 500ms — ver BrowserCodeReader en @zxing/library). Un
+// codigo de barras lineal es mucho mas sensible que un QR a que el frame
+// exacto este bien enfocado/alineado en el instante del intento — probar
+// mas seguido (150ms) da mas oportunidades de acertar un frame nitido
+// mientras el operador ajusta la distancia/angulo, sin cambiar nada de
+// la via QR (que sigue usando el valor por defecto de la libreria).
+const ZXING_INTERVALO_MS_BARRAS = 150;
 
 // Fase 4: cuantos frames consecutivos puede fallar detect() del
 // BarcodeDetector nativo antes de asumir que, aunque el navegador declaro
@@ -169,7 +195,7 @@ export function CameraScanner({ onDetect, cooldownMs = 1800, autoStart = true, f
 
   const iniciarNativo = React.useCallback(
     async (BarcodeDetectorCtor: new (opts: { formats: string[] }) => { detect(source: CanvasImageSource): Promise<Array<{ rawValue: string }>> }) => {
-      const stream = await navigator.mediaDevices.getUserMedia({ video: VIDEO_CONSTRAINTS });
+      const stream = await navigator.mediaDevices.getUserMedia({ video: esSoloQr ? VIDEO_CONSTRAINTS_QR : VIDEO_CONSTRAINTS_BARRAS });
       // getUserMedia() puede tardar varios segundos en resolver (espera al
       // dialogo de permiso del sistema operativo) — si el operador cambia
       // de pestaña (vuelve a "Lector USB") ANTES de que resuelva, este
@@ -221,7 +247,7 @@ export function CameraScanner({ onDetect, cooldownMs = 1800, autoStart = true, f
       rafIdRef.current = requestAnimationFrame(loop);
       setEstrategia('nativo');
     },
-    [aceptarDeteccion, formats, detenerNativo]
+    [aceptarDeteccion, formats, detenerNativo, esSoloQr]
   );
 
   const iniciarZxing = React.useCallback(async () => {
@@ -234,7 +260,10 @@ export function CameraScanner({ onDetect, cooldownMs = 1800, autoStart = true, f
     hints.set(DecodeHintType.POSSIBLE_FORMATS, formats.map((f) => MAPA_ZXING[f]));
     hints.set(DecodeHintType.TRY_HARDER, true);
 
-    const reader = new BrowserMultiFormatReader(hints);
+    // timeBetweenScansMillis (2do arg): undefined deja el default de la
+    // libreria (500ms) para QR, sin ningun cambio de comportamiento — ver
+    // comentario de ZXING_INTERVALO_MS_BARRAS arriba.
+    const reader = new BrowserMultiFormatReader(hints, esSoloQr ? undefined : ZXING_INTERVALO_MS_BARRAS);
     readerRef.current = reader;
 
     if (!videoRef.current) throw new Error('No se pudo preparar el visor de cámara.');
@@ -243,7 +272,7 @@ export function CameraScanner({ onDetect, cooldownMs = 1800, autoStart = true, f
     // decodeFromConstraints solo recibe (result, error) — no hay un
     // tercer parametro de "controles". Para detener la camara se llama
     // reader.reset() sobre la misma instancia (guardada en readerRef).
-    await reader.decodeFromConstraints({ video: VIDEO_CONSTRAINTS }, videoRef.current, (result) => {
+    await reader.decodeFromConstraints({ video: esSoloQr ? VIDEO_CONSTRAINTS_QR : VIDEO_CONSTRAINTS_BARRAS }, videoRef.current, (result) => {
       if (!result) return;
       aceptarDeteccion(result.getText());
     });
@@ -257,7 +286,7 @@ export function CameraScanner({ onDetect, cooldownMs = 1800, autoStart = true, f
       return;
     }
     setEstrategia('zxing');
-  }, [aceptarDeteccion, formats]);
+  }, [aceptarDeteccion, formats, esSoloQr]);
   iniciarZxingRef.current = iniciarZxing;
 
   const iniciandoRef = React.useRef(false);
@@ -406,7 +435,9 @@ export function CameraScanner({ onDetect, cooldownMs = 1800, autoStart = true, f
               <p className="truncate font-mono text-sm font-semibold text-gray-900 dark:text-gray-100">{ultimoDetectado}</p>
             </div>
           ) : (
-            <p className="text-xs text-gray-400 dark:text-gray-500">{textoInstruccion ?? `Apunta la cámara al ${esSoloQr ? 'código QR del envío' : 'código de barras'}…`}</p>
+            <p className="text-xs text-gray-400 dark:text-gray-500">
+              {textoInstruccion ?? (esSoloQr ? 'Apunta la cámara al código QR del envío…' : 'Alinea el código de barras horizontal, a unos 10-15 cm de la cámara…')}
+            </p>
           )}
         </div>
       )}

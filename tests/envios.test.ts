@@ -4,7 +4,7 @@
 // obligatorio, agregar/evitar duplicado/evitar reserva cruzada, quitar,
 // cerrar (inmutabilidad + QR), cancelar (libera paquetes), AuditLog de
 // cada accion, y que Package.status NUNCA cambia por estar en un envio.
-import { describe, test, expect, beforeAll } from 'vitest';
+import { describe, test, expect, beforeAll, beforeEach } from 'vitest';
 import { prisma } from '@/lib/prisma';
 import { normalizarEntradaEscaneo } from '@/lib/codigo';
 import {
@@ -77,6 +77,22 @@ beforeAll(async () => {
   destinoId = destino.id;
 });
 
+// "Lote diario" (crearEnvio() ahora reutiliza el envío BORRADOR ya
+// abierto hoy para un mismo destino — ver src/lib/envios.ts): casi todos
+// los tests de este archivo llaman a crearEnvio(destinoId, userId) contra
+// el MISMO destino compartido de arriba, esperando cada vez un envío
+// BORRADOR nuevo y vacío para armar su propio escenario — sin este reset
+// entre tests, la mayoría terminaría compartiendo sin querer el lote
+// abierto por un test anterior. Limpiar diaAperturaKey (sin tocar estado
+// ni nada más) antes de cada test es exactamente lo mismo que ya hace
+// cerrarEnvio()/cancelarEnvio() al cerrar/cancelar un lote real: libera
+// la ranura del día para que la siguiente llamada cree uno nuevo. Los
+// tests que sí quieren probar la reutilización (más abajo) usan su
+// propio destino dedicado, nunca este.
+beforeEach(async () => {
+  await prisma.envio.updateMany({ where: { estado: 'BORRADOR' }, data: { diaAperturaKey: null } });
+});
+
 describe('TEST 1/2 — crear envío / destino obligatorio', () => {
   test('crea un envío en BORRADOR con código único', async () => {
     const envio = await crearEnvio(destinoId, userId);
@@ -93,6 +109,90 @@ describe('TEST 1/2 — crear envío / destino obligatorio', () => {
   test('rechaza un destino inactivo', async () => {
     const inactivo = await prisma.sucursalDestino.create({ data: { codigo: 'INACT', nombre: 'Inactiva', activa: false } });
     await expect(crearEnvio(inactivo.id, userId)).rejects.toThrow(DestinoInactivoError);
+  });
+});
+
+describe('Lote diario — un solo envío BORRADOR abierto por destino y día', () => {
+  test('dos llamadas a crearEnvio el mismo día, mismo destino, devuelven el MISMO envío (no crea uno nuevo cada vez)', async () => {
+    const destino = await prisma.sucursalDestino.create({ data: { codigo: 'LOTE1', nombre: 'Lote diario 1' } });
+    const primero = await crearEnvio(destino.id, userId);
+    const segundo = await crearEnvio(destino.id, userId);
+    expect(segundo.id).toBe(primero.id);
+    expect(segundo.codigo).toBe(primero.codigo);
+  });
+
+  test('paquetes agregados en llamadas separadas a lo largo del día quedan todos en el mismo lote', async () => {
+    const destino = await prisma.sucursalDestino.create({ data: { codigo: 'LOTE2', nombre: 'Lote diario 2' } });
+    const envio1 = await crearEnvio(destino.id, userId);
+    const pkgManana = await crearPaqueteDePrueba();
+    await agregarPaquete(envio1.id, pkgManana.code, userId);
+
+    // "Vuelve a abrir" el mismo lote más tarde en el día — como hace la
+    // pantalla "Enviar paquetes" cada vez que el operador la usa.
+    const envio2 = await crearEnvio(destino.id, userId);
+    const pkgTarde = await crearPaqueteDePrueba();
+    await agregarPaquete(envio2.id, pkgTarde.code, userId);
+
+    const detalle = await getEnvioDetalle(envio1.id);
+    expect(detalle.id).toBe(envio2.id);
+    expect(detalle.items.map((it) => it.code).sort()).toEqual([pkgManana.code, pkgTarde.code].sort());
+  });
+
+  test('cerrar el lote libera el día: la siguiente llamada crea uno nuevo', async () => {
+    const destino = await prisma.sucursalDestino.create({ data: { codigo: 'LOTE3', nombre: 'Lote diario 3' } });
+    const envio = await crearEnvio(destino.id, userId);
+    const pkg = await crearPaqueteDePrueba();
+    await agregarPaquete(envio.id, pkg.code, userId);
+    await cerrarEnvio(envio.id, userId);
+
+    const nuevoLote = await crearEnvio(destino.id, userId);
+    expect(nuevoLote.id).not.toBe(envio.id);
+    expect(nuevoLote.estado).toBe('BORRADOR');
+    expect(nuevoLote.items).toHaveLength(0);
+  });
+
+  test('cancelar el lote también libera el día: la siguiente llamada crea uno nuevo', async () => {
+    const destino = await prisma.sucursalDestino.create({ data: { codigo: 'LOTE4', nombre: 'Lote diario 4' } });
+    const envio = await crearEnvio(destino.id, userId);
+    await cancelarEnvio(envio.id, userId);
+
+    const nuevoLote = await crearEnvio(destino.id, userId);
+    expect(nuevoLote.id).not.toBe(envio.id);
+    expect(nuevoLote.estado).toBe('BORRADOR');
+  });
+
+  test('destinos distintos nunca comparten lote, aunque sea el mismo día', async () => {
+    const destinoA = await prisma.sucursalDestino.create({ data: { codigo: 'LOTE5A', nombre: 'Lote diario 5A' } });
+    const destinoB = await prisma.sucursalDestino.create({ data: { codigo: 'LOTE5B', nombre: 'Lote diario 5B' } });
+    const envioA = await crearEnvio(destinoA.id, userId);
+    const envioB = await crearEnvio(destinoB.id, userId);
+    expect(envioA.id).not.toBe(envioB.id);
+  });
+
+  test('crearEnvio solo registra ENVIO_CREADO en AuditLog la primera vez, nunca al reutilizar', async () => {
+    const destino = await prisma.sucursalDestino.create({ data: { codigo: 'LOTE6', nombre: 'Lote diario 6' } });
+    await crearEnvio(destino.id, userId);
+    await crearEnvio(destino.id, userId);
+    await crearEnvio(destino.id, userId);
+
+    const eventos = await prisma.auditLog.findMany({ where: { modulo: 'envios', accion: 'ENVIO_CREADO' } });
+    const deEsteDestino = eventos.filter((e) => (JSON.parse(e.valorNuevo ?? '{}') as { destino?: string }).destino === destino.nombre);
+    expect(deEsteDestino).toHaveLength(1);
+  });
+
+  test('un lote abierto ANTES de existir esta columna (diaAperturaKey null) no se reutiliza — sigue existiendo, pero crearEnvio abre uno nuevo', async () => {
+    const destino = await prisma.sucursalDestino.create({ data: { codigo: 'LOTE7', nombre: 'Lote diario 7' } });
+    const viejo = await crearEnvio(destino.id, userId);
+    // Simula un envío BORRADOR de antes de esta migración: nunca tuvo
+    // diaAperturaKey seteado.
+    await prisma.envio.update({ where: { id: viejo.id }, data: { diaAperturaKey: null } });
+
+    const nuevo = await crearEnvio(destino.id, userId);
+    expect(nuevo.id).not.toBe(viejo.id);
+
+    // El viejo sigue existiendo y siendo BORRADOR — no se tocó ni se perdió.
+    const viejoTrasElCambio = await getEnvioDetalle(viejo.id);
+    expect(viejoTrasElCambio.estado).toBe('BORRADOR');
   });
 });
 
@@ -132,8 +232,15 @@ describe('TEST 4 — evitar paquete duplicado', () => {
 
 describe('TEST 5 — evitar paquete reservado en otro envío', () => {
   test('un paquete ya en un envío BORRADOR no puede agregarse a otro', async () => {
+    // Dos destinos DISTINTOS a propósito: con el lote diario (crearEnvio
+    // reutiliza el BORRADOR ya abierto hoy para un mismo destino — ver
+    // src/lib/envios.ts), pedir el mismo destino dos veces devolvería el
+    // MISMO envío, y este test dejaría de probar lo que dice probar
+    // ("otro envío"). La reserva cruzada que se está probando aquí es
+    // independiente del destino de cada envío de todas formas.
+    const otroDestino = await prisma.sucursalDestino.create({ data: { codigo: 'TEST5B', nombre: 'Destino de prueba TEST5' } });
     const envioA = await crearEnvio(destinoId, userId);
-    const envioB = await crearEnvio(destinoId, userId);
+    const envioB = await crearEnvio(otroDestino.id, userId);
     const pkg = await crearPaqueteDePrueba();
 
     await agregarPaquete(envioA.id, pkg.code, userId);
@@ -151,7 +258,11 @@ describe('TEST 6 — quitar paquete', () => {
     expect(sinPaquete.items).toHaveLength(0);
     expect(conPaquete.items).toHaveLength(1); // no muta el objeto anterior
 
-    // Y ahora puede agregarse a otro envío sin problema.
+    // Y ahora puede volver a agregarse sin problema (crearEnvio reutiliza
+    // el mismo lote BORRADOR de hoy para este destino — ver TEST del
+    // "lote diario" más abajo — así que esto es intencionalmente el mismo
+    // envío, no uno distinto; lo que se prueba es que quitarPaquete() de
+    // verdad liberó el paquete).
     const otroEnvio = await crearEnvio(destinoId, userId);
     await expect(agregarPaquete(otroEnvio.id, pkg.code, userId)).resolves.toBeDefined();
   });
@@ -360,9 +471,12 @@ describe('Fase 2.1 — flujo directo: agregar un código que todavía no existe'
     expect(creado!.branchId).toBe(branchId);
 
     // Y queda igual de protegido que un paquete que sí pasó por Recepción:
-    // no puede agregarse dos veces ni reservarse en otro envío.
+    // no puede agregarse dos veces ni reservarse en otro envío. Destino
+    // distinto a propósito (ver TEST 5): con el lote diario, pedir el
+    // mismo destino otra vez devolvería este mismo envío.
     await expect(agregarPaquete(envio.id, codigoNuevo, userId, branchId)).rejects.toThrow(PaqueteYaReservadoError);
-    const otroEnvio = await crearEnvio(destinoId, userId);
+    const otroDestino = await prisma.sucursalDestino.create({ data: { codigo: 'FASE21B', nombre: 'Destino de prueba Fase 2.1' } });
+    const otroEnvio = await crearEnvio(otroDestino.id, userId);
     await expect(agregarPaquete(otroEnvio.id, codigoNuevo, userId, branchId)).rejects.toThrow(PaqueteYaReservadoError);
   });
 

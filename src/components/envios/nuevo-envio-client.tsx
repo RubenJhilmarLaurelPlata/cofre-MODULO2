@@ -75,7 +75,7 @@ export function NuevoEnvioClient() {
         </CardHeader>
         <CardContent className="space-y-4">
           <p className="text-sm text-ink-soft dark:text-gray-400">
-            Elige la sucursal de destino. Después de crear el envío podrás escanear directamente los códigos de los paquetes — no hace falta que hayan pasado antes por Recepción.
+            Elige la sucursal de destino. Si ya hay un lote abierto hoy para ese destino, continuarás agregando paquetes ahí mismo — cada destino tiene un solo lote abierto por día, hasta que se cierra. No hace falta que los paquetes hayan pasado antes por Recepción.
           </p>
 
           {cargando ? (
@@ -114,7 +114,7 @@ export function NuevoEnvioClient() {
           )}
 
           <Button onClick={crear} loading={creando} disabled={destinos.length === 0} className="w-full">
-            Crear envío
+            Abrir o continuar el lote de hoy
           </Button>
         </CardContent>
       </Card>

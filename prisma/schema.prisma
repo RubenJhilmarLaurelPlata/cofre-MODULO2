@@ -809,8 +809,24 @@ model Envio {
   liquidacionId String?
   liquidacion   LiquidacionEnvio? @relation(fields: [liquidacionId], references: [id])
 
+  // "Lote diario abierto" (una sola instalacion, ver crearEnvio() en
+  // src/lib/envios.ts): "YYYY-MM-DD" (hora America/La_Paz, igual que
+  // dateKey() en src/lib/pricing.ts) del dia en que el envio quedo
+  // ABIERTO por ultima vez, o null si no esta actualmente abierto. Se
+  // llena SOLO al crear (BORRADOR) y se limpia a null en cerrarEnvio()/
+  // cancelarEnvio() — nunca en ningun otro momento. Junto con
+  // @@unique([destinoId, diaAperturaKey]) esto es lo que le permite a
+  // crearEnvio() reutilizar el mismo envio BORRADOR de todo el dia para
+  // un mismo destino en vez de crear uno nuevo en cada llamada (SQLite
+  // trata cada NULL como distinto entre si, asi que los envios ya
+  // cerrados/cancelados — o los BORRADOR de antes de esta columna
+  // existir, todos con diaAperturaKey null — nunca chocan entre si contra
+  // este indice).
+  diaAperturaKey String?
+
   items EnvioItem[]
 
+  @@unique([destinoId, diaAperturaKey])
   @@index([destinoId])
   @@index([estado])
   @@index([createdAt])

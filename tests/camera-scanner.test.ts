@@ -21,18 +21,23 @@ const { act } = React;
 (globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
 const decodeFromConstraintsMock = vi.fn(
-  async (_constraints: unknown, _video: HTMLVideoElement, callback: (result: { getText(): string } | null) => void) => {
+  async (constraints: { video?: MediaTrackConstraints }, _video: HTMLVideoElement, callback: (result: { getText(): string } | null) => void) => {
     ultimoCallbackZxing = callback;
+    ultimasConstraintsZxing = constraints.video ?? null;
   }
 );
 const resetZxingMock = vi.fn();
 let ultimoCallbackZxing: ((result: { getText(): string } | null) => void) | null = null;
+let ultimasConstraintsZxing: MediaTrackConstraints | null = null;
+let ultimoTimeBetweenScansMillis: number | undefined = undefined;
 
 vi.mock('@zxing/library', () => {
   class FakeBrowserMultiFormatReader {
     decodeFromConstraints = decodeFromConstraintsMock;
     reset = resetZxingMock;
-    constructor(_hints: unknown) {}
+    constructor(_hints: unknown, timeBetweenScansMillis?: number) {
+      ultimoTimeBetweenScansMillis = timeBetweenScansMillis;
+    }
   }
   return {
     BrowserMultiFormatReader: FakeBrowserMultiFormatReader,
@@ -76,6 +81,8 @@ beforeEach(() => {
   decodeFromConstraintsMock.mockClear();
   resetZxingMock.mockClear();
   ultimoCallbackZxing = null;
+  ultimasConstraintsZxing = null;
+  ultimoTimeBetweenScansMillis = undefined;
   delete (window as unknown as { BarcodeDetector?: unknown }).BarcodeDetector;
   container = document.createElement('div');
   document.body.appendChild(container);
@@ -223,5 +230,70 @@ describe('CameraScanner — payload QR y cleanup en Android (zxing)', () => {
     // onDetect despues de desmontar.
     expect(resetZxingMock).toHaveBeenCalled();
     expect(onDetect).not.toHaveBeenCalled();
+  });
+});
+
+describe('CameraScanner — Code128 (Recepción/Entrega) usa mayor resolución y reintenta más seguido, sin tocar el QR (Fase 4.3)', () => {
+  test('code_128 vía zxing (Android) pide 1920x1080 y un intervalo de reintento más corto que el default', async () => {
+    await montar(UA_ANDROID_CHROME, { formats: ['code_128'] });
+
+    expect(decodeFromConstraintsMock).toHaveBeenCalledTimes(1);
+    expect(ultimasConstraintsZxing).toMatchObject({ width: { ideal: 1920 }, height: { ideal: 1080 } });
+    expect(ultimoTimeBetweenScansMillis).toBe(150);
+  });
+
+  test('qr_code vía zxing sigue exactamente igual que antes: 1280x720 y el intervalo por defecto de la librería (sin cambios)', async () => {
+    await montar(UA_ANDROID_CHROME, { formats: ['qr_code'] });
+
+    expect(decodeFromConstraintsMock).toHaveBeenCalledTimes(1);
+    expect(ultimasConstraintsZxing).toMatchObject({ width: { ideal: 1280 }, height: { ideal: 720 } });
+    expect(ultimoTimeBetweenScansMillis).toBeUndefined(); // deja que @zxing/library use su propio default (500ms)
+  });
+
+  test('code_128 vía BarcodeDetector nativo (desktop) también pide 1920x1080', async () => {
+    const fakeTrack = { stop: vi.fn() };
+    const getUserMediaMock = vi.fn().mockResolvedValue({ getTracks: () => [fakeTrack] });
+    Object.defineProperty(window.navigator, 'mediaDevices', { value: { getUserMedia: getUserMediaMock }, configurable: true });
+
+    class FakeBarcodeDetectorPresenteYSoportado {
+      static getSupportedFormats = vi.fn().mockResolvedValue(['qr_code', 'code_128']);
+      constructor(_opts: { formats: string[] }) {}
+      detect = vi.fn().mockResolvedValue([]);
+    }
+    (window as unknown as { BarcodeDetector: unknown }).BarcodeDetector = FakeBarcodeDetectorPresenteYSoportado;
+
+    await montar(UA_DESKTOP_CHROME, { formats: ['code_128'] });
+
+    expect(getUserMediaMock).toHaveBeenCalledTimes(1);
+    expect(getUserMediaMock).toHaveBeenCalledWith({ video: expect.objectContaining({ width: { ideal: 1920 }, height: { ideal: 1080 } }) });
+  });
+
+  test('qr_code vía BarcodeDetector nativo (desktop) sigue pidiendo 1280x720 — el QR de Envíos no se toca', async () => {
+    const fakeTrack = { stop: vi.fn() };
+    const getUserMediaMock = vi.fn().mockResolvedValue({ getTracks: () => [fakeTrack] });
+    Object.defineProperty(window.navigator, 'mediaDevices', { value: { getUserMedia: getUserMediaMock }, configurable: true });
+
+    class FakeBarcodeDetectorPresenteYSoportado {
+      static getSupportedFormats = vi.fn().mockResolvedValue(['qr_code', 'code_128']);
+      constructor(_opts: { formats: string[] }) {}
+      detect = vi.fn().mockResolvedValue([]);
+    }
+    (window as unknown as { BarcodeDetector: unknown }).BarcodeDetector = FakeBarcodeDetectorPresenteYSoportado;
+
+    await montar(UA_DESKTOP_CHROME, { formats: ['qr_code'] });
+
+    expect(getUserMediaMock).toHaveBeenCalledWith({ video: expect.objectContaining({ width: { ideal: 1280 }, height: { ideal: 720 } }) });
+  });
+
+  test('code_128 detectado vía zxing en Android sigue llegando intacto a onDetect (normalización de src/lib/codigo.ts sin cambios)', async () => {
+    const { onDetect } = await montar(UA_ANDROID_CHROME, { formats: ['code_128'] });
+    expect(ultimoCallbackZxing).not.toBeNull();
+
+    await act(async () => {
+      ultimoCallbackZxing!({ getText: () => "l17a'29" });
+      await esperarAsentado();
+    });
+
+    expect(onDetect).toHaveBeenCalledWith('L17A-29');
   });
 });

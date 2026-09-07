@@ -20,6 +20,7 @@ import { registrarAuditoria } from '@/lib/auditoria';
 import { normalizarCodigo, canonicalizarSeparadores } from '@/lib/codigo';
 import { registrarPaqueteBasico, type CamposExtraRegistro } from '@/lib/paquete-registro';
 import { getCompanyConfig } from '@/lib/config';
+import { dateKey } from '@/lib/pricing';
 import type { Prisma, Envio, EnvioItem } from '@prisma/client';
 
 export class EnvioNoEncontradoError extends Error {
@@ -412,24 +413,62 @@ export async function getEnvioDetalle(id: string): Promise<EnvioDetalleDTO> {
   };
 }
 
+/**
+ * Crea el envío BORRADOR al que ir agregando paquetes, o reutiliza el que
+ * ya esté abierto — "lote diario": cada sucursal tiene UN SOLO envío
+ * abierto por destino a la vez, y se le sigue agregando/quitando durante
+ * toda la jornada (09:00, 12:00, 17:00...) hasta que un operador lo
+ * cierra explícitamente (cerrarEnvio()) o lo cancela (cancelarEnvio()) —
+ * recién ahí una siguiente llamada a crearEnvio() para ese mismo destino
+ * abre uno nuevo. "El mismo día" se calcula con dateKey() (src/lib/
+ * pricing.ts), es decir en hora America/La_Paz (ver next.config.mjs, que
+ * fija la TZ del proceso a Bolivia) — nunca UTC.
+ *
+ * find-or-create dentro de una sola transacción (mismo criterio que
+ * agregarPaquete()/cerrarEnvio() en este archivo): evita la ventana de
+ * carrera de dos operadores creando el lote del día al mismo tiempo. La
+ * columna Envio.diaAperturaKey + @@unique([destinoId, diaAperturaKey])
+ * (ver schema) son la protección de fondo a nivel de base de datos —
+ * doble defensa, igual que el resto de este módulo.
+ *
+ * Envíos creados ANTES de que existiera esta columna (diaAperturaKey
+ * null, nunca reescrita retroactivamente por la migración — ver su
+ * comentario) simplemente no se encuentran ni se reutilizan: siguen
+ * existiendo y siendo editables como siempre, solo que una nueva llamada
+ * a crearEnvio() para su mismo destino abre un lote nuevo en vez de
+ * reusarlos. No hace falta backfill: no se pierde ni se bloquea nada.
+ */
 export async function crearEnvio(destinoId: string, userId: string): Promise<EnvioDetalleDTO> {
   const destino = await prisma.sucursalDestino.findUnique({ where: { id: destinoId } });
   if (!destino) throw new DestinoNoEncontradoError();
   if (!destino.activa) throw new DestinoInactivoError();
 
-  const envio = await prisma.$transaction(async (tx) => {
+  const hoyKey = dateKey(new Date());
+
+  const { envioId, creado } = await prisma.$transaction(async (tx) => {
+    const abierto = await tx.envio.findFirst({
+      where: { destinoId, estado: 'BORRADOR', diaAperturaKey: hoyKey },
+      select: { id: true },
+    });
+    if (abierto) return { envioId: abierto.id, creado: false };
+
     const codigo = await generarCodigoEnvio(tx);
-    return tx.envio.create({ data: { codigo, destinoId, estado: 'BORRADOR', creadoPorId: userId } });
+    const nuevo = await tx.envio.create({
+      data: { codigo, destinoId, estado: 'BORRADOR', creadoPorId: userId, diaAperturaKey: hoyKey },
+    });
+    return { envioId: nuevo.id, creado: true };
   }, TRANSACTION_OPTS);
 
-  await registrarAuditoria({
-    userId,
-    accion: 'ENVIO_CREADO',
-    modulo: 'envios',
-    valorNuevo: { codigo: envio.codigo, destino: destino.nombre },
-  });
+  if (creado) {
+    await registrarAuditoria({
+      userId,
+      accion: 'ENVIO_CREADO',
+      modulo: 'envios',
+      valorNuevo: { destino: destino.nombre },
+    });
+  }
 
-  return getEnvioDetalle(envio.id);
+  return getEnvioDetalle(envioId);
 }
 
 /**
@@ -607,7 +646,11 @@ export async function cerrarEnvio(envioId: string, userId: string): Promise<Envi
     // en package-transitions.ts.
     const resultado = await tx.envio.updateMany({
       where: { id: envioId, estado: 'BORRADOR' },
-      data: { estado: 'CERRADO', qrToken, cerradoAt: new Date(), cerradoPorId: userId },
+      // diaAperturaKey vuelve a null: el lote ya no esta "abierto" (queda
+      // inmutable de aqui en mas), asi que libera esa ranura del dia para
+      // que una siguiente crearEnvio() a este mismo destino abra un lote
+      // nuevo en vez de toparse con el @@unique([destinoId, diaAperturaKey]).
+      data: { estado: 'CERRADO', qrToken, cerradoAt: new Date(), cerradoPorId: userId, diaAperturaKey: null },
     });
     if (resultado.count === 0) throw new EnvioNoModificableError('CERRADO');
 
@@ -625,7 +668,8 @@ export async function cancelarEnvio(envioId: string, userId: string): Promise<En
     if (!envio) throw new EnvioNoEncontradoError();
     if (envio.estado !== 'BORRADOR') throw new EnvioNoModificableError(envio.estado);
 
-    const resultado = await tx.envio.updateMany({ where: { id: envioId, estado: 'BORRADOR' }, data: { estado: 'CANCELADO' } });
+    // diaAperturaKey vuelve a null por el mismo motivo que en cerrarEnvio().
+    const resultado = await tx.envio.updateMany({ where: { id: envioId, estado: 'BORRADOR' }, data: { estado: 'CANCELADO', diaAperturaKey: null } });
     if (resultado.count === 0) throw new EnvioNoModificableError('CANCELADO');
 
     return envio.codigo;

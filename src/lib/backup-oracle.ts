@@ -12,6 +12,7 @@ import { existsSync, copyFileSync } from 'node:fs';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { timestampArchivoLocal } from '@/lib/respaldos';
 
 const execFileAsync = promisify(execFile);
 
@@ -107,10 +108,34 @@ export interface RespaldoOracleDTO {
   fecha: string | null;
 }
 
+export interface ConfiguracionBackupOracleDTO {
+  bucket: string;
+  namespace: string;
+  scriptPath: string;
+}
+
+/**
+ * Config activa en ESTA instalación — puramente informativa (nunca se usa
+ * para decidir nada, solo para que un administrador vea, sin adivinar, a
+ * qué bucket/namespace/script apunta este servidor). Cada sucursal (La
+ * Paz, El Alto, futuras) corre su propio servidor con su propio .env: si
+ * dos instalaciones NO configuran ORACLE_BACKUP_BUCKET/ORACLE_NAMESPACE
+ * de forma explícita y distinta entre sí, ambas caerían en el mismo
+ * default y terminarían compartiendo el mismo almacenamiento — mostrar
+ * esto en la pantalla hace ese error visible de inmediato en vez de
+ * quedar oculto hasta que alguien note respaldos de la sucursal
+ * equivocada. Ver .env.example para la guía de qué configurar en una
+ * instalación nueva.
+ */
+export function getConfiguracionBackupOracle(): ConfiguracionBackupOracleDTO {
+  return { bucket: ORACLE_BUCKET, namespace: ORACLE_NAMESPACE, scriptPath: BACKUP_SCRIPT };
+}
+
 export interface ResultadoListaOracle {
   ok: boolean;
   objetos: RespaldoOracleDTO[];
   error?: string;
+  configuracion: ConfiguracionBackupOracleDTO;
 }
 
 interface ObjetoOciCrudo {
@@ -137,9 +162,9 @@ export async function listarRespaldosOracle(): Promise<ResultadoListaOracle> {
         fecha: o['time-created'] ?? o.timeCreated ?? null,
       }))
       .sort((a, b) => (b.fecha ?? '').localeCompare(a.fecha ?? '') || b.nombre.localeCompare(a.nombre));
-    return { ok: true, objetos };
+    return { ok: true, objetos, configuracion: getConfiguracionBackupOracle() };
   } catch (err) {
-    return { ok: false, objetos: [], error: formatearErrorComando(err) };
+    return { ok: false, objetos: [], error: formatearErrorComando(err), configuracion: getConfiguracionBackupOracle() };
   }
 }
 
@@ -195,8 +220,7 @@ export async function restaurarDesdeOracle(nombreArchivo: string): Promise<Resul
     return { ok: false, error: `No se pudo verificar la integridad del respaldo descargado: ${formatearErrorComando(err)}` };
   }
 
-  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const copiaSeguridad = `${dbPath}.antes-de-restaurar-${timestamp}`;
+  const copiaSeguridad = `${dbPath}.antes-de-restaurar-${timestampArchivoLocal()}`;
   try {
     copyFileSync(dbPath, copiaSeguridad);
     copyFileSync(tmpFile, dbPath);

@@ -1,0 +1,19 @@
+# scripts/backup-cofre.service
+#
+# Plantilla de referencia — instalar en /etc/systemd/system/ junto con
+# backup-cofre.timer (ver el paso 5 de la sección INSTALACIÓN dentro de
+# backup-cofre.sh). No se activa solo por sí mismo: hace falta habilitar
+# el .timer, no este .service directamente.
+#
+# Ajustar User=/WorkingDirectory= según el usuario/ruta reales de esta
+# instalación (La Paz y El Alto pueden diferir).
+[Unit]
+Description=Respaldo de Cofre Express a Oracle Object Storage
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/cofre-MODULO2
+ExecStart=/usr/local/bin/backup-cofre.sh
