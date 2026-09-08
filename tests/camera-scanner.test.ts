@@ -31,10 +31,45 @@ let ultimoCallbackZxing: ((result: { getText(): string } | null) => void) | null
 let ultimasConstraintsZxing: MediaTrackConstraints | null = null;
 let ultimoTimeBetweenScansMillis: number | undefined = undefined;
 
+// Fase 4.4 (pipeline propio por capas para code_128 — ver camera-scanner.tsx):
+// decodeBitmapMock simula reader.decodeBitmap(binaryBitmap). Por defecto
+// SIEMPRE lanza (ningun frame/orientacion "encuentra" nada) — cada test que
+// quiere simular una deteccion exitosa cambia su mockImplementation para
+// resolver solo en la rotacion que le interesa, usando las rotaciones que
+// quedan registradas en rotacionesIntentadas (una por cada
+// HTMLCanvasElementLuminanceSource creado, en orden).
+const decodeBitmapMock = vi.fn((_rotaciones: number): { getText(): string } => {
+  throw new Error('NotFoundException (fake): ningún código en este frame/orientación');
+});
+let rotacionesIntentadas: number[] = [];
+
+class FakeHTMLCanvasElementLuminanceSource {
+  rotaciones = 0;
+  constructor(
+    public canvas: unknown,
+    public doAutoInvert?: boolean
+  ) {}
+  rotateCounterClockwise() {
+    this.rotaciones += 1;
+    return this;
+  }
+}
+class FakeHybridBinarizer {
+  constructor(public luminanceSource: FakeHTMLCanvasElementLuminanceSource) {}
+}
+class FakeBinaryBitmap {
+  constructor(public binarizer: FakeHybridBinarizer) {}
+}
+
 vi.mock('@zxing/library', () => {
   class FakeBrowserMultiFormatReader {
     decodeFromConstraints = decodeFromConstraintsMock;
     reset = resetZxingMock;
+    decodeBitmap(bitmap: FakeBinaryBitmap) {
+      const rotaciones = bitmap.binarizer.luminanceSource.rotaciones;
+      rotacionesIntentadas.push(rotaciones);
+      return decodeBitmapMock(rotaciones);
+    }
     constructor(_hints: unknown, timeBetweenScansMillis?: number) {
       ultimoTimeBetweenScansMillis = timeBetweenScansMillis;
     }
@@ -43,6 +78,9 @@ vi.mock('@zxing/library', () => {
     BrowserMultiFormatReader: FakeBrowserMultiFormatReader,
     BarcodeFormat: { CODE_128: 1, QR_CODE: 2 },
     DecodeHintType: { POSSIBLE_FORMATS: 'POSSIBLE_FORMATS', TRY_HARDER: 'TRY_HARDER' },
+    HTMLCanvasElementLuminanceSource: FakeHTMLCanvasElementLuminanceSource,
+    HybridBinarizer: FakeHybridBinarizer,
+    BinaryBitmap: FakeBinaryBitmap,
   };
 });
 
@@ -72,14 +110,51 @@ async function esperarAsentado() {
   }
 }
 
+// iniciarZxingLineal() (pipeline propio de code_128 — Fase 4.4) usa
+// requestAnimationFrame, no promesas encadenadas: jsdom SÍ implementa rAF,
+// pero lo dispara por su propio timer interno (no es instantáneo como un
+// setTimeout(0) encadenado) — hace falta un tiempo real de espera, no solo
+// ticks de microtarea, para que el loop llegue a ejecutar al menos un
+// intento de decodeBitmap().
+async function esperarFrameDeCode128() {
+  await new Promise((r) => setTimeout(r, 50));
+}
+
 let container: HTMLDivElement;
 let root: Root;
 
 beforeEach(() => {
   Object.defineProperty(window, 'isSecureContext', { value: true, configurable: true });
   window.HTMLMediaElement.prototype.play = vi.fn().mockResolvedValue(undefined);
+  // jsdom no implementa canvas de verdad (getContext('2d') devuelve null
+  // sin el paquete nativo "canvas", que a propósito no se instaló solo
+  // para esto — ver iniciarZxingLineal(), todo lo que toca el canvas real
+  // pasa por @zxing/library, que ya está mockeado por completo). drawImage
+  // no-op alcanza: lo único que importa para estos tests es que se llame,
+  // nunca el contenido real de los píxeles.
+  window.HTMLCanvasElement.prototype.getContext = vi.fn().mockReturnValue({ drawImage: vi.fn() }) as unknown as typeof HTMLCanvasElement.prototype.getContext;
+  // jsdom nunca decodifica video real: videoWidth/videoHeight se quedan en
+  // 0 para siempre, y el loop de iniciarZxingLineal() (Fase 4.4) usa
+  // exactamente esa condición para saber si ya hay un frame real que
+  // decodificar — sin esto, el pipeline de code_128 jamás llega a intentar
+  // un solo decodeBitmap() en los tests.
+  Object.defineProperty(window.HTMLVideoElement.prototype, 'videoWidth', { value: 1920, configurable: true });
+  Object.defineProperty(window.HTMLVideoElement.prototype, 'videoHeight', { value: 1080, configurable: true });
+  // Stream por defecto para el pipeline propio de code_128
+  // (iniciarZxingLineal llama a getUserMedia directamente, nunca a través
+  // de @zxing/library) — un test que necesite inspeccionar la llamada
+  // define su propio mock explícito en su lugar.
+  Object.defineProperty(window.navigator, 'mediaDevices', {
+    value: { getUserMedia: vi.fn().mockResolvedValue({ getTracks: () => [{ stop: vi.fn() }] }) },
+    configurable: true,
+  });
   decodeFromConstraintsMock.mockClear();
   resetZxingMock.mockClear();
+  decodeBitmapMock.mockClear();
+  decodeBitmapMock.mockImplementation(() => {
+    throw new Error('NotFoundException (fake): ningún código en este frame/orientación');
+  });
+  rotacionesIntentadas = [];
   ultimoCallbackZxing = null;
   ultimasConstraintsZxing = null;
   ultimoTimeBetweenScansMillis = undefined;
@@ -233,16 +308,8 @@ describe('CameraScanner — payload QR y cleanup en Android (zxing)', () => {
   });
 });
 
-describe('CameraScanner — Code128 (Recepción/Entrega) usa mayor resolución y reintenta más seguido, sin tocar el QR (Fase 4.3)', () => {
-  test('code_128 vía zxing (Android) pide 1920x1080 y un intervalo de reintento más corto que el default', async () => {
-    await montar(UA_ANDROID_CHROME, { formats: ['code_128'] });
-
-    expect(decodeFromConstraintsMock).toHaveBeenCalledTimes(1);
-    expect(ultimasConstraintsZxing).toMatchObject({ width: { ideal: 1920 }, height: { ideal: 1080 } });
-    expect(ultimoTimeBetweenScansMillis).toBe(150);
-  });
-
-  test('qr_code vía zxing sigue exactamente igual que antes: 1280x720 y el intervalo por defecto de la librería (sin cambios)', async () => {
+describe('CameraScanner — Code128 (Recepción/Entrega) usa mayor resolución, sin tocar el QR (Fase 4.3)', () => {
+  test('qr_code vía zxing sigue exactamente igual que antes: decodeFromConstraints, 1280x720 y el intervalo por defecto de la librería (sin cambios)', async () => {
     await montar(UA_ANDROID_CHROME, { formats: ['qr_code'] });
 
     expect(decodeFromConstraintsMock).toHaveBeenCalledTimes(1);
@@ -285,15 +352,91 @@ describe('CameraScanner — Code128 (Recepción/Entrega) usa mayor resolución y
     expect(getUserMediaMock).toHaveBeenCalledWith({ video: expect.objectContaining({ width: { ideal: 1280 }, height: { ideal: 720 } }) });
   });
 
-  test('code_128 detectado vía zxing en Android sigue llegando intacto a onDetect (normalización de src/lib/codigo.ts sin cambios)', async () => {
-    const { onDetect } = await montar(UA_ANDROID_CHROME, { formats: ['code_128'] });
-    expect(ultimoCallbackZxing).not.toBeNull();
+});
 
+describe('CameraScanner — pipeline propio por capas para code_128 en iOS Safari/Android vía zxing (Fase 4.4)', () => {
+  // Causa raíz real (ver comentario extenso al inicio de camera-scanner.tsx):
+  // decodeFromConstraints() solo decodifica cada frame en UNA orientación.
+  // Un Code128 real, válido e impreso, sostenido "de lado", nunca se
+  // encuentra ahí — sin importar resolución o velocidad de reintento (ya
+  // se probó). code_128 vía zxing (iOS Safari SIEMPRE, Android por
+  // esAndroid()) ya NO usa decodeFromConstraints en absoluto: abre la
+  // cámara por su cuenta y decodifica cada frame en dos capas (0° y 90°)
+  // reutilizando el mismo reader vía decodeBitmap().
+
+  test('code_128 vía zxing NUNCA usa decodeFromConstraints — abre la cámara con getUserMedia directo, a 1920x1080', async () => {
+    await montar(UA_ANDROID_CHROME, { formats: ['code_128'] });
     await act(async () => {
-      ultimoCallbackZxing!({ getText: () => "l17a'29" });
       await esperarAsentado();
     });
 
-    expect(onDetect).toHaveBeenCalledWith('L17A-29');
+    expect(decodeFromConstraintsMock).not.toHaveBeenCalled();
+    const getUserMediaMock = window.navigator.mediaDevices.getUserMedia as ReturnType<typeof vi.fn>;
+    expect(getUserMediaMock).toHaveBeenCalledWith({ video: expect.objectContaining({ width: { ideal: 1920 }, height: { ideal: 1080 } }) });
+  });
+
+  test('un código sostenido "de lado" (solo se encuentra rotado 90°) SÍ se detecta — la capa B es justo lo que antes faltaba', async () => {
+    // Simula el caso real reportado: M02S-20, Code128 válido, que una app
+    // externa decodifica sin problema pero que la capa A (0°, equivalente
+    // a lo que hacía decodeFromConstraints) nunca encuentra.
+    decodeBitmapMock.mockImplementation((rotaciones: number) => {
+      if (rotaciones === 1) return { getText: () => 'm02s-20' };
+      throw new Error('NotFoundException (fake): a 0° no se encuentra, como en el caso real reportado');
+    });
+
+    const { onDetect } = await montar(UA_ANDROID_CHROME, { formats: ['code_128'] });
+    await act(async () => {
+      await esperarAsentado();
+      await esperarFrameDeCode128();
+    });
+
+    expect(rotacionesIntentadas).toEqual(expect.arrayContaining([0, 1])); // probó ambas capas
+    expect(onDetect).toHaveBeenCalledWith('M02S-20'); // normalizado, igual que el lector USB
+  });
+
+  test('un código legible sin rotar (0°) se acepta en la primera capa, sin necesitar la segunda', async () => {
+    decodeBitmapMock.mockImplementation((rotaciones: number) => {
+      if (rotaciones === 0) return { getText: () => 'M02S-20' };
+      throw new Error('no debería llegar a intentarse');
+    });
+
+    const { onDetect } = await montar(UA_ANDROID_CHROME, { formats: ['code_128'] });
+    await act(async () => {
+      await esperarAsentado();
+      await esperarFrameDeCode128();
+    });
+
+    expect(onDetect).toHaveBeenCalledWith('M02S-20');
+  });
+
+  test('ningún frame con código (0° y 90° fallan siempre): nunca llama a onDetect, pero sigue intentando sin romperse', async () => {
+    const { onDetect } = await montar(UA_ANDROID_CHROME, { formats: ['code_128'] });
+    await act(async () => {
+      await esperarAsentado();
+      await esperarFrameDeCode128();
+    });
+
+    expect(onDetect).not.toHaveBeenCalled();
+    expect(decodeBitmapMock.mock.calls.length).toBeGreaterThan(0); // sí lo intentó, solo que nunca encontró nada
+  });
+
+  test('desmontar durante el pipeline de code_128 detiene el stream propio (nunca queda una cámara abierta)', async () => {
+    const fakeTrack = { stop: vi.fn() };
+    Object.defineProperty(window.navigator, 'mediaDevices', {
+      value: { getUserMedia: vi.fn().mockResolvedValue({ getTracks: () => [fakeTrack] }) },
+      configurable: true,
+    });
+
+    await montar(UA_ANDROID_CHROME, { formats: ['code_128'] });
+    await act(async () => {
+      await esperarAsentado();
+    });
+
+    await act(async () => {
+      root.unmount();
+      await esperarAsentado();
+    });
+
+    expect(fakeTrack.stop).toHaveBeenCalled();
   });
 });

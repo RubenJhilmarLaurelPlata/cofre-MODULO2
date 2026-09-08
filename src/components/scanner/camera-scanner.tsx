@@ -32,6 +32,30 @@
 // (normalizacion, cooldown anti-repeticion, callback) — nunca hay dos
 // logicas distintas de "que hacer con el texto detectado".
 //
+// Fase 4.4 (iPhone/Safari: un Code128 real, impreso, valido y leido sin
+// problema por una app externa de escaneo en el MISMO telefono, nunca es
+// detectado aqui): iOS Safari no tiene BarcodeDetector — SIEMPRE usa
+// zxing, tanto para QR (que ya funciona en produccion) como para
+// Code128. Ambos pasaban por el mismo BrowserMultiFormatReader.
+// decodeFromConstraints(), cuyo loop interno (ver @zxing/library,
+// BrowserCodeReader.createBinaryBitmap/decodeContinuously) decodifica
+// cada frame en UNA sola orientacion (mas su version con colores
+// invertidos — nunca una rotacion). Un QR tolera esto porque sus 3
+// patrones localizadores lo hacen legible en cualquier angulo por
+// diseño; un codigo LINEAL como Code128 no: sus lectores escanean filas
+// horizontales de pixeles, y una etiqueta sostenida "de lado" (comun con
+// etiquetas angostas, con el codigo impreso a lo largo del lado corto)
+// queda con las barras verticales en el frame — invisibles para
+// cualquier lector 1D en esa orientacion, sin importar cuanta resolucion
+// o cuantos reintentos por segundo se agreguen (ya se probo). Una app
+// dedicada de escaneo si lo resuelve porque prueba varias rotaciones
+// internamente. Por eso, SOLO para code_128, se reemplaza
+// decodeFromConstraints() por un loop propio (ver iniciarZxingLineal())
+// que decodifica cada frame en dos capas — 0° y 90° — reutilizando el
+// MISMO reader/hints ya configurados via su metodo publico decodeBitmap().
+// qr_code sigue usando decodeFromConstraints() exactamente como antes,
+// sin ningun cambio.
+//
 // Arranca la camara automaticamente al montarse (autoStart, por defecto
 // true): el operador no debe pulsar un boton aparte para "activarla"
 // despues de elegir la pestaña Camara — ver especificacion Fase 6,
@@ -250,6 +274,95 @@ export function CameraScanner({ onDetect, cooldownMs = 1800, autoStart = true, f
     [aceptarDeteccion, formats, detenerNativo, esSoloQr]
   );
 
+  // Fase 4.4: pipeline propio para code_128 — ver comentario extenso al
+  // inicio del archivo. `reader` ya viene creado y configurado (mismos
+  // hints/CODE_128/TRY_HARDER) por iniciarZxing(); esta funcion SOLO se
+  // encarga de abrir la cámara y decodificar cada frame en dos capas
+  // (0° y 90°) usando ese mismo reader — nunca duplica la logica de
+  // decodificacion ni crea un segundo decoder.
+  const iniciarZxingLineal = React.useCallback(
+    async (reader: import('@zxing/library').BrowserMultiFormatReader) => {
+      const { HTMLCanvasElementLuminanceSource, HybridBinarizer, BinaryBitmap } = await import('@zxing/library');
+
+      const stream = await navigator.mediaDevices.getUserMedia({ video: VIDEO_CONSTRAINTS_BARRAS });
+      // Mismo riesgo/mismo chequeo que iniciarNativo() — ver su comentario.
+      if (!montadoRef.current) {
+        stream.getTracks().forEach((t) => t.stop());
+        return;
+      }
+      streamRef.current = stream;
+      if (!videoRef.current) throw new Error('No se pudo preparar el visor de cámara.');
+      videoRef.current.srcObject = stream;
+      await videoRef.current.play().catch(() => {});
+
+      // willReadFrequently: mismo hint que ya usa @zxing/library
+      // internamente para su propio canvas (ver getCaptureCanvasContext()
+      // en BrowserCodeReader) — le avisa a Safari que este canvas se va a
+      // leer seguido (getImageData en cada frame), no solo a dibujar, para
+      // que no lo trate como acelerado por GPU (mas lento/inconsistente
+      // para lecturas repetidas).
+      const canvas = document.createElement('canvas');
+      let ctx: CanvasRenderingContext2D | null;
+      try {
+        ctx = canvas.getContext('2d', { willReadFrequently: true });
+      } catch {
+        ctx = canvas.getContext('2d');
+      }
+      if (!ctx) throw new Error('No se pudo preparar el lienzo de captura.');
+      const contexto = ctx;
+
+      // Throttle explícito a ZXING_INTERVALO_MS_BARRAS: el RAF en sí sigue
+      // corriendo a la velocidad normal del navegador (~60fps), pero cada
+      // intento real hace 2 lecturas de canvas + 2 decodificaciones (capa A
+      // + capa B) — mucho más pesado que el detect() nativo de
+      // iniciarNativo(). Sin este throttle se intentaría decodificar en
+      // cada frame de pantalla, con un costo de CPU innecesario.
+      let ultimoIntentoAt = 0;
+
+      const loop = () => {
+        if (!montadoRef.current || !videoRef.current) return;
+        const ahora = performance.now();
+        if (ahora - ultimoIntentoAt < ZXING_INTERVALO_MS_BARRAS) {
+          rafIdRef.current = requestAnimationFrame(loop);
+          return;
+        }
+        ultimoIntentoAt = ahora;
+        const video = videoRef.current;
+        // videoWidth/videoHeight en 0 mientras el primer frame real
+        // todavia no llego (comun justo despues de play()) — nada que
+        // decodificar todavia, se reintenta en el siguiente frame.
+        if (video.videoWidth > 0 && video.videoHeight > 0) {
+          canvas.width = video.videoWidth;
+          canvas.height = video.videoHeight;
+          contexto.drawImage(video, 0, 0, video.videoWidth, video.videoHeight);
+
+          // Capa A (0 rotaciones): el frame tal cual, igual que antes.
+          // Capa B (1 rotacion): el MISMO frame rotado 90° — cubre una
+          // etiqueta sostenida "de lado", el caso real confirmado que
+          // ninguna cantidad de resolución/reintentos por sí sola resuelve.
+          for (const rotaciones of [0, 1] as const) {
+            try {
+              const luminance = new HTMLCanvasElementLuminanceSource(canvas, true);
+              for (let i = 0; i < rotaciones; i++) luminance.rotateCounterClockwise();
+              const resultado = reader.decodeBitmap(new BinaryBitmap(new HybridBinarizer(luminance)));
+              aceptarDeteccion(resultado.getText());
+              rafIdRef.current = requestAnimationFrame(loop);
+              return;
+            } catch {
+              // Ni la capa A ni la B encontraron nada en este frame —
+              // comportamiento normal mientras se apunta la cámara, nunca
+              // un fallo; se reintenta en el siguiente frame.
+            }
+          }
+        }
+        rafIdRef.current = requestAnimationFrame(loop);
+      };
+      rafIdRef.current = requestAnimationFrame(loop);
+      setEstrategia('zxing');
+    },
+    [aceptarDeteccion]
+  );
+
   const iniciarZxing = React.useCallback(async () => {
     // Import dinamico: evita cargar la libreria (y sus dependencias del
     // navegador) durante el renderizado en el servidor.
@@ -260,19 +373,32 @@ export function CameraScanner({ onDetect, cooldownMs = 1800, autoStart = true, f
     hints.set(DecodeHintType.POSSIBLE_FORMATS, formats.map((f) => MAPA_ZXING[f]));
     hints.set(DecodeHintType.TRY_HARDER, true);
 
-    // timeBetweenScansMillis (2do arg): undefined deja el default de la
-    // libreria (500ms) para QR, sin ningun cambio de comportamiento — ver
-    // comentario de ZXING_INTERVALO_MS_BARRAS arriba.
-    const reader = new BrowserMultiFormatReader(hints, esSoloQr ? undefined : ZXING_INTERVALO_MS_BARRAS);
+    // timeBetweenScansMillis (2do arg) solo lo usa el loop interno de
+    // decodeFromConstraints (QR, mas abajo) — no pasarlo deja el default
+    // de la libreria (500ms), sin cambios. iniciarZxingLineal() (code_128)
+    // nunca llama a decodeFromConstraints; maneja su propio throttle por
+    // requestAnimationFrame con ZXING_INTERVALO_MS_BARRAS.
+    const reader = new BrowserMultiFormatReader(hints);
     readerRef.current = reader;
 
     if (!videoRef.current) throw new Error('No se pudo preparar el visor de cámara.');
 
+    if (!esSoloQr) {
+      // Code128 (y cualquier otro formato lineal futuro): pipeline propio
+      // por capas — ver iniciarZxingLineal() y el comentario extenso al
+      // inicio del archivo. decodeFromConstraints() NUNCA se usa aqui.
+      await iniciarZxingLineal(reader);
+      if (!montadoRef.current) reader.reset();
+      return;
+    }
+
+    // QR: exactamente el mismo camino que ya esta confirmado funcionando
+    // en produccion — no se toca en absoluto.
     // NOTA: en la version instalada de @zxing/library, el callback de
     // decodeFromConstraints solo recibe (result, error) — no hay un
     // tercer parametro de "controles". Para detener la camara se llama
     // reader.reset() sobre la misma instancia (guardada en readerRef).
-    await reader.decodeFromConstraints({ video: esSoloQr ? VIDEO_CONSTRAINTS_QR : VIDEO_CONSTRAINTS_BARRAS }, videoRef.current, (result) => {
+    await reader.decodeFromConstraints({ video: VIDEO_CONSTRAINTS_QR }, videoRef.current, (result) => {
       if (!result) return;
       aceptarDeteccion(result.getText());
     });
@@ -286,7 +412,7 @@ export function CameraScanner({ onDetect, cooldownMs = 1800, autoStart = true, f
       return;
     }
     setEstrategia('zxing');
-  }, [aceptarDeteccion, formats, esSoloQr]);
+  }, [aceptarDeteccion, formats, esSoloQr, iniciarZxingLineal]);
   iniciarZxingRef.current = iniciarZxing;
 
   const iniciandoRef = React.useRef(false);
