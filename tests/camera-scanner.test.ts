@@ -61,6 +61,20 @@ class FakeBinaryBitmap {
   constructor(public binarizer: FakeHybridBinarizer) {}
 }
 
+// Fase 4.5 (ZBar/WASM como decoder primario de Code128 — ver
+// src/lib/scanner/zbar.ts): se mockea por completo, igual que
+// @zxing/library. Que ZBar realmente decodifica un Code128 REAL ya se
+// prueba, sin mocks, en tests/zbar-code128.test.ts — aqui lo que importa
+// es la ORQUESTACION del componente: que decida UNA vez por sesion cual
+// pipeline usar, que arme el ImageData del frame correcto, y que nunca la
+// use para qr_code.
+const zbarDisponibleMock = vi.fn(async () => false); // por defecto: respaldo de zxing (Fase 4.4), igual que antes de este cambio
+const decodificarCode128ConZbarMock = vi.fn(async (_imageData: unknown): Promise<string | null> => null);
+vi.mock('@/lib/scanner/zbar', () => ({
+  zbarDisponible: zbarDisponibleMock,
+  decodificarCode128ConZbar: decodificarCode128ConZbarMock,
+}));
+
 vi.mock('@zxing/library', () => {
   class FakeBrowserMultiFormatReader {
     decodeFromConstraints = decodeFromConstraintsMock;
@@ -132,7 +146,13 @@ beforeEach(() => {
   // pasa por @zxing/library, que ya está mockeado por completo). drawImage
   // no-op alcanza: lo único que importa para estos tests es que se llame,
   // nunca el contenido real de los píxeles.
-  window.HTMLCanvasElement.prototype.getContext = vi.fn().mockReturnValue({ drawImage: vi.fn() }) as unknown as typeof HTMLCanvasElement.prototype.getContext;
+  window.HTMLCanvasElement.prototype.getContext = vi.fn().mockReturnValue({
+    drawImage: vi.fn(),
+    // Fase 4.5: el pipeline de ZBar arma un ImageData del frame antes de
+    // decodificar — el contenido real de los pixeles no importa aqui
+    // (@undecaf/zbar-wasm esta completamente mockeado), solo que exista.
+    getImageData: vi.fn().mockReturnValue({ data: new Uint8ClampedArray(4), width: 1, height: 1 }),
+  }) as unknown as typeof HTMLCanvasElement.prototype.getContext;
   // jsdom nunca decodifica video real: videoWidth/videoHeight se quedan en
   // 0 para siempre, y el loop de iniciarZxingLineal() (Fase 4.4) usa
   // exactamente esa condición para saber si ya hay un frame real que
@@ -155,6 +175,10 @@ beforeEach(() => {
     throw new Error('NotFoundException (fake): ningún código en este frame/orientación');
   });
   rotacionesIntentadas = [];
+  zbarDisponibleMock.mockClear();
+  zbarDisponibleMock.mockImplementation(async () => false);
+  decodificarCode128ConZbarMock.mockClear();
+  decodificarCode128ConZbarMock.mockImplementation(async () => null);
   ultimoCallbackZxing = null;
   ultimasConstraintsZxing = null;
   ultimoTimeBetweenScansMillis = undefined;
@@ -354,15 +378,17 @@ describe('CameraScanner — Code128 (Recepción/Entrega) usa mayor resolución, 
 
 });
 
-describe('CameraScanner — pipeline propio por capas para code_128 en iOS Safari/Android vía zxing (Fase 4.4)', () => {
-  // Causa raíz real (ver comentario extenso al inicio de camera-scanner.tsx):
-  // decodeFromConstraints() solo decodifica cada frame en UNA orientación.
-  // Un Code128 real, válido e impreso, sostenido "de lado", nunca se
-  // encuentra ahí — sin importar resolución o velocidad de reintento (ya
-  // se probó). code_128 vía zxing (iOS Safari SIEMPRE, Android por
-  // esAndroid()) ya NO usa decodeFromConstraints en absoluto: abre la
-  // cámara por su cuenta y decodifica cada frame en dos capas (0° y 90°)
-  // reutilizando el mismo reader vía decodeBitmap().
+describe('CameraScanner — respaldo por capas de zxing cuando ZBar no está disponible (Fase 4.4, ahora fallback de la Fase 4.5)', () => {
+  // Estos tests dependen de que zbarDisponibleMock resuelva false (el
+  // valor por defecto en beforeEach) — así se ejercita exactamente el
+  // mismo camino de respaldo que existía antes de introducir ZBar. Causa
+  // raíz que motivó ESTE pipeline (ver comentario extenso al inicio de
+  // camera-scanner.tsx): decodeFromConstraints() solo decodifica cada
+  // frame en UNA orientación. Una etiqueta sostenida "de lado" nunca se
+  // encuentra ahí. code_128 sin ZBar disponible ya NO usa
+  // decodeFromConstraints en absoluto: abre la cámara por su cuenta y
+  // decodifica cada frame en dos capas (0° y 90°) reutilizando el mismo
+  // reader vía decodeBitmap().
 
   test('code_128 vía zxing NUNCA usa decodeFromConstraints — abre la cámara con getUserMedia directo, a 1920x1080', async () => {
     await montar(UA_ANDROID_CHROME, { formats: ['code_128'] });
@@ -421,6 +447,91 @@ describe('CameraScanner — pipeline propio por capas para code_128 en iOS Safar
   });
 
   test('desmontar durante el pipeline de code_128 detiene el stream propio (nunca queda una cámara abierta)', async () => {
+    const fakeTrack = { stop: vi.fn() };
+    Object.defineProperty(window.navigator, 'mediaDevices', {
+      value: { getUserMedia: vi.fn().mockResolvedValue({ getTracks: () => [fakeTrack] }) },
+      configurable: true,
+    });
+
+    await montar(UA_ANDROID_CHROME, { formats: ['code_128'] });
+    await act(async () => {
+      await esperarAsentado();
+    });
+
+    await act(async () => {
+      root.unmount();
+      await esperarAsentado();
+    });
+
+    expect(fakeTrack.stop).toHaveBeenCalled();
+  });
+});
+
+describe('CameraScanner — ZBar/WASM como decoder primario de Code128 (Fase 4.5)', () => {
+  // Causa raíz REAL confirmada en producción (ver comentario extenso al
+  // inicio de camera-scanner.tsx): un Code128 real, en orientación
+  // NORMAL, perfectamente encuadrado, en iPhone/Safari Y Android/Chrome,
+  // nunca era detectado por ninguna de las dos capas de zxing (Fase 4.4).
+  // Que ZBar SÍ decodifica un Code128 real (incluso rotado, escalado o con
+  // perspectiva) se prueba sin mocks en tests/zbar-code128.test.ts. Aquí
+  // se prueba la orquestación: decidir UNA vez por sesión, nunca alternar
+  // frame a frame, y no tocar QR en absoluto.
+
+  test('cuando ZBar está disponible, decodificarCode128ConZbar se usa y decodeBitmap (zxing) NUNCA se llama', async () => {
+    zbarDisponibleMock.mockImplementation(async () => true);
+
+    await montar(UA_ANDROID_CHROME, { formats: ['code_128'] });
+    await act(async () => {
+      await esperarAsentado();
+      await esperarFrameDeCode128();
+    });
+
+    expect(zbarDisponibleMock).toHaveBeenCalled();
+    expect(decodificarCode128ConZbarMock).toHaveBeenCalled();
+    expect(decodeBitmapMock).not.toHaveBeenCalled();
+  });
+
+  test('un texto devuelto por ZBar llega normalizado a onDetect (igual que el lector USB)', async () => {
+    zbarDisponibleMock.mockImplementation(async () => true);
+    decodificarCode128ConZbarMock.mockImplementation(async () => 'q03t-205');
+
+    const { onDetect } = await montar(UA_ANDROID_CHROME, { formats: ['code_128'] });
+    await act(async () => {
+      await esperarAsentado();
+      await esperarFrameDeCode128();
+    });
+
+    expect(onDetect).toHaveBeenCalledWith('Q03T-205');
+  });
+
+  test('mientras ZBar no encuentra nada (null) nunca llama a onDetect, pero sigue intentando sin romperse', async () => {
+    zbarDisponibleMock.mockImplementation(async () => true);
+
+    const { onDetect } = await montar(UA_ANDROID_CHROME, { formats: ['code_128'] });
+    await act(async () => {
+      await esperarAsentado();
+      await esperarFrameDeCode128();
+    });
+
+    expect(onDetect).not.toHaveBeenCalled();
+    expect(decodificarCode128ConZbarMock.mock.calls.length).toBeGreaterThan(0);
+  });
+
+  test('qr_code nunca consulta zbarDisponible ni decodificarCode128ConZbar — QR sigue siendo 100% zxing, sin cambios', async () => {
+    zbarDisponibleMock.mockImplementation(async () => true);
+
+    await montar(UA_ANDROID_CHROME, { formats: ['qr_code'] });
+    await act(async () => {
+      await esperarAsentado();
+    });
+
+    expect(zbarDisponibleMock).not.toHaveBeenCalled();
+    expect(decodificarCode128ConZbarMock).not.toHaveBeenCalled();
+    expect(decodeFromConstraintsMock).toHaveBeenCalledTimes(1);
+  });
+
+  test('desmontar durante el pipeline de ZBar detiene el stream propio (nunca queda una cámara abierta)', async () => {
+    zbarDisponibleMock.mockImplementation(async () => true);
     const fakeTrack = { stop: vi.fn() };
     Object.defineProperty(window.navigator, 'mediaDevices', {
       value: { getUserMedia: vi.fn().mockResolvedValue({ getTracks: () => [fakeTrack] }) },
