@@ -12,7 +12,8 @@
     "prisma:generate": "prisma generate",
     "prisma:push": "prisma db push",
     "prisma:studio": "prisma studio",
-    "db:seed": "tsx prisma/seed.ts"
+    "db:seed": "tsx prisma/seed.ts",
+    "tracking:worker": "tsx scripts/tracking-worker.ts"
   },
   "prisma": {
     "seed": "tsx prisma/seed.ts"

@@ -592,6 +592,20 @@ describe('Fase 2.1 — Recibir envío', () => {
     await expect(recibirEnvio(envio.id, userId)).rejects.toThrow(EnvioNoRecibibleError);
   });
 
+  test('Fase 4.4: la recepción LOCAL deja recibidoViaInterop=false, y la entrega local del paquete recién recibido sigue funcionando exactamente igual que siempre', async () => {
+    const envio = await crearEnvio(destinoId, userId);
+    const pkg = await crearPaqueteDePrueba();
+    await agregarPaquete(envio.id, pkg.code, userId);
+    await cerrarEnvio(envio.id, userId);
+    await recibirEnvio(envio.id, userId);
+
+    const envioEnDb = await prisma.envio.findUniqueOrThrow({ where: { id: envio.id } });
+    expect(envioEnDb.recibidoViaInterop).toBe(false);
+
+    const entregado = await entregarPaquete(pkg.code, userId);
+    expect(entregado.status).toBe('ENTREGADO');
+  });
+
   test('no se puede recibir un envío BORRADOR ni uno CANCELADO', async () => {
     const borrador = await crearEnvio(destinoId, userId);
     await expect(recibirEnvio(borrador.id, userId)).rejects.toThrow(EnvioNoRecibibleError);

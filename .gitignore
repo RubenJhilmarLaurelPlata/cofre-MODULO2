@@ -11,6 +11,8 @@ prisma/dev.db-journal
 prisma/*.db
 prisma/*.db-journal
 /data/backups/*.db
+/data/backups/*.db-shm
+/data/backups/*.db-wal
 /data/etiquetas/*.pdf
 /data/paquete-fotos/*
 .DS_Store
@@ -18,3 +20,4 @@ prisma/*.db-journal
 .claude/
 prisma/*.db-shm
 prisma/*.db-wal
+prisma/dev.db.backup-*

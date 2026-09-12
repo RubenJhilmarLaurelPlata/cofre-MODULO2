@@ -1340,7 +1340,11 @@ export function EntregaClient({
                   </p>
                   <p className="text-xs text-blue-700 dark:text-blue-400">
                     Enviado desde {paquete.envioInfo.origenNombre ?? 'esta instalación'} · envío {paquete.envioInfo.envioCodigo} ·{' '}
-                    {paquete.envioInfo.estado === 'RECIBIDO' ? 'RECIBIDO EN DESTINO — disponible para entrega' : 'EN TRÁNSITO'}
+                    {paquete.envioInfo.estado === 'RECIBIDO'
+                      ? paquete.enTransito
+                        ? 'RECIBIDO EN DESTINO — ya no disponible en esta sucursal'
+                        : 'RECIBIDO EN DESTINO — disponible para entrega'
+                      : 'EN TRÁNSITO'}
                   </p>
                 </div>
               )}
@@ -1348,7 +1352,7 @@ export function EntregaClient({
               {paquete.enTransito ? (
                 <div className="space-y-2 rounded-xl border border-amber-200 dark:border-amber-900/50 bg-amber-50 dark:bg-amber-500/10 p-4">
                   <p className="flex items-center gap-2 text-sm font-semibold text-amber-800 dark:text-amber-300">
-                    <Truck className="h-4 w-4 shrink-0" /> Paquete enviado a otra sucursal
+                    <Truck className="h-4 w-4 shrink-0" /> {paquete.enTransito.estado === 'RECIBIDO' ? 'Paquete transferido a otra sucursal' : 'Paquete enviado a otra sucursal'}
                   </p>
                   <div className="grid grid-cols-1 gap-1 text-sm text-amber-800 dark:text-amber-300 sm:grid-cols-2">
                     <p>
@@ -1359,10 +1363,12 @@ export function EntregaClient({
                     </p>
                   </div>
                   <p className="text-sm text-amber-800 dark:text-amber-300">
-                    Estado: <strong>EN TRÁNSITO</strong> (envío {paquete.enTransito.envioCodigo})
+                    Estado: <strong>{paquete.enTransito.estado === 'RECIBIDO' ? 'RECIBIDO EN DESTINO' : 'EN TRÁNSITO'}</strong> (envío {paquete.enTransito.envioCodigo})
                   </p>
                   <p className="text-xs text-amber-700 dark:text-amber-400">
-                    Este paquete no está disponible para entrega en esta sucursal. Vuelve a estarlo cuando la sucursal destino confirme la recepción del envío.
+                    {paquete.enTransito.estado === 'RECIBIDO'
+                      ? 'Este paquete ya fue recibido en la sucursal destino y no puede procesarse en esta instalación.'
+                      : 'Este paquete no está disponible para entrega en esta sucursal. Vuelve a estarlo cuando la sucursal destino confirme la recepción del envío.'}
                   </p>
                 </div>
               ) : (

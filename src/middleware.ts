@@ -83,7 +83,14 @@ export const config = {
      * - archivos estaticos (_next/static, _next/image)
      * - favicon
      * - rutas de la API de autenticacion (login/logout, publicas por diseño)
+     * - rutas de interoperabilidad entre instalaciones (Fase 4.3,
+     *   /api/interop/*): las llama OTRA INSTALACION por HTTP, nunca un
+     *   navegador con la cookie de sesion de un usuario — se autentican
+     *   por su cuenta con HMAC (ver src/lib/interop/verificar.ts),
+     *   nunca con SESSION_COOKIE. Sin esta exclusion, este middleware
+     *   redirigiria cualquier llamada de interop a /login antes de que
+     *   el propio endpoint llegue a intentar verificar la firma.
      */
-    '/((?!_next/static|_next/image|favicon.ico|api/auth).*)',
+    '/((?!_next/static|_next/image|favicon.ico|api/auth|api/interop).*)',
   ],
 };

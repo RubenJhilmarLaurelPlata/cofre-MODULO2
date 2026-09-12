@@ -5,6 +5,7 @@ import { getSession } from '@/lib/auth';
 import { tienePermiso } from '@/lib/permisos';
 import { prisma } from '@/lib/prisma';
 import { registrarAuditoria, extraerContextoRequest } from '@/lib/auditoria';
+import { DESTINO_SELECT_SEGURO } from '@/lib/destinos-seguro';
 
 const bodySchema = z.object({
   nombre: z.string().trim().min(1).max(120).optional(),
@@ -25,7 +26,10 @@ export async function PATCH(req: Request, { params }: { params: { id: string } }
     return NextResponse.json({ error: parsed.error.issues[0]?.message ?? 'Datos inválidos.' }, { status: 400 });
   }
 
-  const anterior = await prisma.sucursalDestino.findUnique({ where: { id: params.id } });
+  // Fase 5.3B: `select` explícito en ambas lecturas/escrituras — nunca
+  // apiKeySaliente/apiKeyEntrante, ni en la respuesta HTTP ni en AuditLog
+  // (ver src/lib/destinos-seguro.ts).
+  const anterior = await prisma.sucursalDestino.findUnique({ where: { id: params.id }, select: DESTINO_SELECT_SEGURO });
   if (!anterior) return NextResponse.json({ error: 'No se encontró ese destino.' }, { status: 404 });
 
   const actualizado = await prisma.sucursalDestino.update({
@@ -36,6 +40,7 @@ export async function PATCH(req: Request, { params }: { params: { id: string } }
       ...(parsed.data.direccion !== undefined ? { direccion: parsed.data.direccion || null } : {}),
       ...(parsed.data.activa !== undefined ? { activa: parsed.data.activa } : {}),
     },
+    select: DESTINO_SELECT_SEGURO,
   });
 
   const { ip, userAgent } = extraerContextoRequest(req);

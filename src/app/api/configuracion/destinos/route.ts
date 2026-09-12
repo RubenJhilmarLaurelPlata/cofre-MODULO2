@@ -9,6 +9,7 @@ import { getSession } from '@/lib/auth';
 import { tienePermiso } from '@/lib/permisos';
 import { prisma } from '@/lib/prisma';
 import { registrarAuditoria, extraerContextoRequest } from '@/lib/auditoria';
+import { DESTINO_SELECT_SEGURO } from '@/lib/destinos-seguro';
 
 export async function GET() {
   const session = await getSession();
@@ -18,7 +19,10 @@ export async function GET() {
     return NextResponse.json({ error: 'No tienes permiso para esta acción' }, { status: 403 });
   }
 
-  const destinos = await prisma.sucursalDestino.findMany({ orderBy: { nombre: 'asc' } });
+  // Fase 5.3B: `select` explícito — nunca la fila completa (ver
+  // src/lib/destinos-seguro.ts, apiKeySaliente/apiKeyEntrante jamás
+  // deben llegar a un usuario con solo `envios.ver`).
+  const destinos = await prisma.sucursalDestino.findMany({ orderBy: { nombre: 'asc' }, select: DESTINO_SELECT_SEGURO });
   return NextResponse.json(destinos);
 }
 
@@ -53,9 +57,12 @@ export async function POST(req: Request) {
       ciudad: parsed.data.ciudad || null,
       direccion: parsed.data.direccion || null,
     },
+    select: DESTINO_SELECT_SEGURO,
   });
 
   const { ip, userAgent } = extraerContextoRequest(req);
+  // Fase 5.3B: nunca persistir secretos en AuditLog — "destino" ya viene
+  // filtrado por el `select` de arriba, así que esto es seguro tal cual.
   await registrarAuditoria({ userId: session.id, accion: 'DESTINO_CREADO', modulo: 'envios', valorNuevo: destino, ip, userAgent });
 
   return NextResponse.json(destino, { status: 201 });

@@ -15,6 +15,7 @@
 // "reservar" — mismo criterio ya aplicado al resto del modulo Envios).
 import type { Prisma, Package } from '@prisma/client';
 import { normalizarCodigo } from '@/lib/codigo';
+import { emitirEventoPaquete } from '@/lib/tracking/eventos';
 
 export class CodigoInvalidoError extends Error {
   constructor() {
@@ -81,8 +82,20 @@ export async function registrarPaqueteBasico(
     },
   });
 
-  await tx.packageHistory.create({ data: { packageId: nuevo.id, estado: 'EN_PAQUETERIA', fecha: now, userId } });
+  const historial = await tx.packageHistory.create({ data: { packageId: nuevo.id, estado: 'EN_PAQUETERIA', fecha: now, userId } });
   await tx.generatedCode.updateMany({ where: { code, usado: false }, data: { usado: true } });
+
+  // Fase 5.3M (prioridad 1): PAQUETE_REGISTRADO, dentro de la MISMA
+  // transaccion — eventId = PackageHistory.id (Fase 5.3F, estable en
+  // cualquier reintento del worker). Nunca puede fallar la operacion
+  // real por esto (ver emitirEventoPaquete(), Fase 5.3D).
+  await emitirEventoPaquete(tx, {
+    tipoEvento: 'PAQUETE_REGISTRADO',
+    eventId: historial.id,
+    pkg: { code: nuevo.code, origenSucursalCodigo: null, origenCodigoPaquete: null },
+    estadoInternoOrigen: 'EN_PAQUETERIA',
+    fechaOrigen: now,
+  });
 
   return nuevo;
 }

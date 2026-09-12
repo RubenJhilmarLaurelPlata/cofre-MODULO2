@@ -10,6 +10,7 @@ import { getCompanyConfig, getHolidaySet } from '@/lib/config';
 import { calcularCosto } from '@/lib/pricing';
 import { fechaReferencia } from '@/lib/package-detail';
 import { getReservaActivaDePaquete } from '@/lib/envios';
+import { emitirEventoPaquete } from '@/lib/tracking/eventos';
 import type { Package, Prisma } from '@prisma/client';
 import type { PackageStatus, PaymentStatus, MotivoEntregaExcepcional } from '@/types';
 import { MOTIVO_ENTREGA_EXCEPCIONAL_LABEL } from '@/types';
@@ -28,15 +29,25 @@ export class PaqueteNoEncontradoError extends Error {
   }
 }
 
-// Fase 2 (modulo Envios): un paquete reservado en un envio en BORRADOR o
-// ya CERRADO no puede entregarse/denegarse/enviarse a deposito desde
-// aqui — evita el bug operativo real de procesar localmente un paquete
-// que ya salio (o esta por salir) hacia otra sucursal. Un envio
-// CANCELADO nunca bloquea (sus paquetes ya quedaron libres). Ver
-// getReservaActivaDePaquete() en src/lib/envios.ts.
+// Fase 2 (modulo Envios): un paquete reservado en un envio CERRADO (o,
+// desde Fase 4.4, ya RECIBIDO vía interop — ver getReservaActivaDePaquete()
+// en src/lib/envios.ts) no puede entregarse/denegarse/enviarse a deposito
+// desde aqui — evita el bug operativo real de procesar localmente un
+// paquete que ya salio (o ya llego, por una transferencia real, a otra
+// instalacion). Un envio CANCELADO nunca bloquea (sus paquetes ya
+// quedaron libres); un RECIBIDO local (recibidoViaInterop=false) tampoco
+// — ver el comentario de getReservaActivaDePaquete() para el porque. El
+// mensaje distingue CERRADO (temporal: "todavia puede quitarse del
+// envio, o la sucursal destino todavia va a confirmar") de RECIBIDO vía
+// interop (definitivo: el paquete fisico ya se fue de aqui para
+// siempre).
 export class PaqueteEnEnvioError extends Error {
-  constructor(envioCodigo: string) {
-    super(`Este paquete está en el envío ${envioCodigo} hacia otra sucursal y no puede procesarse aquí. Quítalo del envío primero si corresponde.`);
+  constructor(envioCodigo: string, estado: 'CERRADO' | 'RECIBIDO') {
+    super(
+      estado === 'RECIBIDO'
+        ? `Este paquete ya fue transferido a otra sucursal y recibido allá (envío ${envioCodigo}) — no puede procesarse en esta instalación.`
+        : `Este paquete está en el envío ${envioCodigo} hacia otra sucursal y no puede procesarse aquí. Quítalo del envío primero si corresponde.`
+    );
     this.name = 'PaqueteEnEnvioError';
   }
 }
@@ -66,7 +77,7 @@ async function transicionar(
     // de getReservaActivaDePaquete() en src/lib/envios.ts.
     if (verificarSinReservaEnvio) {
       const reserva = await getReservaActivaDePaquete(pkg.id, tx);
-      if (reserva) throw new PaqueteEnEnvioError(reserva.envioCodigo);
+      if (reserva) throw new PaqueteEnEnvioError(reserva.envioCodigo, reserva.estado);
     }
 
     // "where: status: estadoAnterior" es la protección contra doble
@@ -84,9 +95,21 @@ async function transicionar(
         'Este paquete ya fue actualizado por otra operación en curso. Vuelve a buscarlo para ver su estado actual.'
       );
     }
-    await tx.packageHistory.create({
+    const historial = await tx.packageHistory.create({
       data: { packageId: pkg.id, estado: nuevoEstado, fecha: now, userId, nota: nota ?? null },
     });
+
+    // Fase 5.3M: PAQUETE_TRANSICION para las 5 transiciones de estado
+    // (Entrega/Deposito) — misma transaccion, eventId = PackageHistory.id
+    // (Fase 5.3F/5.3D, ver comentario de registrarPaqueteBasico()).
+    await emitirEventoPaquete(tx, {
+      tipoEvento: 'PAQUETE_TRANSICION',
+      eventId: historial.id,
+      pkg: { code: pkg.code, origenSucursalCodigo: pkg.origenSucursalCodigo, origenCodigoPaquete: pkg.origenCodigoPaquete, origenTransferenciaId: pkg.origenTransferenciaId },
+      estadoInternoOrigen: nuevoEstado,
+      fechaOrigen: now,
+    });
+
     return tx.package.findUniqueOrThrow({ where: { id: pkg.id } });
   }, TRANSACTION_OPTS);
 
@@ -561,12 +584,32 @@ export async function entregaExcepcional(code: string, userId: string, branchId:
         origenEntrega: 'EXCEPCIONAL',
       },
     });
-    await tx.packageHistory.create({
+    const historialRegistro = await tx.packageHistory.create({
       data: { packageId: nuevo.id, estado: 'EN_PAQUETERIA', fecha: now, userId, nota: `Recepción omitida (entrega excepcional): ${motivoTexto}` },
     });
-    await tx.packageHistory.create({
+    const historialEntrega = await tx.packageHistory.create({
       data: { packageId: nuevo.id, estado: 'ENTREGADO', fecha: now, userId, nota: `Entrega excepcional: paquete no figuraba como recibido — ${motivoTexto}` },
     });
+
+    // Fase 5.3E/5.3M: una entrega excepcional crea el paquete Y lo
+    // entrega en la MISMA transaccion — así que emite los DOS eventos
+    // públicos que le corresponden (registro + transición), cada uno con
+    // su propio PackageHistory.id como eventId.
+    await emitirEventoPaquete(tx, {
+      tipoEvento: 'PAQUETE_REGISTRADO',
+      eventId: historialRegistro.id,
+      pkg: { code: nuevo.code, origenSucursalCodigo: null, origenCodigoPaquete: null },
+      estadoInternoOrigen: 'EN_PAQUETERIA',
+      fechaOrigen: now,
+    });
+    await emitirEventoPaquete(tx, {
+      tipoEvento: 'PAQUETE_TRANSICION',
+      eventId: historialEntrega.id,
+      pkg: { code: nuevo.code, origenSucursalCodigo: null, origenCodigoPaquete: null },
+      estadoInternoOrigen: 'ENTREGADO',
+      fechaOrigen: now,
+    });
+
     return aplicarPagoEnTx(tx, nuevo.id, 0, montoAplicado, costoActual, 'COBRO_ENTREGA', userId, motivoMovimiento);
   }, TRANSACTION_OPTS);
 

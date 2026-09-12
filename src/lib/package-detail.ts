@@ -24,6 +24,8 @@ import type { PackageStatus, PaymentStatus } from '@/types';
 export interface EnTransitoDTO {
   envioCodigo: string;
   destinoNombre: string;
+  /** Fase 4.4: CERRADO (temporal, todavía puede recibirse) vs RECIBIDO (siempre vía interop en este campo — ver getReservaActivaDePaquete() — definitivo). */
+  estado: 'CERRADO' | 'RECIBIDO';
 }
 
 export interface ClienteInfoDTO {

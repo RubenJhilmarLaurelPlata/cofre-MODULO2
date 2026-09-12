@@ -19,6 +19,7 @@ import { prisma, TRANSACTION_OPTS } from '@/lib/prisma';
 import { registrarAuditoria } from '@/lib/auditoria';
 import { normalizarCodigo, canonicalizarSeparadores } from '@/lib/codigo';
 import { registrarPaqueteBasico, type CamposExtraRegistro } from '@/lib/paquete-registro';
+import { emitirEventoEnvio } from '@/lib/tracking/eventos';
 import { getCompanyConfig } from '@/lib/config';
 import { dateKey } from '@/lib/pricing';
 import type { Prisma, Envio, EnvioItem } from '@prisma/client';
@@ -109,15 +110,39 @@ export class NoHayFondosPendientesError extends Error {
 const ESTADOS_ACTIVOS = ['BORRADOR', 'CERRADO'] as const;
 
 /**
- * ¿Este paquete está actualmente EN TRÁNSITO hacia otra sucursal? — es
- * decir, en un envío ya CERRADO (despachado) que todavía no fue
- * recibido en destino. Usado por src/lib/package-transitions.ts como
+ * ¿Este paquete está actualmente EN TRÁNSITO o YA TRANSFERIDO hacia otra
+ * sucursal? — es decir, en un envío CERRADO (despachado, todavía no
+ * recibido) O YA RECIBIDO **vía interop** (recepción remota real desde
+ * otra instalación). Usado por src/lib/package-transitions.ts como
  * guardia antes de entregar/denegar/enviar a depósito, y por
  * src/lib/package-detail.ts para mostrar el motivo (Fase 2.2, regla
  * fundamental: "una sucursal solo puede entregar paquetes que
  * actualmente estén disponibles en ella"). Un envío CANCELADO nunca
- * bloquea nada (sus paquetes ya quedaron libres); un envío RECIBIDO
- * tampoco (ya está disponible en destino — ver recibirEnvio()).
+ * bloquea nada (sus paquetes ya quedaron libres).
+ *
+ * Fase 4.4 (cierre del punto pendiente de la auditoría de Fase 4 —
+ * primer intento revertido por romper la recepción local real, ver
+ * historial de este comentario/informe de esa ronda): la distinción que
+ * hacía falta y que el código no podía deducir por sí solo es
+ * `Envio.recibidoViaInterop` (ver su comentario en schema.prisma):
+ *
+ *   - `estado='CERRADO'` → SIEMPRE bloquea (sin cambios, es el caso de
+ *     siempre: el envío está en tránsito, todavía puede recibirse).
+ *   - `estado='RECIBIDO' AND recibidoViaInterop=true` → bloquea PARA
+ *     SIEMPRE: el paquete físico se fue de aquí a una base de datos
+ *     realmente separada (confirmado por una llamada HTTP autenticada de
+ *     otra instalación — ver recibirEnvioParaInterop() en
+ *     src/lib/interop-envios.ts), y una copia PROPIA e independiente ya
+ *     existe en el destino (materializarRecepcionRemota()). Dejar de
+ *     bloquear aquí permitiría procesar dos veces, en dos sistemas
+ *     independientes, el mismo paquete físico.
+ *   - `estado='RECIBIDO' AND recibidoViaInterop=false` → NO bloquea
+ *     (comportamiento ORIGINAL, sin cambios): esta es la recepción 100%
+ *     local ("Envíos → Recibir envío", sesión de un usuario de esta
+ *     misma instalación) — hoy, sin comunicación real entre
+ *     instalaciones separadas para ESTE envío, "RECIBIDO" significa
+ *     literalmente "ya está disponible aquí", exactamente como significó
+ *     siempre antes de que existiera Fase 4.
  *
  * A propósito NO incluye BORRADOR: mientras el envío todavía se está
  * preparando, el paquete sigue físicamente en esta sucursal — recién
@@ -140,12 +165,14 @@ const ESTADOS_ACTIVOS = ['BORRADOR', 'CERRADO'] as const;
 export async function getReservaActivaDePaquete(
   packageId: string,
   client: Prisma.TransactionClient | typeof prisma = prisma
-): Promise<{ envioId: string; envioCodigo: string; destinoNombre: string } | null> {
+): Promise<{ envioId: string; envioCodigo: string; destinoNombre: string; estado: 'CERRADO' | 'RECIBIDO' } | null> {
   const item = await client.envioItem.findFirst({
-    where: { packageId, envio: { estado: 'CERRADO' } },
-    select: { envioId: true, envio: { select: { codigo: true, destino: { select: { nombre: true } } } } },
+    where: { packageId, envio: { OR: [{ estado: 'CERRADO' }, { estado: 'RECIBIDO', recibidoViaInterop: true }] } },
+    select: { envioId: true, envio: { select: { codigo: true, estado: true, destino: { select: { nombre: true } } } } },
   });
-  return item ? { envioId: item.envioId, envioCodigo: item.envio.codigo, destinoNombre: item.envio.destino.nombre } : null;
+  return item
+    ? { envioId: item.envioId, envioCodigo: item.envio.codigo, destinoNombre: item.envio.destino.nombre, estado: item.envio.estado as 'CERRADO' | 'RECIBIDO' }
+    : null;
 }
 
 export interface InfoEnvioPaqueteDTO {
@@ -635,12 +662,19 @@ export async function quitarPaquete(envioId: string, packageId: string, userId: 
 
 export async function cerrarEnvio(envioId: string, userId: string): Promise<EnvioDetalleDTO> {
   const { envioCodigo, cantidadPaquetes } = await prisma.$transaction(async (tx) => {
-    const envio = await tx.envio.findUnique({ where: { id: envioId }, include: { items: { select: { id: true } } } });
+    const envio = await tx.envio.findUnique({
+      where: { id: envioId },
+      include: {
+        destino: { select: { codigo: true, nombre: true } },
+        items: { select: { package: { select: { id: true, code: true, origenSucursalCodigo: true, origenCodigoPaquete: true } } } },
+      },
+    });
     if (!envio) throw new EnvioNoEncontradoError();
     if (envio.estado !== 'BORRADOR') throw new EnvioNoModificableError(envio.estado);
     if (envio.items.length === 0) throw new EnvioVacioError();
 
     const qrToken = generarQrToken();
+    const now = new Date();
     // updateMany condicionado al estado anterior: misma protección
     // optimista contra doble-cierre concurrente que ya usa transicionar()
     // en package-transitions.ts.
@@ -650,9 +684,25 @@ export async function cerrarEnvio(envioId: string, userId: string): Promise<Envi
       // inmutable de aqui en mas), asi que libera esa ranura del dia para
       // que una siguiente crearEnvio() a este mismo destino abra un lote
       // nuevo en vez de toparse con el @@unique([destinoId, diaAperturaKey]).
-      data: { estado: 'CERRADO', qrToken, cerradoAt: new Date(), cerradoPorId: userId, diaAperturaKey: null },
+      data: { estado: 'CERRADO', qrToken, cerradoAt: now, cerradoPorId: userId, diaAperturaKey: null },
     });
     if (resultado.count === 0) throw new EnvioNoModificableError('CERRADO');
+
+    // Fase 5.3M (prioridad 2): ENVIO_CERRADO, fan-out (un evento por
+    // paquete del lote), misma transaccion — claveEnvio usa
+    // transferenciaId si existe, o el id relacional como respaldo
+    // estable para envios anteriores a Fase 4.1 (Fase 5.3F).
+    const claveEnvio = envio.transferenciaId ?? envio.id;
+    for (const item of envio.items) {
+      await emitirEventoEnvio(tx, {
+        tipoEvento: 'ENVIO_CERRADO',
+        claveEnvio,
+        pkg: item.package,
+        estadoInternoOrigen: 'CERRADO',
+        fechaOrigen: now,
+        destino: envio.destino,
+      });
+    }
 
     return { envioCodigo: envio.codigo, cantidadPaquetes: envio.items.length };
   }, TRANSACTION_OPTS);
@@ -716,28 +766,79 @@ export async function buscarEnvioParaRecibir(input: string): Promise<EnvioDetall
 }
 
 /**
- * Confirma la recepción de un envío CERRADO (Fase 2.1). Solo cambia
- * Envio.estado a RECIBIDO — nunca Package.status, mismo principio que el
- * resto de este módulo: hoy esta instalación y la "sucursal destino" son
- * la MISMA base de datos (no existe todavía comunicación real entre
- * servidores), así que no hay ningún paquete "ajeno" que dar de alta
- * aquí; esto solo cierra el ciclo de vida del envío mismo. La protección
- * optimista (`estado: 'CERRADO'` en el where) evita recibir el mismo
- * envío dos veces, igual que cerrarEnvio()/cancelarEnvio().
+ * Confirma la recepción de un envío CERRADO. Solo cambia Envio.estado a
+ * RECIBIDO — nunca Package.status ni crea ningún Package, mismo
+ * principio que el resto de este módulo. La protección optimista
+ * (`estado: 'CERRADO'` en el where) evita recibir el mismo envío dos
+ * veces, igual que cerrarEnvio()/cancelarEnvio() — y es EXACTAMENTE la
+ * misma protección que hace segura la concurrencia real entre dos
+ * requests simultáneas (ver Fase 4.4 más abajo): si ambas leen "CERRADO"
+ * y ambas intentan el updateMany, solo una encuentra la fila (count 1);
+ * la otra encuentra 0 y recibe EnvioNoRecibibleError('RECIBIDO') — nunca
+ * las dos aplican la transición.
+ *
+ * `userId` (Fase 2.1, ahora opcional desde Fase 4.4): quién confirmó la
+ * recepción, para AuditLog — un usuario real cuando la dispara un
+ * operador desde "Envíos → Recibir envío" (recibir/route.ts, sesión
+ * local), o `undefined` cuando la dispara la RECEPCIÓN REMOTA desde otra
+ * instalación (POST /api/interop/envios/[codigo]/recibir — ver
+ * src/lib/interop-envios.ts): ahí no existe ningún usuario local de esta
+ * instalación que haya "hecho clic" en nada, así que no hay ningún id
+ * honesto que inventar. registrarAuditoria() ya acepta `userId: null` de
+ * sobra (no fue necesario tocar esa función).
+ *
+ * `opts.viaInterop` (Fase 4.4, cierre del punto pendiente de la
+ * auditoría de Fase 4): `false` por defecto — quien no lo indica
+ * explícitamente (el 100% de las llamadas anteriores a esta fase, y la
+ * ruta local recibir/route.ts, que nunca lo pasa) sigue recibiendo
+ * exactamente el mismo `Envio.recibidoViaInterop=false` de siempre. Solo
+ * recibirEnvioParaInterop() (src/lib/interop-envios.ts) pasa `true`. NO
+ * cambia el significado de "estado" ni agrega ningún estado nuevo — solo
+ * queda registrado, junto a RECIBIDO, CÓMO se llegó ahí, para que
+ * getReservaActivaDePaquete() pueda distinguir los dos casos (ver su
+ * comentario). Esta es la ÚNICA adaptación que necesitó esta función
+ * para Fase 4.4: la transición local en sí (CERRADO -> RECIBIDO) no
+ * cambió en absoluto.
  */
-export async function recibirEnvio(envioId: string, userId: string): Promise<EnvioDetalleDTO> {
+export async function recibirEnvio(envioId: string, userId?: string, opts?: { viaInterop?: boolean }): Promise<EnvioDetalleDTO> {
+  const viaInterop = opts?.viaInterop ?? false;
   const { envioCodigo, cantidadPaquetes } = await prisma.$transaction(async (tx) => {
-    const envio = await tx.envio.findUnique({ where: { id: envioId }, include: { items: { select: { id: true } } } });
+    const envio = await tx.envio.findUnique({
+      where: { id: envioId },
+      include: {
+        destino: { select: { codigo: true, nombre: true } },
+        items: { select: { package: { select: { id: true, code: true, origenSucursalCodigo: true, origenCodigoPaquete: true } } } },
+      },
+    });
     if (!envio) throw new EnvioNoEncontradoError();
     if (envio.estado !== 'CERRADO') throw new EnvioNoRecibibleError(envio.estado);
 
-    const resultado = await tx.envio.updateMany({ where: { id: envioId, estado: 'CERRADO' }, data: { estado: 'RECIBIDO' } });
+    const now = new Date();
+    const resultado = await tx.envio.updateMany({ where: { id: envioId, estado: 'CERRADO' }, data: { estado: 'RECIBIDO', recibidoViaInterop: viaInterop } });
     if (resultado.count === 0) throw new EnvioNoRecibibleError('RECIBIDO');
+
+    // Fase 5.3M (prioridad 3) / 5.3N: ENVIO_RECIBIDO, fan-out, misma
+    // transaccion — corre siempre en la base de ORIGEN (tanto recepcion
+    // LOCAL como recepcion via interop llaman a esta misma función, ver
+    // recibirEnvioParaInterop() en interop-envios.ts), así que
+    // "sucursalActual" queda correctamente en el destino sin importar
+    // cuál de los dos caminos disparó la transición.
+    const claveEnvio = envio.transferenciaId ?? envio.id;
+    for (const item of envio.items) {
+      await emitirEventoEnvio(tx, {
+        tipoEvento: 'ENVIO_RECIBIDO',
+        claveEnvio,
+        pkg: item.package,
+        estadoInternoOrigen: 'RECIBIDO',
+        fechaOrigen: now,
+        destino: envio.destino,
+      });
+    }
 
     return { envioCodigo: envio.codigo, cantidadPaquetes: envio.items.length };
   }, TRANSACTION_OPTS);
 
-  await registrarAuditoria({ userId, accion: 'ENVIO_RECIBIDO', modulo: 'envios', valorNuevo: { codigo: envioCodigo, cantidadPaquetes } });
+  await registrarAuditoria({ userId: userId ?? null, accion: 'ENVIO_RECIBIDO', modulo: 'envios', valorNuevo: { codigo: envioCodigo, cantidadPaquetes, viaInterop } });
 
   return getEnvioDetalle(envioId);
 }

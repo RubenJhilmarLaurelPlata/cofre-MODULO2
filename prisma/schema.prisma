@@ -412,9 +412,38 @@ model Package {
   // (ver src/lib/envios.ts) — Package.status NUNCA cambia por esto.
   enviosItems EnvioItem[]
 
+  // Fase 4.1 (preparacion de esquema, sin comportamiento nuevo todavia):
+  // de donde vino este paquete cuando fue materializado aqui por una
+  // transferencia entre instalaciones (todos null para cualquier paquete
+  // registrado normalmente por Recepcion/Envios de ESTA instalacion,
+  // que es el 100% de los paquetes existentes hoy). Correccion de diseño
+  // explicita sobre la auditoria de Fase 4: "Package.code" NUNCA debe
+  // tratarse como identificador GLOBAL entre sucursales — cada
+  // instalacion genera sus propios codigos de forma independiente (ver
+  // PackageSeries/GeneratedCode), asi que dos instalaciones distintas
+  // podrian generar el mismo "code" para paquetes fisicos distintos. El
+  // identificador real y seguro de un paquete transferido es el PAR
+  // (origenSucursalCodigo, origenCodigoPaquete) — nunca uno sin el otro.
+  // "origenCodigoPaquete" es el "code" tal cual existia en la
+  // instalacion de origen (deliberadamente separado de "code"/
+  // "codigoNormalizado" de arriba, que siguen siendo el codigo LOCAL de
+  // esta instalacion — pueden coincidir en texto o no, nunca se asume
+  // que son la misma columna). "origenSucursalCodigo" es el
+  // Company.sucursalCodigo (Fase 1) de la instalacion de origen, tal
+  // como la conoce el destino a traves de su propio catalogo
+  // SucursalDestino. "origenTransferenciaId" enlaza con
+  // Envio.transferenciaId del envio de origen que trajo este paquete —
+  // nunca una relacion @relation de Prisma (el Envio de origen vive en
+  // OTRA base de datos fisica, jamas en esta), solo un string plano de
+  // trazabilidad/lote de origen.
+  origenSucursalCodigo  String?
+  origenCodigoPaquete   String?
+  origenTransferenciaId String?
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
+  @@unique([origenSucursalCodigo, origenCodigoPaquete])
   @@index([status])
   @@index([ingresoAt])
   @@index([entregaAt])
@@ -426,6 +455,7 @@ model Package {
   @@index([registradoPorId])
   @@index([clienteId])
   @@index([estadoPago])
+  @@index([origenTransferenciaId])
 }
 
 // ---------------------------------------------------------------------
@@ -761,6 +791,24 @@ model SucursalDestino {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
+  // Fase 4.1 (preparacion de esquema para comunicacion entre
+  // instalaciones — todavia SIN endpoints /api/interop, SIN HMAC, SIN
+  // llamadas HTTP reales): credenciales para comunicarse con la
+  // instalacion externa que representa este destino. Los tres campos son
+  // opcionales a proposito — una instalacion que todavia no configuro
+  // comunicacion con este destino sigue funcionando exactamente igual
+  // que hoy (Envios/Recepcion sin ningun cambio de comportamiento).
+  // "Saliente"/"Entrante" son direcciones de la llamada HTTP, no del
+  // envio fisico: apiUrlSaliente/apiKeySaliente se usan cuando ESTA
+  // instalacion llama a la del destino; apiKeyEntrante es el secreto que
+  // esa otra instalacion debe presentar cuando ES ELLA quien llama hacia
+  // aqui. Ningun secreto se muestra en texto visible en ninguna UI
+  // publica (ver componente de Configuracion correspondiente, cuando se
+  // construya en una fase posterior).
+  apiUrlSaliente String?
+  apiKeySaliente String?
+  apiKeyEntrante String?
+
   envios        Envio[]
   liquidaciones LiquidacionEnvio[]
 
@@ -788,6 +836,51 @@ model Envio {
   estado String @default("BORRADOR")
 
   qrToken String? @unique
+
+  // Fase 4.1 (preparacion de esquema, sin comportamiento nuevo todavia):
+  // identidad TECNICA y ESTABLE de esta transferencia entre
+  // instalaciones, para uso exclusivo de la futura comunicacion
+  // /api/interop — deliberadamente NUNCA "codigo" (visible, secuencial,
+  // pensado para que lo lea una persona) ni "qrToken" (secreto de
+  // UN SOLO proposito: autorizar la recepcion fisica por QR/manual,
+  // nulo mientras el envio sigue en BORRADOR — ver buscarEnvioParaRecibir()
+  // en src/lib/envios.ts). "id" tampoco se reutiliza aqui: es la clave
+  // primaria RELACIONAL interna de esta base de datos, pensada para
+  // joins locales, no para viajar fuera de ella como identificador de
+  // negocio. "transferenciaId" en cambio: (a) no es secreto (puede
+  // aparecer en URLs/logs de la futura API sin debilitar la seguridad de
+  // qrToken), (b) existe desde el momento de crear el envio — igual que
+  // "id" — para que Fase 4.2 nunca dependa de un paso extra de
+  // "generar/backfill" antes de poder referenciar la transferencia. Se
+  // genera solo del lado del cliente Prisma (@default(cuid()), igual
+  // que "id"), nunca en la base — por eso la migracion que agrega esta
+  // columna no necesita (ni puede) rellenar los envios ya existentes:
+  // quedan en null, y siguen funcionando exactamente igual que hoy,
+  // porque ninguna funcion de src/lib/envios.ts lee ni escribe este
+  // campo todavia.
+  transferenciaId String? @unique @default(cuid())
+
+  // Fase 4.4 (cierre del punto pendiente de la auditoria de Fase 4):
+  // distingue COMO se ejecuto la transicion CERRADO -> RECIBIDO, sin
+  // inventar un estado nuevo ni cambiar el significado de "RECIBIDO"
+  // (que sigue siendo un solo concepto: "el destino ya lo tiene"). false
+  // (default, y el unico valor posible antes de esta columna existir —
+  // ver migracion) = recepcion LOCAL, disparada desde "Envios -> Recibir
+  // envio" con sesion de un usuario de ESTA instalacion; today (una sola
+  // base compartida entre origen/destino) esto significa correctamente
+  // "ya esta disponible aqui mismo". true = recepcion REMOTA, disparada
+  // por otra instalacion via POST /api/interop/envios/[codigo]/recibir
+  // (ver recibirEnvioParaInterop() en src/lib/interop-envios.ts) — ahi el
+  // paquete fisico se fue para siempre a una base de datos separada, y
+  // getReservaActivaDePaquete() (src/lib/envios.ts) usa este campo,
+  // JUNTO con estado='RECIBIDO', para bloquear la copia de origen para
+  // siempre SOLO en este caso — nunca en una recepcion local, que sigue
+  // funcionando exactamente igual que siempre. Ver el comentario extenso
+  // de getReservaActivaDePaquete() para la razon completa de este diseño
+  // (una version anterior sin esta columna bloqueaba TODO RECIBIDO por
+  // igual y rompia la recepcion local real — revertida antes de llegar
+  // aqui).
+  recibidoViaInterop Boolean @default(false)
 
   creadoPorId String?
   creadoPor   User?   @relation("EnvioCreadoPor", fields: [creadoPorId], references: [id])
@@ -894,6 +987,48 @@ model LiquidacionEnvio {
   @@index([createdAt])
 }
 
+// Fase 4.1 (preparacion de esquema, sin comportamiento nuevo todavia —
+// ningun endpoint ni funcion escribe en este modelo por ahora): registro
+// de idempotencia de la recepcion REMOTA de una transferencia, en la
+// base de datos de la instalacion DESTINO. Deliberadamente NO es un
+// sistema de eventos genérico: un solo modelo, un solo proposito —
+// evitar que una misma operacion de recepcion (reintento de red,
+// doble-click, doble entrega de un webhook) pueda materializar los
+// paquetes de una transferencia dos veces en esta base de datos.
+//
+// La idempotencia la da la restriccion @unique sobre "transferenciaId":
+// cuando la Fase 4.2 implemente el endpoint real, un segundo intento de
+// confirmar la misma transferencia (mismo Envio.transferenciaId de
+// origen) choca contra este indice unico y falla de forma predecible
+// (Prisma P2002) — el endpoint puede entonces responder "ya fue
+// recibido" en vez de volver a crear los Package. No usa una
+// relacion @relation hacia Envio: el Envio de origen vive en la base de
+// datos de OTRA instalacion, nunca en esta — mismo criterio que
+// Package.origenTransferenciaId, arriba.
+model EnvioRecepcionRemota {
+  id String @id @default(cuid())
+
+  // Envio.transferenciaId de la instalacion de ORIGEN — la clave real de
+  // idempotencia de esta tabla (ver comentario del modelo).
+  transferenciaId String @unique
+
+  // Identidad de la instalacion de origen y datos legibles del envio,
+  // solo para auditoria/trazabilidad humana (nunca para decidir nada):
+  // "origenCodigo" es el Company.sucursalCodigo (Fase 1) de quien envio,
+  // "envioCodigoOrigen" es el Envio.codigo visible (ej. "ENV-20260904-001").
+  origenCodigo      String
+  envioCodigoOrigen String
+
+  // Cuantos Package se materializaron en esta base al procesar esta
+  // recepcion — puramente informativo (auditoria/depuracion).
+  cantidadPaquetes Int @default(0)
+
+  recibidoAt DateTime @default(now())
+
+  @@index([origenCodigo])
+  @@index([recibidoAt])
+}
+
 // Catalogo de PERMISOS en si (la clave, su nombre y descripcion legibles)
 // vive fijo en codigo — src/lib/permisos.ts — porque solo cambia cuando
 // se despliega una funcionalidad nueva, no algo que un administrador
@@ -908,4 +1043,109 @@ model RolePermiso {
 
   @@unique([role, permiso])
   @@index([role])
+}
+
+// ---------------------------------------------------------------------
+// Outbox de Tracking (Fase 5.3): cola LOCAL persistente de eventos
+// pendientes de enviar al servicio independiente `cofre-tracking`.
+// ---------------------------------------------------------------------
+
+// Un evento de tracking pendiente/enviado, en ESTA instalación. Nunca
+// contiene datos administrativos/PII más allá de lo que ya va en
+// "payload" (que a su vez nunca incluye eso — ver src/lib/tracking/).
+// Deliberadamente NO es una copia de TrackingEvent (cofre-tracking): esa
+// tabla vive en OTRA base de datos, en otro proyecto — esta es solo la
+// cola de salida de ESTA instalación, con su propio ciclo de vida
+// (PENDING -> SENDING -> SENT, o FAILED si se agotan los reintentos).
+//
+// "eventId" es el MISMO identificador estable que también viajará dentro
+// de "payload" hacia Tracking (ver src/lib/tracking/identidad.ts): para
+// una transición de Package, es PackageHistory.id; para un evento
+// derivado de un Envio (salió/llegó), es una clave determinística
+// "transferenciaId:codigo:tipoEvento". El índice único sobre "eventId"
+// es lo que garantiza que la MISMA transición nunca pueda encolarse dos
+// veces, sin importar cuántas veces se reintente insertarla.
+model OutboxEvent {
+  id      String @id @default(cuid())
+  eventId String @unique
+
+  // Fase 5.3-HARDENING (paquetes inter-sucursal, ver informe): a quién
+  // se dirige esta fila, y por lo tanto qué protocolo/credenciales usa el
+  // worker para enviarla — nunca un modelo nuevo, la misma cola sirve
+  // para los dos casos porque su ciclo de vida (PENDING/SENDING/SENT,
+  // reintentos, backoff, lease) es idéntico:
+  //   TRACKING: el caso de siempre — se firma con TRACKING_HMAC_SECRET y
+  //     se envía a TRACKING_URL (esta instalación reporta un paquete
+  //     PROPIO — origenSucursalCodigo == la identidad de esta instalación).
+  //   INTEROP_ORIGEN: esta instalación es el DESTINO de una transferencia
+  //     y necesita que la instalación de ORIGEN (origenSucursalCodigo)
+  //     reporte, en su nombre, una transición ocurrida aquí — Tracking
+  //     exige que el firmante coincida con el origen declarado, así que
+  //     esta instalación no puede firmar el evento final ella misma (ver
+  //     eventos.ts). En este caso "payload" es la SOLICITUD delegada
+  //     (ver src/lib/tracking/cliente-interop.ts), no el body final de
+  //     Tracking — el origen la valida y arma su propio OutboxEvent
+  //     'TRACKING' recién ahí.
+  destino String @default("TRACKING")
+
+  // Mismo vocabulario que cofre-tracking (PAQUETE_REGISTRADO |
+  // PAQUETE_TRANSICION | ENVIO_CERRADO | ENVIO_RECIBIDO) — ver
+  // src/lib/tracking/eventos.ts. Solo para filtrar/depurar; el payload
+  // completo ya lo trae también.
+  tipoEvento String
+
+  // Identidad de ESTA instalación al momento de crear el evento
+  // (Company.sucursalCodigo) — ver comentario del modelo. Puramente
+  // informativo/consultable; el valor real que Tracking usa viaja dentro
+  // de "payload".
+  origenSucursalCodigo String
+
+  // El body EXACTO (ya serializado a JSON) que se enviará como
+  // POST /tracking/events — congelado en el momento en que se crea esta
+  // fila, dentro de la MISMA transacción que la operación de negocio que
+  // lo originó (ver src/lib/tracking/registrar-evento.ts). El worker
+  // NUNCA recalcula este payload a partir de otras tablas al reintentar
+  // — reenvía este mismo texto tal cual, siempre.
+  payload String
+
+  // PENDING: recién creado, o listo para un nuevo intento (falló antes, o
+  //   se recuperó de un SENDING abandonado — ver "claimedAt" abajo).
+  // SENDING: un worker lo tomó y está intentando enviarlo AHORA MISMO —
+  //   es la defensa real contra que dos workers lo procesen a la vez
+  //   (ver src/lib/tracking/worker.ts) — no se necesita Redis para esto,
+  //   un UPDATE condicionado (`WHERE estado='PENDING'`) sobre SQLite ya
+  //   es suficientemente atómico bajo connection_limit=1.
+  // SENT: entregado y aceptado por Tracking — terminal, nunca se vuelve
+  //   a tocar.
+  // Deliberadamente NO existe un estado FAILED (Fase 5.3C: "no inventes
+  // estados si no son necesarios") — un fallo simplemente vuelve a
+  // PENDING con "intentos" incrementado y backoff aplicado; no hay techo
+  // de reintentos en esta fase (ver informe de Fase 5.3-HARDENING).
+  estado String @default("PENDING")
+
+  // Fase 5.3-HARDENING (recuperación de SENDING huérfano): instante en
+  // que un worker reclamó esta fila (solo tiene sentido mientras
+  // estado='SENDING'; se limpia a null al salir de SENDING). Si el
+  // proceso muere después del claim y antes de la actualización final
+  // (SENT o de vuelta a PENDING), la fila quedaría en SENDING para
+  // siempre sin esto — ver recuperarSendingExpirados() en worker.ts, que
+  // vuelve a PENDING cualquier SENDING cuyo claimedAt supere el tope de
+  // arrendamiento (lease), permitiendo que otro worker (o el mismo, en un
+  // siguiente ciclo) la retome. eventId sigue siendo la única garantía de
+  // que ese reintento nunca duplique el evento en Tracking, sin importar
+  // cuántas veces se recupere/reclame esta fila.
+  claimedAt DateTime?
+
+  intentos      Int       @default(0)
+  nextAttemptAt DateTime  @default(now())
+  createdAt     DateTime  @default(now())
+  sentAt        DateTime?
+  // Mensaje de error corto, SIN secretos ni el body completo — ver
+  // src/lib/hmac (enmascararValorSensible-equivalente) y el worker, que
+  // nunca guarda aquí una cabecera ni el payload.
+  lastError     String?
+
+  @@index([estado, nextAttemptAt])
+  @@index([estado, claimedAt])
+  @@index([tipoEvento])
 }
